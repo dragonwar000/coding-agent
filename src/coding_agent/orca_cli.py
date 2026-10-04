@@ -7,9 +7,12 @@ them and records the outcome.
 Orca's task commands act inside a Run. Pass `run` explicitly or set `CODING_AGENT_ORCA_RUN`; without one the
 CLI answers `run_required`. `orca orchestration run-list` lists the Runs.
 
-Assumption, unverified against a live Orca: `task-create` and `task-update` answer an envelope whose
-`result.task.id` is the task id (as the orca-guard hint states), and `task-list` answers either
-`result.tasks` or a bare list. `ok: false` in an answer is an error.
+Measured against the installed Orca CLI on 2026-10-04: `run-create` answers `result.run.id`; `task-create` answers
+`result.task.id`; `task-list` answers `result.tasks`, where `deps` and `result` are JSON strings; a task without
+dependencies starts `ready`, one with open dependencies starts `pending`, and Orca moves it to `ready` when they
+complete; `worker-start --worktree new-child` requires `--name` and answers `result.dispatchId` plus an `effects`
+entry `{kind: worktree, id: "<repo>::<path>"}`; Orca marks a task `completed` when its worker reports success
+(`result.provenance == "worker_report"`). `task-update` is not measured. `ok: false` in an answer is an error.
 """
 
 from __future__ import annotations
@@ -129,7 +132,20 @@ def tasks_of(answer: Any) -> list[dict[str, Any]]:
     tasks = body.get("tasks", body) if isinstance(body, dict) else body
     if not isinstance(tasks, list):
         raise OrcaError("the answer has no task list")
-    return [task for task in tasks if isinstance(task, dict)]
+    return [_decoded(task) for task in tasks if isinstance(task, dict)]
+
+
+def _decoded(task: dict[str, Any]) -> dict[str, Any]:
+    """A task record with `deps` and `result` parsed: Orca stores both as JSON strings."""
+    out = dict(task)
+    for key in ("deps", "result"):
+        value = out.get(key)
+        if isinstance(value, str):
+            try:
+                out[key] = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+    return out
 
 
 def links(root: Path) -> dict[str, str]:
@@ -197,26 +213,74 @@ def list_tasks(run: str | None = None) -> list[dict[str, Any]]:
 
 
 def dispatch_id_of(answer: Any) -> str:
-    """The dispatch id from a worker-start answer. Unverified against a live Orca; see the module note."""
+    """The dispatch id from a worker-start answer (`result.dispatchId`)."""
     result = answer.get("result") if isinstance(answer, dict) else None
-    if isinstance(result, dict):
-        for key in ("dispatch", "worker"):
-            value = result.get(key)
-            if isinstance(value, dict) and isinstance(value.get("id"), str):
-                return value["id"]
-        if isinstance(result.get("dispatchId"), str):
-            return result["dispatchId"]
+    if isinstance(result, dict) and isinstance(result.get("dispatchId"), str):
+        return result["dispatchId"]
     raise OrcaError("the worker-start answer has no dispatch id")
 
 
-def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, worktree: str = "new-child", session: str = "cli") -> str:
-    """Start one supervised worker on `task_id` in its own worktree, and return the dispatch id.
+def worktree_of(answer: Any) -> str | None:
+    """The path of the worktree a worker-start answer created, from its `effects`, or None."""
+    result = answer.get("result") if isinstance(answer, dict) else None
+    for effect in (result.get("effects") if isinstance(result, dict) else None) or []:
+        if isinstance(effect, dict) and effect.get("kind") == "worktree" and isinstance(effect.get("id"), str) and "::" in effect["id"]:
+            return effect["id"].split("::", 1)[1]
+    return None
 
-    `new-child` gives the worker a linked git worktree, which is how the coordinator tells it is not the coordinator.
+
+def _git_common_dir(root: Path) -> Path | None:
+    try:
+        run = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-common-dir"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (root / run.stdout.strip()).resolve() if run.returncode == 0 and run.stdout.strip() else None
+
+
+def workers_ledger(root: Path) -> Path | None:
+    """The file listing worker worktrees. It lives in the git common directory, so every worktree of the repository reads the same one."""
+    common = _git_common_dir(root)
+    return common / "coding-agent-workers.jsonl" if common is not None else None
+
+
+def worker_worktrees(root: Path) -> set[str]:
+    """Resolved paths of the worktrees that coding-agent started workers in."""
+    path = workers_ledger(root)
+    if path is None or not path.exists():
+        return set()
+    found: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("worktree"), str):
+            found.add(record["worktree"])
+    return found
+
+
+def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str) -> None:
+    """Add a worker worktree to the ledger. Outside git there is no ledger and nothing is recorded."""
+    path = workers_ledger(root)
+    if path is None:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"worktree": str(Path(worktree).resolve()), "task_id": task_id, "dispatch": dispatch}) + "\n")
+
+
+def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli") -> str:
+    """Start one supervised worker on `task_id` in a new child worktree, and return the dispatch id.
+
+    The worktree is recorded in the workers ledger, which is how a session in it is recognised as a worker.
     """
-    dispatch = dispatch_id_of(_call("worker-start", "--task", task_id, "--agent", agent, "--worktree", worktree, *_run_args(run)))
+    name = f"ca-{task_id.removeprefix('task_')[:12]}"
+    answer = _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, *_run_args(run))
+    dispatch = dispatch_id_of(answer)
+    worktree = worktree_of(answer)
+    if worktree is not None:
+        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch)
     events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
-                  detail={"task_id": task_id, "agent": agent, "dispatch": dispatch})
+                  detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree})
     return dispatch
 
 

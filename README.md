@@ -98,32 +98,35 @@ Kiểm tra trạng thái sau khi cài:
 PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.gate --manifest integration.yaml   # 0: khớp manifest
 ```
 
-## Coordinator: tự quyết định làm trực tiếp hay giao việc
+## Coordinator: bắt buộc chia việc theo graph
 
-Session chính ở cây làm việc chính của repo là **coordinator**. Nó lập kế hoạch, trả lời người dùng, và tự
-quyết định việc nào làm trực tiếp, việc nào giao cho worker Orca. Worker chạy trong git worktree riêng
-(`worker-start --worktree new-child`), nên session ở worktree liên kết được nhận diện là worker.
+Session chính là **coordinator**. Nó lập plan, giao từng node cho worker Orca, gộp kết quả, và trả lời người dùng.
+Nó không tự sửa file.
 
-- **Nhắc, không chặn (`coordinator-guard`, shadow):** khi coordinator gọi `Write`, `Edit`, `MultiEdit`, `NotebookEdit`,
-  hoặc lệnh shell làm thay đổi trạng thái (`sed -i`, `>`, `rm`, `git commit`, `pip install`, ...), hook thêm một lời nhắc
-  vào ngữ cảnh và ghi event `nudged`. Lệnh vẫn chạy. Việc nhận diện lệnh shell là heuristic.
-- **Hợp đồng và bảng việc (`coordinator-context`, `coordinator-board`):** đầu phiên và sau nén ngữ cảnh, coordinator
-  nhận hợp đồng vai trò: việc nhỏ, một bước thì tự làm; việc lớn, nhiều bước, chạy lâu thì giao worker. Mỗi prompt,
-  nó nhận bảng việc đọc từ Orca. Nếu Orca không đọc được, bảng việc ghi rõ lỗi.
-- **Giao việc:**
+- **`coordinator-guard` (enforce)** chặn trong session coordinator: `Write`, `Edit`, `MultiEdit`, `NotebookEdit`; lệnh shell
+  sửa nội dung hay viết lại trạng thái (`sed -i`, `>`, `rm`, `git reset`, `git checkout`, `pip install`, ...); và tool
+  `Agent`/`Task` (subagent nội bộ không qua graph).
+- **Coordinator vẫn được:** đọc file, lệnh đọc, ghi `.coding-agent/plan.yaml`, chạy một lệnh `coding_agent.cli` đơn lẻ,
+  và `git add` / `git commit` / `git merge` để gộp nhánh của worker.
+- **Ai là worker:** chỉ session chạy trong worktree mà `worker-start` của coding-agent tạo ra. Danh sách nằm ở
+  `<git-common-dir>/coding-agent-workers.jsonl`, dùng chung cho mọi worktree. Session ở worktree khác (kể cả workspace
+  Orca) là coordinator. `CODING_AGENT_ROLE=coordinator|worker` ghi đè.
+- **Phát hiện phần guard bỏ sót:** guard shell là heuristic. Cuối lượt, `stop-gate` so `git status` với đầu lượt và ghi
+  event `direct-change` nếu cây của coordinator có file mới đổi. Đây là phát hiện, không hoàn tác. Sửa tay của người dùng
+  trong lúc đó cũng bị tính.
+- **Hợp đồng và bảng việc** được nạp đầu phiên, sau nén ngữ cảnh, và mỗi prompt.
+- **Nới lỏng:** đổi `coordinator-guard` sang `mode: shadow` trong `integration.yaml` rồi cài lại. Khi đó hook chỉ nhắc.
 
-```sh
-python3 -m coding_agent.cli delegate --title "Tách module" --spec "..." [--agent claude|codex]
-python3 -m coding_agent.cli board          # bảng việc hiện tại
-```
+Lưu ý khi dùng:
+- Worker tách nhánh từ commit hiện tại. Việc chưa commit ở cây chính thì worker không thấy.
+- Worktree mới chưa có phụ thuộc đã cài (ví dụ `node_modules`), nên lệnh verify ở `stop-gate` của worker sẽ fail cho tới khi
+  worker cài. Cấu hình setup của repo trong Orca để tránh.
+- Orca đánh task `completed` khi worker tự báo xong. Bảng việc xếp nó vào "báo xong nhưng chưa có bằng chứng"; node phụ
+  thuộc vẫn được giao tiếp. Kiểm kết quả trước khi báo người dùng.
+- Sửa một dòng cũng phải qua graph. Không có ngoại lệ cho việc nhỏ.
 
-  `delegate` tạo task (kèm `project` và `T-id`), rồi `worker-start` trên task đó. Cần có Orca Run:
-  `CODING_AGENT_ORCA_RUN` hoặc `--run`. `CODING_AGENT_WORKER_AGENT` đặt agent mặc định (`claude`).
-- **Muốn chặn cứng:** đổi `coordinator-guard` sang `mode: enforce` trong `integration.yaml` rồi chạy lại installer.
-  Khi đó ghi trực tiếp trong coordinator thoát 2.
-- **Ghi đè vai trò:** `CODING_AGENT_ROLE=coordinator|worker` ghi đè việc nhận diện theo worktree.
-
-Chưa kiểm trên Orca thật: định dạng trả về của `worker-start` (`result.dispatch.id`) và cách Orca chọn agent.
+Đã kiểm với Orca cài trên máy (2026-10-04): `run-init`, `plan-apply`, `plan-next`, `board` chạy trọn một graph 2 node,
+node sau chỉ được giao khi node trước xong. Chưa kiểm: `task-update` qua `orca-status`.
 
 ## Chia việc theo graph
 

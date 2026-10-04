@@ -126,6 +126,8 @@ def prompt_reset(ctx: Context) -> HookResult:
         prompts.append({"ts": int(time.time()), "text": prompt[:4000]})
     data = state.expire_prompts({**data, "prompts": prompts[-20:]})
     data.update({"sig_counts": {}, "calls_this_turn": 0, "continuations": 0})
+    if coordinator.role_for(_cwd(ctx)) == "coordinator":
+        data["dirty_at_prompt"] = coordinator.dirty_paths(ctx.root)
     state.save(ctx.root, ctx.session, data)
     return HookResult()
 
@@ -185,8 +187,24 @@ def stop_gate(ctx: Context) -> HookResult:
     if manifest.loop.max_denials_per_turn and turn.denials >= manifest.loop.max_denials_per_turn:
         ctx.note(guard="stop-gate", kind="denial-budget", applied=False, detail={"denials": turn.denials, "budget": manifest.loop.max_denials_per_turn})
 
+    _note_direct_changes(ctx, data)
     _remember(ctx, turn, verdict, lines)
     return result
+
+
+def _note_direct_changes(ctx: Context, data: dict[str, Any]) -> None:
+    """Record files the coordinator's tree gained during the turn while the graph was mandatory.
+
+    Detection only: a change is already made when the turn ends. It also counts files the user changed by hand in that time.
+    """
+    guard = ctx.manifest.hook("coordinator-guard") if ctx.manifest is not None else None
+    before = data.get("dirty_at_prompt")
+    if guard is None or guard.mode != "enforce" or not isinstance(before, list) or coordinator.role_for(_cwd(ctx)) != "coordinator":
+        return
+    now = coordinator.dirty_paths(ctx.root)
+    new = sorted(set(now or []) - set(before))
+    if new:
+        ctx.note(guard="coordinator-guard", kind="direct-change", applied=False, detail={"paths": new[:20], "count": len(new)})
 
 
 def pre_compact(ctx: Context) -> HookResult:
@@ -248,14 +266,14 @@ def coordinator_guard(ctx: Context) -> HookResult:
     if coordinator.role_for(_cwd(ctx)) != "coordinator":
         return HookResult()
     tool = str(ctx.payload.get("tool_name") or "")
-    reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"))
+    reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"), ctx.root)
     if reason is None:
         return HookResult()
     enforce = ctx.mode == "enforce"
     ctx.note(guard="coordinator-guard", kind="blocked" if enforce else "nudged", applied=enforce, detail={"tool": tool})
     if enforce:
         return HookResult(code=2, stderr=reason)
-    return HookResult(stdout=_inject("PreToolUse", reason + " Quyết định là của coordinator: làm trực tiếp nếu việc nhỏ và một bước, giao worker nếu lớn hoặc nhiều bước."))
+    return HookResult(stdout=_inject("PreToolUse", reason + " (shadow: chỉ nhắc, lệnh vẫn chạy.)"))
 
 
 def coordinator_context(ctx: Context) -> HookResult:

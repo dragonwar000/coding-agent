@@ -8,11 +8,11 @@ from coding_agent.manifest import load
 SHIPPED = Path(__file__).resolve().parents[1] / "integration.yaml"
 
 
-def test_the_shipped_manifest_is_unverified_and_enforces_only_the_two_gates():
+def test_the_shipped_manifest_is_unverified_and_enforces_only_the_three_gates():
     manifest = load(SHIPPED)
     assert manifest.verified is False
     enforcing = {hook.id for hook in manifest.hooks if hook.mode == "enforce"}
-    assert enforcing == {"orca-guard", "stop-gate"}
+    assert enforcing == {"orca-guard", "stop-gate", "coordinator-guard"}
     assert {hook.mode for hook in manifest.hooks if hook.id not in enforcing} == {"shadow"}
 
 

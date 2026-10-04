@@ -53,7 +53,7 @@ def test_completion_without_proof_never_reaches_orca(repo, fake_orca):
     task_id = orca_cli.create_task(repo, project="demo-repo", t_id="T-4", spec="x", title="x")
     outcome = orca_cli.set_status(repo, task_id=task_id, requested="completed", basis="agentReported")
     assert outcome == orca_cli.Transition(decision="unverified", sent=False, reason="basis agentReported is not proof")
-    assert orca_tasks(fake_orca)[task_id]["status"] == "pending"
+    assert orca_tasks(fake_orca)[task_id]["status"] == "ready"
 
 
 def test_completion_with_proof_is_sent_with_its_artifacts(repo, fake_orca):
@@ -61,7 +61,7 @@ def test_completion_with_proof_is_sent_with_its_artifacts(repo, fake_orca):
     outcome = orca_cli.set_status(repo, task_id=task_id, requested="completed", basis="predicate", artifacts=("out/report.md",))
     assert outcome.decision == "completed" and outcome.sent is True
     stored = orca_tasks(fake_orca)[task_id]
-    assert stored["status"] == "completed" and stored["result"] == {"basis": "predicate", "artifacts": ["out/report.md"]}
+    assert stored["status"] == "completed" and json.loads(stored["result"]) == {"basis": "predicate", "artifacts": ["out/report.md"]}
 
 
 def test_a_non_completion_status_is_sent_as_given(repo, fake_orca):

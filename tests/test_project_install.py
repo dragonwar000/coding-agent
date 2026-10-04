@@ -38,7 +38,7 @@ def test_a_fresh_project_gets_the_package_manifest_hooks_ci_and_a_passing_verify
     assert "vendors: claude_code" in report
     assert "verify: orca-guard (enforce) answered exit 2 to an invalid status" in report
     assert "verify: prompt-reset answered exit 0" in report
-    assert "verify: coordinator-guard (shadow) answered exit 0 to a direct write" in report
+    assert "verify: coordinator-guard (enforce) answered exit 2 to a direct write" in report
     assert "verify: coordinator-guard leaves worker sessions alone" in report
     assert gate.main(["--manifest", str(project / "integration.yaml")]) == 0
 
@@ -248,9 +248,9 @@ def test_add_new_hooks_appends_them_and_keeps_a_backup(tmp_path: Path):
     before = (project / "integration.yaml").read_text(encoding="utf-8")
     report = project_install.install(project, add_new_hooks=True)
     manifest = load(project / "integration.yaml")
-    assert manifest.hook("coordinator-guard").mode == "shadow" and manifest.hook("coordinator-board") is not None
+    assert manifest.hook("coordinator-guard").mode == "enforce" and manifest.hook("coordinator-board") is not None
     assert (project / "integration.yaml.bak").read_text(encoding="utf-8") == before
-    assert "verify: coordinator-guard (shadow) answered exit 0 to a direct write" in report
+    assert "verify: coordinator-guard (enforce) answered exit 2 to a direct write" in report
     assert "coordinator-guard" in (project / ".claude" / "settings.json").read_text(encoding="utf-8")
     assert project_install.missing_hooks(project / "integration.yaml") == []
 

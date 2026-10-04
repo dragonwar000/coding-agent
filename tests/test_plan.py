@@ -73,9 +73,10 @@ def test_apply_creates_each_task_once_with_its_orca_dependencies(repo, tmp_path,
     assert [(node_id, created) for node_id, _task, created in first] == [("protocol", True), ("server", True), ("web", True)]
     ids = plan.ledger(repo)
     tasks = orca_state(fake_orca)["tasks"]
-    assert tasks[ids["protocol"]]["deps"] == []
-    assert tasks[ids["server"]]["deps"] == [ids["protocol"]]
-    assert tasks[ids["web"]]["deps"] == [ids["protocol"], ids["server"]]
+    assert json.loads(tasks[ids["protocol"]]["deps"]) == []
+    assert json.loads(tasks[ids["server"]]["deps"]) == [ids["protocol"]]
+    assert json.loads(tasks[ids["web"]]["deps"]) == [ids["protocol"], ids["server"]]
+    assert [tasks[ids[n]]["status"] for n in ("protocol", "server", "web")] == ["ready", "pending", "pending"]
     assert all(not created for _n, _t, created in plan.apply(repo, nodes))
     assert len(orca_state(fake_orca)["tasks"]) == 3
 

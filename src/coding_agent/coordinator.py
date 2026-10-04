@@ -24,11 +24,12 @@ ROLE_ENV = "CODING_AGENT_ROLE"
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 BOARD_LIMIT = 20
 
-# Shell forms that change files or repository state. Read-only forms (git status/log/diff, ls, cat, grep)
-# and the coding-agent CLI itself are not matched. A heuristic: anything it misses is still visible in events.
+# Shell forms that change file content or rewrite repository state. Read-only forms (git status/log/diff, ls, cat, grep),
+# the coding-agent CLI, and `git add/commit/merge` are not matched: integrating worker branches is the coordinator's job.
+# A heuristic: what it misses is recorded by stop-gate as `direct-change`.
 MUTATING_BASH = re.compile(
     r"(\bsed\s+-i\b|\brm\s|\bmv\s|\bcp\s|\bmkdir\b|\btouch\b|\btee\b|\bchmod\b|\bln\s|"
-    r"\bgit\s+(commit|push|reset|checkout|clean|rebase|merge|stash|apply|add|restore|rm)\b|"
+    r"\bgit\s+(push|reset|checkout|clean|rebase|stash|apply|restore|rm)\b|"
     r"\b(pip3?|npm|pnpm|yarn)\s+(install|add|i)\b|"
     r"(?<![0-9&])>{1,2}\s*(?![&]|/dev/null)\S)"
 )
@@ -43,18 +44,39 @@ def _git(cwd: Path, *args: str) -> str | None:
 
 
 def role_for(cwd: Path | None) -> str:
-    """`coordinator` or `worker` for a session working in `cwd`. Outside git, the session is the coordinator."""
+    """`coordinator` or `worker` for a session working in `cwd`.
+
+    A session is a worker only in a worktree that coding-agent started a worker in (the workers ledger).
+    Any other session, in the main worktree or in a linked one such as an Orca workspace, is the coordinator.
+    """
     override = os.environ.get(ROLE_ENV)
     if override in ("coordinator", "worker"):
         return override
     if cwd is None:
         return "coordinator"
-    git_dir = _git(cwd, "rev-parse", "--git-dir")
-    common = _git(cwd, "rev-parse", "--git-common-dir")
-    if git_dir is None or common is None:
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if top is None:
         return "coordinator"
-    same = Path(cwd, git_dir).resolve() == Path(cwd, common).resolve()
-    return "coordinator" if same else "worker"
+    return "worker" if str(Path(top).resolve()) in orca_cli.worker_worktrees(cwd) else "coordinator"
+
+
+PLAN_FILE = Path(".coding-agent") / "plan.yaml"
+DELEGATING_TOOLS = frozenset({"Agent", "Task"})
+HOW = (
+    "Chia việc theo graph: (1) ghi plan vào .coding-agent/plan.yaml (tasks: id, title, spec, deps); "
+    "(2) `python3 -m coding_agent.cli run-init --objective \"...\"` nếu chưa có Run; "
+    "(3) `python3 -m coding_agent.cli plan-apply .coding-agent/plan.yaml`; "
+    "(4) `python3 -m coding_agent.cli plan-next .coding-agent/plan.yaml`. Xem graph: `plan-status`."
+)
+
+
+def is_plan_file(root: Path, file_path: Any) -> bool:
+    """True when `file_path` is the coordinator's plan file, the one file it writes itself."""
+    if not isinstance(file_path, str) or not file_path:
+        return False
+    target = Path(file_path)
+    target = target if target.is_absolute() else root / target
+    return target.resolve() == (root / PLAN_FILE).resolve()
 
 
 # The coordinator's own delegation command, run alone. A chained or substituted command is not allowed through.
@@ -62,22 +84,25 @@ DELEGATE_CALL = re.compile(r"^\s*(PYTHONPATH=\S+\s+)?python3?\s+-m\s+coding_agen
 CHAINING = re.compile(r"(&&|\|\||;|\||`|\$\()")
 
 
-def guard_reason(tool: str, tool_input: Any) -> str | None:
-    """Why the coordinator must not do this call itself, or None when the call is allowed."""
+def guard_reason(tool: str, tool_input: Any, root: Path | None = None) -> str | None:
+    """Why the coordinator must not do this call itself, or None when the call is allowed.
+
+    Allowed: read-only shell, a single `coding_agent.cli` command, and writing the plan file.
+    Refused: any other file write, a mutating shell command, and an in-process subagent, which would bypass the graph.
+    """
+    data = tool_input if isinstance(tool_input, dict) else {}
     if tool in WRITE_TOOLS:
-        return (
-            f"[coordinator] {tool} is a direct change. The coordinator delegates it: "
-            "run `coding_agent.cli delegate --title ... --spec ...` and answer the user while the worker runs."
-        )
-    if tool == "Bash" and isinstance(tool_input, dict):
-        command = str(tool_input.get("command") or "")
+        if root is not None and is_plan_file(root, data.get("file_path") or data.get("notebook_path")):
+            return None
+        return f"[coordinator] {tool} là sửa trực tiếp. {HOW}"
+    if tool in DELEGATING_TOOLS:
+        return f"[coordinator] subagent nội bộ không qua graph, nên bảng việc không thấy nó. {HOW}"
+    if tool == "Bash":
+        command = str(data.get("command") or "")
         if DELEGATE_CALL.search(command) and not CHAINING.search(command):
             return None
         if MUTATING_BASH.search(command):
-            return (
-                "[coordinator] this shell command changes files or repository state. "
-                "The coordinator delegates it: run `coding_agent.cli delegate --title ... --spec ...`."
-            )
+            return f"[coordinator] lệnh shell này làm thay đổi file hoặc trạng thái repo. {HOW}"
     return None
 
 
@@ -85,10 +110,12 @@ def contract(python_src: str) -> str:
     """The coordinator contract injected at session start and after a compaction."""
     return "\n".join([
         "[coordinator] Bạn là coordinator của repo này. Vai trò: nhận yêu cầu, lập kế hoạch, giao việc, và trả lời người dùng.",
-        "- Bạn tự quyết định: việc nhỏ, một bước, hoặc cần kết quả ngay thì tự làm; việc lớn, nhiều bước, hoặc chạy lâu thì giao worker.",
-        "- Hook chỉ nhắc khi bạn sửa file hay chạy lệnh làm thay đổi trạng thái, không chặn. Ghi ngắn lý do làm trực tiếp hoặc giao việc trong câu trả lời.",
+        "- Mọi thay đổi file đi qua graph: bạn viết plan, worker Orca làm từng node trong worktree riêng. Ở mode enforce, hook chặn sửa trực tiếp, lệnh shell ghi file, và subagent nội bộ.",
+        "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và gộp kết quả: `git add`, `git commit`, `git merge <nhánh worker>`.",
+        "- Worker tách nhánh từ commit hiện tại: commit việc đang dở trước khi `plan-next`, nếu không worker sẽ không thấy nó.",
         f"- Giao việc bằng: PYTHONPATH={python_src} python3 -m coding_agent.cli delegate --title \"...\" --spec \"...\" [--agent claude|codex]",
-        "- Việc nhiều phần phụ thuộc nhau: viết plan YAML (tasks: id, title, spec, deps) rồi `plan-apply FILE` và `plan-next FILE`; `plan-status FILE` xem graph. Chỉ task đã xong hết phụ thuộc mới được giao.",
+        "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao; gọi lại `plan-next` khi một worker xong.",
+        "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",
     ])
@@ -135,3 +162,19 @@ def read_board(root: Path, run: str | None = None) -> tuple[list[str], str | Non
     except orca_cli.OrcaError as error:
         return [], str(error)[:300]
     return board_lines(tasks, orca_cli.links(root), orca.project_name(root)), None
+
+
+def dirty_paths(root: Path) -> list[str] | None:
+    """Paths git reports as changed or untracked in `root`, or None outside git. Ignored files are not listed."""
+    out = _git_raw(root, "status", "--porcelain")
+    if out is None:
+        return None
+    return sorted({line[3:].split(" -> ")[-1].strip('"') for line in out.splitlines() if len(line) > 3})
+
+
+def _git_raw(cwd: Path, *args: str) -> str | None:
+    try:
+        run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return run.stdout if run.returncode == 0 else None

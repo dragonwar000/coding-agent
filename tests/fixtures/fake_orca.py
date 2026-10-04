@@ -42,9 +42,9 @@ def main(argv: list[str]) -> int:
         answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"run": {"id": "run_created", "objective": options.get("--objective", "")}}}
     elif command == "task-create":
         task_id = f"task_{len(tasks) + 1:04d}"
-        tasks[task_id] = {"id": task_id, "title": options.get("--task-title", ""), "spec": options.get("--spec", ""), "status": "pending", "result": None,
-                          "deps": json.loads(options.get("--deps", "[]"))}
-        answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"task": {"id": task_id, "status": "pending"}}}
+        tasks[task_id] = {"id": task_id, "title": options.get("--task-title", ""), "spec": options.get("--spec", ""), "status": "pending" if json.loads(options.get("--deps", "[]")) else "ready", "result": None,
+                          "deps": options.get("--deps", "[]")}
+        answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"task": {"id": task_id, "status": tasks[task_id]["status"]}}}
     elif command == "task-update":
         task = tasks.get(options.get("--id", ""))
         status = options.get("--status", "")
@@ -52,17 +52,25 @@ def main(argv: list[str]) -> int:
             answer = {"ok": False, "error": "unknown task or status"}
         else:
             task["status"] = status
-            task["result"] = json.loads(options["--result"]) if "--result" in options else None
+            task["result"] = options.get("--result")
+            if status == "completed":
+                for other in tasks.values():
+                    if other["status"] == "pending" and all(tasks[d]["status"] == "completed" for d in json.loads(other["deps"])):
+                        other["status"] = "ready"
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"task": {"id": task["id"], "status": status}}}
     elif command == "worker-start":
         task = tasks.get(options.get("--task", ""))
-        if task is None or options.get("--agent") is None:
+        if options.get("--worktree") == "new-child" and "--name" not in options:
+            answer = {"ok": False, "error": {"code": "invalid_argument", "message": "New worktrees require --name."}}
+        elif task is None or options.get("--agent") is None:
             answer = {"ok": False, "error": {"code": "unknown_task", "message": "no such task or agent"}}
         else:
             dispatch_id = f"dsp_{len(data.setdefault('dispatches', {})) + 1:04d}"
-            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": options.get("--worktree")}
+            worktree = os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
+            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": options.get("--worktree"), "name": options["--name"]}
             task["status"] = "dispatched"
-            answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"dispatch": {"id": dispatch_id}, "task": {"id": task["id"], "status": "dispatched"}}}
+            answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"runId": options["--run"], "taskId": task["id"], "dispatchId": dispatch_id,
+                                                                 "effects": [{"kind": "worktree", "action": "created_child", "id": f"repo::{worktree}"}]}}
     elif command == "task-list":
         answer = {"ok": True, "result": {"tasks": list(tasks.values())}}
     else:
