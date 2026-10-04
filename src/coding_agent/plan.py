@@ -157,7 +157,7 @@ def dispatch_ready(root: Path, nodes: list[Node], *, default_agent: str, run: st
     mapping = ledger(root)
     started: list[tuple[str, str, str]] = []
     for node in ready(nodes, states(root, nodes, run=run))[:max(limit, 0)]:
-        dispatch = orca_cli.worker_start(root, task_id=mapping[node.id], agent=node.agent or default_agent, run=run)
+        dispatch = orca_cli.worker_start(root, task_id=mapping[node.id], agent=node.agent or default_agent, run=run, title=node.title)
         started.append((node.id, mapping[node.id], dispatch))
     return started
 

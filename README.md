@@ -167,6 +167,10 @@ python3 -m coding_agent.cli plan-next plan.yaml --max 2  # khởi động worker
 python3 -m coding_agent.cli plan-status plan.yaml        # graph: trạng thái từng node và phụ thuộc còn mở
 ```
 
+Worktree và nhánh của worker được đặt tên từ tiêu đề task: chữ thường không dấu, nối bằng `-`, tối đa 40 ký tự
+(ví dụ "3D: model chó, chủ nhà" → `3d-model-cho-chu-nha`). Orca hiện tiêu đề đầy đủ trên dòng của worker, và tự thêm
+`-2`, `-3` khi tên trùng. Vì vậy `title` của node nên là một tóm tắt ngắn của việc cần làm.
+
 Plan bị từ chối khi có id trùng, phụ thuộc không tồn tại, tự phụ thuộc, hoặc vòng lặp. Node có phụ thuộc `failed`
 hay `blocked` không bao giờ được giao. Ánh xạ plan id → Orca task id nằm ở `.coding-agent/plan.json`.
 **Khi worker xong:** Orca gửi `worker_done` về hộp thư của Run. Mỗi prompt, bảng việc của coordinator liệt kê các báo cáo

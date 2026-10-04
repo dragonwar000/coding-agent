@@ -88,7 +88,8 @@ def main(argv: list[str]) -> int:
             dispatch_id = f"dsp_{len(data.setdefault('dispatches', {})) + 1:04d}"
             selector = options.get("--worktree", "")
             worktree = selector[5:] if selector.startswith("path:") else os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
-            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": selector, "name": options.get("--name", os.path.basename(worktree))}
+            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": selector, "name": options.get("--name", os.path.basename(worktree)),
+                                               "display": options.get("--display-name")}
             task["status"] = "dispatched"
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"runId": options["--run"], "taskId": task["id"], "dispatchId": dispatch_id,
                                                                  "effects": [{"kind": "worktree", "action": "created_child", "id": f"repo::{worktree}"}]}}

@@ -166,7 +166,7 @@ def test_delegate_creates_a_task_and_starts_a_worker_in_its_own_worktree(repo, f
     committed_repo(repo)
     task_id, dispatch = orca_cli.delegate(repo, title="Refactor", spec="split the module", t_id="T-31", agent="codex")
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
-    assert state["dispatches"][dispatch] == {"task": task_id, "agent": "codex", "worktree": "new-child", "name": "ca-0001"}
+    assert state["dispatches"][dispatch] == {"task": task_id, "agent": "codex", "worktree": "new-child", "name": "refactor", "display": "Refactor"}
     assert len(orca_cli.worker_worktrees(repo)) == 1
     assert state["tasks"][task_id]["status"] == "dispatched"
     assert cli.main(["--root", str(repo), "delegate", "--title", "Docs", "--spec", "write docs", "--t-id", "T-32"]) == 0
@@ -268,7 +268,7 @@ def test_worker_start_falls_back_to_an_explicit_worktree_when_new_child_cannot_b
     monkeypatch.setenv("FAKE_ORCA_NO_NEW_CHILD", "1")
     task_id, dispatch = orca_cli.delegate(repo, title="Models", spec="x", t_id="T-50", agent="claude")
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
-    assert state["created_worktrees"] == [{"name": "ca-0001", "repo": f"path:{repo.resolve()}"}]
+    assert state["created_worktrees"] == [{"name": "models", "repo": f"path:{repo.resolve()}"}]
     assert state["dispatches"][dispatch]["worktree"].startswith("path:") and state["dispatches"][dispatch]["task"] == task_id
     assert len(orca_cli.worker_worktrees(repo)) == 1
 
@@ -295,3 +295,25 @@ def test_the_cli_starts_a_worker_on_an_existing_task(repo, fake_orca, capsys):
     task_id = orca_cli.create_task(repo, project="demo-repo", t_id="T-51", spec="x", title="x")
     assert cli.main(["--root", str(repo), "worker-start", "--task-id", task_id, "--agent", "codex"]) == 0
     assert json.loads(capsys.readouterr().out)["dispatch"].startswith("dsp_")
+
+
+@pytest.mark.parametrize("title, expected", [
+    ("3D: model chó, chủ nhà, người trộm, xe máy có animation", "3d-model-cho-chu-nha-nguoi-trom-xe-may"),
+    ("Đổi phím & toàn màn hình", "doi-phim-toan-man-hinh"),
+    ("Fix login bug", "fix-login-bug"),
+    ("  ", "task-abc123"),
+    ("???", "task-abc123"),
+    ("Supercalifragilisticexpialidociousandevenlongerthanthat", "supercalifragilisticexpialidociousandeve"),
+])
+def test_the_worktree_name_is_read_from_the_title(title, expected):
+    name = orca_cli.worktree_name(title, "task_abc123")
+    assert name == expected and len(name) <= orca_cli.NAME_LIMIT
+
+
+def test_a_worker_started_by_task_id_gets_its_name_from_the_title_orca_stores(repo, fake_orca):
+    committed_repo(repo)
+    task_id = orca_cli.create_task(repo, project="demo-repo", t_id="T-60", spec="x", title="Vật thể tương tác, ánh sáng")
+    dispatch = orca_cli.worker_start(repo, task_id=task_id, agent="claude")
+    record = json.loads(fake_orca.read_text(encoding="utf-8"))["dispatches"][dispatch]
+    assert record["name"] == "vat-the-tuong-tac-anh-sang" and record["display"] == "Vật thể tương tác, ánh sáng"
+    assert not record["name"].startswith("ca-")

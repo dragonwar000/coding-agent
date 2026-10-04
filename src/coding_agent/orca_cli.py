@@ -284,7 +284,40 @@ def _repo_path(root: Path) -> Path | None:
     return common.parent if common is not None and common.name == ".git" else None
 
 
-def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, run: str | None) -> Any:
+NAME_LIMIT = 40
+DISPLAY_LIMIT = 80
+
+
+def worktree_name(title: str, task_id: str) -> str:
+    """A worktree and branch name read from the task title: lower-case ASCII words joined by `-`, at most 40 characters.
+
+    Vietnamese diacritics are removed (`đ` becomes `d`). A title with no usable characters falls back to the task id.
+    Orca appends `-2`, `-3`, ... when the name is taken.
+    """
+    import re
+    import unicodedata
+
+    plain = unicodedata.normalize("NFKD", title.replace("đ", "d").replace("Đ", "D"))
+    plain = "".join(ch for ch in plain if not unicodedata.combining(ch)).lower()
+    words = [word for word in re.split(r"[^a-z0-9]+", plain) if word]
+    name = ""
+    for word in words:
+        candidate = f"{name}-{word}" if name else word
+        if len(candidate) > NAME_LIMIT:
+            break
+        name = candidate
+    return name or (words[0][:NAME_LIMIT] if words else f"task-{task_id.removeprefix('task_')[:12]}")
+
+
+def _title_of(task_id: str, run: str | None) -> str:
+    """The task's title as Orca stores it, or an empty string when the task is not listed."""
+    for task in list_tasks(run):
+        if task.get("id") == task_id:
+            return str(task.get("task_title") or task.get("title") or "")
+    return ""
+
+
+def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None) -> Any:
     """Start a worker in a new worktree.
 
     `new-child` makes the worktree a child of the calling terminal's worktree. Orca answers `selector_not_found`
@@ -292,7 +325,7 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, run:
     after the terminal opened). Then the worktree is created from the repository path and the worker is started on it.
     """
     try:
-        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, *_run_args(run))
+        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, "--display-name", display, *_run_args(run))
     except OrcaError as error:
         if "selector_not_found" not in str(error):
             raise
@@ -308,26 +341,29 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, run:
     return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", *_run_args(run))
 
 
-def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli") -> str:
+def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli", title: str | None = None) -> str:
     """Start one supervised worker on `task_id` in a new worktree, and return the dispatch id.
 
-    The worktree is recorded in the workers ledger, which is how a session in it is recognised as a worker.
+    The worktree and its branch are named from the task title, and Orca shows the title on the worker's row.
+    Without `title`, the title is read from Orca. The worktree is recorded in the workers ledger, which is how a
+    session in it is recognised as a worker.
     """
-    name = f"ca-{task_id.removeprefix('task_')[:12]}"
-    answer = _start_in_new_worktree(root, task_id, agent, name, run)
+    title = title if title is not None else _title_of(task_id, run)
+    name = worktree_name(title, task_id)
+    answer = _start_in_new_worktree(root, task_id, agent, name, (title or name)[:DISPLAY_LIMIT], run)
     dispatch = dispatch_id_of(answer)
     worktree = worktree_of(answer)
     if worktree is not None:
         record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch)
     events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
-                  detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree})
+                  detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree, "name": name})
     return dispatch
 
 
 def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: str | None = None, session: str = "cli") -> tuple[str, str]:
     """Create a task for this repository and start a worker on it. Returns (task id, dispatch id)."""
     task_id = create_task(root, project=orca.project_name(root), t_id=t_id, spec=spec, title=title, run=run)
-    return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session)
+    return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session, title=title)
 
 
 def _reports(answer: Any) -> list[dict[str, Any]]:
