@@ -19,10 +19,15 @@ class NotOwned(RuntimeError):
     """The directory is not a harness-owned install, or it was edited after install."""
 
 
+def _tracked(path: Path) -> bool:
+    """Source files count toward the digest; bytecode caches do not, since running the package writes them."""
+    return path.is_file() and path.name != MARKER and "__pycache__" not in path.parts and path.suffix != ".pyc"
+
+
 def tree_digest(root: Path) -> str:
-    """sha256 over every file's relative path and bytes, marker excluded."""
+    """sha256 over every source file's relative path and bytes, marker and bytecode caches excluded."""
     digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.is_file() and p.name != MARKER):
+    for path in sorted(p for p in root.rglob("*") if _tracked(p)):
         digest.update(str(path.relative_to(root)).encode("utf-8") + b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
@@ -50,9 +55,13 @@ def _require_owned(target: Path) -> None:
 
 
 def backup(target: Path, backup_root: Path) -> Path:
-    """Copy `target` aside before it is changed. The copy keeps a timestamp so repeated installs never collide."""
+    """Copy `target` aside before it is changed. The name carries a timestamp and, when needed, a counter, so repeated installs never collide."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
     destination = backup_root / f"{target.name}-{stamp}"
+    counter = 1
+    while destination.exists():
+        counter += 1
+        destination = backup_root / f"{target.name}-{stamp}-{counter}"
     shutil.copytree(target, destination)
     return destination
 

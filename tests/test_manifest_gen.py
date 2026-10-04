@@ -107,3 +107,50 @@ def test_main_check_exit_codes(tmp_path, capsys):
     assert gen.main(["--manifest", str(manifest), "--apply"]) == 0
     assert gen.main(["--manifest", str(manifest), "--check"]) == 0
     assert gen.main(["--manifest", str(tmp_path / "missing.yaml")]) == 2
+
+
+def test_write_keeps_the_users_own_hooks_settings_and_backs_up_the_file(tmp_path):
+    manifest = load(write(tmp_path, BASE))
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({
+        "model": "opus",
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/my-lint"}]}]},
+    }), encoding="utf-8")
+    gen.write(manifest, apply=True)
+    document = json.loads(settings.read_text(encoding="utf-8"))
+    assert document["model"] == "opus"
+    commands_now = commands(document)
+    assert "/usr/local/bin/my-lint" in commands_now
+    assert any("coding_agent.hooks orca-guard" in c for c in commands_now)
+    assert (tmp_path / ".claude" / "settings.json.bak").read_text(encoding="utf-8").count("my-lint") == 1
+    assert gen.drift(manifest) == []
+
+
+def test_rewriting_replaces_old_harness_entries_instead_of_adding(tmp_path):
+    manifest = load(write(tmp_path, BASE))
+    gen.write(manifest, apply=True)
+    gen.write(manifest, apply=True)
+    document = json.loads((tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    harness = [c for c in commands(document) if "coding_agent.hooks" in c]
+    assert len(harness) == len(set(harness)) == 2
+
+
+def test_a_host_file_that_is_not_json_is_refused_and_untouched(tmp_path):
+    manifest = load(write(tmp_path, BASE))
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(gen.GenError, match="not valid JSON"):
+        gen.write(manifest, apply=True)
+    assert settings.read_text(encoding="utf-8") == "{ not json"
+    assert gen.main(["--manifest", str(tmp_path / "integration.yaml"), "--apply"]) == 2
+
+
+def test_only_the_selected_hosts_are_written_and_checked(tmp_path):
+    manifest = load(write(tmp_path, BASE))
+    gen.write(manifest, apply=True, hosts=["claude_code"])
+    assert (tmp_path / ".claude" / "settings.json").exists()
+    assert not (tmp_path / ".codex" / "hooks.json").exists()
+    assert gen.drift(manifest, ["claude_code"]) == []
+    assert gen.drift(manifest, ["codex"]) and all("codex" in p for p in gen.drift(manifest, ["codex"]))

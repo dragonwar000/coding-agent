@@ -37,7 +37,7 @@ def test_editing_a_live_file_by_hand_fails_the_gate(tmp_path, capsys):
     live = root / ".claude" / "settings.json"
     live.write_text(live.read_text(encoding="utf-8").replace("shadow", "enforce", 1), encoding="utf-8")
     assert gate.main(["--manifest", str(root / "integration.yaml")]) == 1
-    assert "differs from integration.yaml" in capsys.readouterr().err
+    assert "differ from integration.yaml" in capsys.readouterr().err
 
 
 def test_an_invalid_manifest_is_exit_two(tmp_path, capsys):

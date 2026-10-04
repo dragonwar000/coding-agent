@@ -25,7 +25,8 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
 | `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check` |
-| `src/coding_agent/project_install.py` | Cài package, manifest và hook vào một dự án (FR-001, FR-004) |
+| `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
+| `install.sh` | Lệnh một dòng cho `project_install` |
 | `src/coding_agent/gate.py` | Cổng của package (FR-003): thất bại khi file đang dùng lệch manifest |
 | `tests/` | Test gồm `fixtures/fake_orca.py` làm Orca giả lập cho FR-013 |
 
@@ -52,22 +53,35 @@ không cần Orca thật.
 
 ## Cài vào một dự án
 
-Cần: Python 3.11 trở lên, git, và PyYAML trong `python3` mà hook chạy bằng. Nếu thiếu PyYAML, hook báo lỗi
-trong stderr và ghi event `manifest-error`; cổng `gate` thoát 2.
+Một lệnh, giống install.sh của harness/setup:
 
 ```sh
-# 1. Cài package, manifest, và hook vào dự án (không ghi đè manifest có sẵn)
-PYTHONPATH=<đường dẫn coding-agent>/src python3 -m coding_agent.project_install --project <dự án> [--python-src harness/src] [--verify "python3 -m pytest -q"]
-# 2. Cổng: thoát 0 khi file hook đang dùng khớp manifest
-PYTHONPATH=<dự án>/harness/src python3 -m coding_agent.gate --manifest <dự án>/integration.yaml
+bash install.sh <dự án>                           # cài: dò vendor, merge hook, ghi CI, verify
+bash install.sh <dự án> --vendor claude           # ép vendor (claude, codex, hoặc claude,codex)
+bash install.sh <dự án> --uninstall [--keep-core] # gỡ: hook của coding-agent, CI, bản copy package
+bash install.sh <dự án> --clean                   # gỡ rồi cài lại
 ```
 
-Installer chép `src/coding_agent` vào `<dự án>/<python_src>/coding_agent`. Bản đã cài chỉ được thay khi
-còn dấu harness; bản cũ được sao lưu vào `.coding-agent/backups/`. Thư mục không có dấu bị từ chối và
-giữ nguyên. Lệnh hook dùng `$CLAUDE_PROJECT_DIR` (Claude Code) hoặc `$(git rev-parse --show-toplevel)`
-(Codex), nên file sinh ra không chứa đường dẫn tuyệt đối của máy nào.
+Installer thực hiện, theo thứ tự:
 
-Lệnh `verify` trong manifest chạy trong PATH của hook. Dự án cần có công cụ đó (ví dụ pytest) trong PATH.
+1. Kiểm PyYAML cho `python3` đang chạy installer. Thiếu thì tự `pip install pyyaml`.
+2. Dò vendor: `.claude/` → Claude Code, `.codex/` hoặc `AGENTS.md` → Codex, không có gì thì Claude Code.
+3. Chép package vào `harness/coding-agent/src/coding_agent`. Bản đã cài chỉ được thay khi còn dấu harness; bản cũ vào `.coding-agent/backups/`. Thư mục không có dấu bị từ chối.
+4. Ghi `integration.yaml` nếu dự án chưa có. Manifest có sẵn không bao giờ bị ghi đè.
+5. Merge hook vào `.claude/settings.json` và `.codex/hooks.json`: giữ hook và cài đặt của bạn, thay hook cũ của coding-agent, và giữ file `.bak`.
+6. Ghi CI gate `.github/workflows/coding-agent.yml` nếu chưa có file này. Thêm `--no-ci` để bỏ qua.
+7. Verify: chạy gate, và chạy đúng lệnh hook trong `settings.json` với payload mẫu (orca-guard phải chặn status sai, prompt-reset phải thoát 0). Thêm `--no-verify` để bỏ qua.
+
+Cài lại là an toàn: lệnh giống nhau cho cùng kết quả. Gỡ giữ nguyên `integration.yaml` và mọi hook của bạn.
+
+Cần có: Python 3.11 trở lên, git, và lệnh verify trong manifest chạy được trong PATH (mặc định `python3 -m pytest -q`).
+Hook chạy bằng `python3` trên PATH, nên `python3` đó cũng phải có PyYAML.
+
+Kiểm tra trạng thái sau khi cài:
+
+```sh
+PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.gate --manifest integration.yaml   # 0: khớp manifest
+```
 
 ## Mode và assumption
 
@@ -113,7 +127,7 @@ Adapter giả định `task-create` và `task-update` trả `result.task.id`, v�
 | 3. Hoàn thành có bằng chứng | Xong | `completion()` ở `orca.py`, `set_status()` ở `orca_cli.py` |
 | 4. Cách ly theo repo | Xong | Claim từ repo khác bị từ chối và ghi event |
 | 5. Guard vòng lặp và ngân sách | Xong ở shadow | `loop-guard` có trần lượt và denial budget; `stop-gate` ghi `denial-budget` |
-| 6. An toàn cài đặt | Một phần | `install.py` và `project_install.py` đã chạy được trên dự án thử. Ghim commit khi cài (FR-005) chưa làm: xem dưới |
+| 6. An toàn cài đặt | Một phần | `install.py` và `project_install.py`: cài, cài lại, gỡ, verify. Ghim commit khi cài (FR-005) chưa làm: xem dưới |
 | 7. Fixture end-to-end | Một phần | Fake Orca CLI (có Run, `run_required`) và test CLI chạy thật. Chưa có dispatch nên chưa chạy đủ propose → gate → dispatch → verify. Đăng ký vào `fdk-gate`, `mechanisms.yaml`, `harness-doctor` của setup: bỏ, vì coding-agent tự đứng riêng |
 | FR-014 / SC-001. Lệnh `status` | Xong | `status [--run ID]`, đọc task của Run qua CLI thật (đã kiểm với Orca cài trên máy) |
 

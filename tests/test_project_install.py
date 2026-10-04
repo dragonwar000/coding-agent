@@ -1,6 +1,8 @@
-"""Installing into a project (FR-004, FR-001): owned copies are replaced with a backup, unowned ones are refused, and the result passes the gate."""
+"""Installing into a project like the setup harness (FR-001, FR-004): one command, detected vendors, merged wiring, verify, uninstall."""
 
+import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,46 +13,109 @@ from coding_agent.manifest import load
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def git_project(tmp_path: Path) -> Path:
+    project = tmp_path / "demo-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    return project
+
+
 def test_the_template_is_the_shipped_manifest():
     assert project_install.TEMPLATE.read_text(encoding="utf-8") == (ROOT / "integration.yaml").read_text(encoding="utf-8")
 
 
-def test_a_fresh_project_gets_a_package_a_manifest_and_matching_hooks(tmp_path: Path, capsys):
-    project = tmp_path / "project"
-    project.mkdir()
+def test_a_fresh_project_gets_the_package_manifest_hooks_ci_and_a_passing_verify(tmp_path: Path):
+    project = git_project(tmp_path)
     report = project_install.install(project)
-    assert (project / "harness" / "src" / "coding_agent" / "gate.py").exists()
-    assert not list((project / "harness" / "src").rglob("__pycache__"))
-    assert install.is_owned_intact(project / "harness" / "src" / "coding_agent")
+    assert (project / "harness" / "coding-agent" / "src" / "coding_agent" / "gate.py").exists()
+    assert install.is_owned_intact(project / "harness" / "coding-agent" / "src" / "coding_agent")
     manifest = load(project / "integration.yaml")
-    assert manifest.python_src == "harness/src" and manifest.verified is False
-    assert (project / ".claude" / "settings.json").exists() and (project / ".codex" / "hooks.json").exists()
-    assert any(line.startswith("gate: live hook files match") for line in report)
+    assert manifest.python_src == "harness/coding-agent/src" and manifest.verified is False
+    settings = json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert "PreToolUse" in settings["hooks"] and "SessionStart" in settings["hooks"]
+    assert not (project / ".codex" / "hooks.json").exists()
+    assert (project / ".github" / "workflows" / "coding-agent.yml").read_text(encoding="utf-8").startswith(project_install.CI_MARK)
+    assert "vendors: claude_code" in report
+    assert "verify: orca-guard (enforce) answered exit 2 to an invalid status" in report
+    assert "verify: prompt-reset answered exit 0" in report
     assert gate.main(["--manifest", str(project / "integration.yaml")]) == 0
 
 
-def test_an_existing_manifest_is_never_overwritten(tmp_path: Path):
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "integration.yaml").write_text((ROOT / "integration.yaml").read_text(encoding="utf-8").replace("python_src: src", "python_src: vendored/src"), encoding="utf-8")
+def test_the_installed_hooks_run_from_the_command_the_host_file_contains(tmp_path: Path):
+    project = git_project(tmp_path)
+    project_install.install(project, run_verify=False)
+    settings = json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    commands = [h["command"] for event in settings["hooks"].values() for entry in event for h in entry["hooks"]]
+    assert all(c.startswith("CODING_AGENT_MODE_") and '"$CLAUDE_PROJECT_DIR"/harness/coding-agent/src' in c for c in commands)
+
+
+def test_vendors_are_detected_from_the_project_and_can_be_forced(tmp_path: Path):
+    project = git_project(tmp_path)
+    (project / ".codex").mkdir()
+    assert project_install.detect_hosts(project, None) == ["codex"]
+    (project / ".claude").mkdir()
+    assert project_install.detect_hosts(project, None) == ["claude_code", "codex"]
+    assert project_install.detect_hosts(project, "claude") == ["claude_code"]
+    with pytest.raises(project_install.InstallError, match="unknown vendor"):
+        project_install.detect_hosts(project, "cursor")
+
+
+def test_a_bare_project_defaults_to_claude_code(tmp_path: Path):
+    project = git_project(tmp_path)
+    assert project_install.detect_hosts(project, None) == ["claude_code"]
+
+
+def test_an_existing_settings_file_keeps_the_users_hooks_and_is_backed_up(tmp_path: Path):
+    project = git_project(tmp_path)
+    (project / ".claude").mkdir()
+    (project / ".claude" / "settings.json").write_text(json.dumps({
+        "model": "opus",
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/my-lint"}]}]},
+    }), encoding="utf-8")
+    project_install.install(project, run_verify=False)
+    settings = json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert settings["model"] == "opus"
+    assert any(h["command"] == "/usr/local/bin/my-lint" for entry in settings["hooks"]["PreToolUse"] for h in entry["hooks"])
+    assert (project / ".claude" / "settings.json.bak").exists()
+
+
+def test_a_second_install_is_idempotent(tmp_path: Path):
+    project = git_project(tmp_path)
+    project_install.install(project)
+    first = (project / ".claude" / "settings.json").read_text(encoding="utf-8")
     report = project_install.install(project)
+    assert (project / ".claude" / "settings.json").read_text(encoding="utf-8") == first
+    assert any("previous copy kept at" in line for line in report)
     assert "manifest: kept existing integration.yaml" in report
+
+
+def test_an_existing_manifest_is_never_overwritten(tmp_path: Path):
+    project = git_project(tmp_path)
+    (project / "integration.yaml").write_text((ROOT / "integration.yaml").read_text(encoding="utf-8").replace("python_src: src", "python_src: vendored/src"), encoding="utf-8")
+    project_install.install(project, python_src="vendored/src", run_verify=False)
     assert load(project / "integration.yaml").python_src == "vendored/src"
 
 
-def test_a_second_install_replaces_the_owned_copy_and_keeps_a_backup(tmp_path: Path):
-    project = tmp_path / "project"
-    project.mkdir()
-    project_install.install(project)
-    report = project_install.install(project)
-    assert any("previous copy kept at" in line for line in report)
-    assert list((project / ".coding-agent" / "backups").iterdir())
+def test_an_existing_ci_file_that_is_not_ours_is_kept(tmp_path: Path):
+    project = git_project(tmp_path)
+    ci = project / ".github" / "workflows" / "coding-agent.yml"
+    ci.parent.mkdir(parents=True)
+    ci.write_text("name: mine\n", encoding="utf-8")
+    report = project_install.install(project, run_verify=False)
+    assert ci.read_text(encoding="utf-8") == "name: mine\n"
+    assert any("kept existing" in line for line in report)
 
 
-def test_an_unowned_copy_is_refused_and_left_in_place(tmp_path: Path):
-    project = tmp_path / "project"
-    (project / "harness" / "src" / "coding_agent").mkdir(parents=True)
-    mine = project / "harness" / "src" / "coding_agent" / "mine.py"
+def test_no_ci_flag_writes_no_workflow(tmp_path: Path):
+    project = git_project(tmp_path)
+    project_install.install(project, run_verify=False, ci=False)
+    assert not (project / ".github").exists()
+
+
+def test_an_unowned_package_copy_is_refused_and_left_in_place(tmp_path: Path):
+    project = git_project(tmp_path)
+    mine = project / "harness" / "coding-agent" / "src" / "coding_agent" / "mine.py"
+    mine.parent.mkdir(parents=True)
     mine.write_text("keep me", encoding="utf-8")
     with pytest.raises(install.NotOwned):
         project_install.install(project)
@@ -58,19 +123,83 @@ def test_an_unowned_copy_is_refused_and_left_in_place(tmp_path: Path):
     assert not (project / "integration.yaml").exists()
 
 
-def test_a_custom_location_and_verify_command_reach_the_manifest(tmp_path: Path):
-    project = tmp_path / "project"
-    project.mkdir()
-    project_install.install(project, python_src="tools/src", verify="make test")
+def test_a_host_file_that_is_not_json_stops_the_install_without_changes(tmp_path: Path):
+    project = git_project(tmp_path)
+    (project / ".claude").mkdir()
+    (project / ".claude" / "settings.json").write_text("{ broken", encoding="utf-8")
+    with pytest.raises(Exception, match="not valid JSON"):
+        project_install.install(project, run_verify=False)
+    assert (project / ".claude" / "settings.json").read_text(encoding="utf-8") == "{ broken"
+
+
+def test_a_failing_wiring_check_is_reported(tmp_path: Path):
+    project = git_project(tmp_path)
+    project_install.install(project, run_verify=False)
+    settings = project / ".claude" / "settings.json"
+    settings.write_text(settings.read_text(encoding="utf-8").replace("CODING_AGENT_MODE_ORCA_GUARD=enforce", "CODING_AGENT_MODE_ORCA_GUARD=shadow"), encoding="utf-8")
+    with pytest.raises(project_install.InstallError, match="differ from integration.yaml"):
+        project_install.verify_wiring(project, project / "integration.yaml", ["claude_code"])
+
+
+def test_a_hook_that_does_not_block_fails_the_wiring_check(tmp_path: Path, monkeypatch):
+    project = git_project(tmp_path)
+    project_install.install(project, run_verify=False)
+    settings = project / ".claude" / "settings.json"
+    document = json.loads(settings.read_text(encoding="utf-8"))
+    for entries in document["hooks"].values():
+        for entry in entries:
+            for hook in entry["hooks"]:
+                hook["command"] = hook["command"].replace("CODING_AGENT_MODE_ORCA_GUARD=enforce", "CODING_AGENT_MODE_ORCA_GUARD=shadow")
+    settings.write_text(json.dumps(document), encoding="utf-8")
     manifest = load(project / "integration.yaml")
-    assert manifest.python_src == "tools/src" and manifest.verify_commands == ("make test",)
-    assert (project / "tools" / "src" / "coding_agent" / "cli.py").exists()
+    assert manifest.hook("orca-guard").mode == "enforce"
+    monkeypatch.setattr(project_install.gen, "drift", lambda *_args: [])
+    with pytest.raises(project_install.InstallError, match="orca-guard answered exit 0, expected 2"):
+        project_install.verify_wiring(project, project / "integration.yaml", ["claude_code"])
+
+
+def test_uninstall_removes_the_wiring_and_the_copy_and_keeps_the_users_hooks(tmp_path: Path):
+    project = git_project(tmp_path)
+    (project / ".claude").mkdir()
+    (project / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/my-lint"}]}]}}), encoding="utf-8")
+    project_install.install(project, run_verify=False)
+    report = project_install.uninstall(project)
+    settings = json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert [h["command"] for entry in settings["hooks"]["PreToolUse"] for h in entry["hooks"]] == ["/usr/local/bin/my-lint"]
+    assert not (project / "harness" / "coding-agent" / "src" / "coding_agent").exists()
+    assert not (project / "harness").exists()
+    assert not (project / ".github" / "workflows" / "coding-agent.yml").exists()
+    assert not (project / ".coding-agent" / "installed.json").exists()
+    assert (project / "integration.yaml").exists()
+    assert any("package: removed" in line for line in report)
+
+
+def test_uninstall_keep_core_leaves_the_package(tmp_path: Path):
+    project = git_project(tmp_path)
+    project_install.install(project, run_verify=False)
+    project_install.uninstall(project, keep_core=True)
+    assert (project / "harness" / "coding-agent" / "src" / "coding_agent" / "gate.py").exists()
+
+
+def test_clean_reinstalls_from_scratch(tmp_path: Path, capsys):
+    project = git_project(tmp_path)
+    assert project_install.main(["--project", str(project), "--no-verify"]) == 0
+    assert project_install.main(["--project", str(project), "--no-verify", "--clean"]) == 0
+    out = capsys.readouterr().out
+    assert "package: removed" in out and out.count("package: harness/coding-agent/src/coding_agent") == 2
+
+
+def test_the_cli_reports_errors_with_exit_two(tmp_path: Path, capsys):
+    assert project_install.main(["--project", str(tmp_path / "nowhere")]) == 2
+    assert "not a directory" in capsys.readouterr().err
+    project = git_project(tmp_path)
+    assert project_install.main(["--project", str(project), "--vendor", "cursor"]) == 2
+    assert "unknown vendor" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("python_src", ["/abs/src", "../escape"])
 def test_a_location_outside_the_project_is_refused(tmp_path: Path, python_src):
-    project = tmp_path / "project"
-    project.mkdir()
+    project = git_project(tmp_path)
     with pytest.raises(project_install.InstallError, match="relative path"):
         project_install.install(project, python_src=python_src)
 
@@ -80,18 +209,17 @@ def test_a_missing_project_directory_is_refused(tmp_path: Path):
         project_install.install(tmp_path / "nowhere")
 
 
-def test_the_cli_reports_errors_with_exit_two(tmp_path: Path, capsys):
-    assert project_install.main(["--project", str(tmp_path / "nowhere")]) == 2
-    assert "not a directory" in capsys.readouterr().err
-    project = tmp_path / "project"
-    project.mkdir()
-    assert project_install.main(["--project", str(project)]) == 0
-    assert "gate: live hook files match" in capsys.readouterr().out
-
-
 def test_a_template_without_the_expected_lines_is_refused(tmp_path: Path, monkeypatch):
     broken = tmp_path / "template.yaml"
     broken.write_text("schema: 1\nverified: false\npython_source: src\nhooks: []\n", encoding="utf-8")
     monkeypatch.setattr(project_install, "TEMPLATE", broken)
     with pytest.raises(project_install.InstallError, match="cannot set it"):
-        project_install.manifest_text("harness/src", "true")
+        project_install.manifest_text("harness/coding-agent/src", "true")
+
+
+def test_gitignore_gets_the_state_directory_once(tmp_path: Path):
+    project = git_project(tmp_path)
+    (project / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+    project_install.install(project, run_verify=False)
+    project_install.install(project, run_verify=False)
+    assert (project / ".gitignore").read_text(encoding="utf-8").splitlines().count(".coding-agent/") == 1

@@ -63,3 +63,12 @@ def test_removal_of_an_owned_install_keeps_a_backup(tmp_path: Path):
     backups.mkdir()
     kept = install.safe_remove(target, backup_root=backups)
     assert kept is not None and not target.exists()
+
+
+def test_two_backups_in_the_same_second_do_not_collide(tmp_path: Path):
+    target = make_tree(tmp_path / "pkg", {"a.py": "1"})
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    first = install.backup(target, backups)
+    second = install.backup(target, backups)
+    assert first != second and first.exists() and second.exists()
