@@ -125,6 +125,34 @@ python3 -m coding_agent.cli board          # bảng việc hiện tại
 
 Chưa kiểm trên Orca thật: định dạng trả về của `worker-start` (`result.dispatch.id`) và cách Orca chọn agent.
 
+## Chia việc theo graph
+
+Việc có nhiều phần phụ thuộc nhau được khai trong một plan YAML. Mỗi node là một task Orca; phụ thuộc được chuyển
+cho Orca qua `--deps`. Worker chỉ được khởi động cho node đã xong hết phụ thuộc.
+
+```yaml
+tasks:
+  - id: protocol
+    title: Wire protocol
+    spec: Định nghĩa message và validate
+  - id: server
+    title: Server
+    spec: Room actor, transport
+    deps: [protocol]
+    agent: codex        # tuỳ chọn
+```
+
+```sh
+python3 -m coding_agent.cli run-init --objective "..."   # một lần cho mỗi terminal coordinator; lưu vào .coding-agent/orca-run
+python3 -m coding_agent.cli plan-apply plan.yaml         # tạo task theo thứ tự phụ thuộc; chạy lại không tạo trùng
+python3 -m coding_agent.cli plan-next plan.yaml --max 2  # khởi động worker cho các node sẵn sàng
+python3 -m coding_agent.cli plan-status plan.yaml        # graph: trạng thái từng node và phụ thuộc còn mở
+```
+
+Plan bị từ chối khi có id trùng, phụ thuộc không tồn tại, tự phụ thuộc, hoặc vòng lặp. Node có phụ thuộc `failed`
+hay `blocked` không bao giờ được giao. Ánh xạ plan id → Orca task id nằm ở `.coding-agent/plan.json`.
+Chưa có: tự chạy `plan-next` khi một worker xong (coordinator gọi lại lệnh), và ratchet giữ bản tốt nhất như DSH.
+
 ## Mode và assumption
 
 - `mode` có ba giá trị: `off` (không chạy), `shadow` (ghi quyết định, không chặn), `enforce` (được chặn).

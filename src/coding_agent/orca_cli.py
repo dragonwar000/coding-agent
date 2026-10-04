@@ -50,6 +50,38 @@ def run_id(explicit: str | None) -> str | None:
     return explicit or os.environ.get(RUN_ENV) or None
 
 
+RUN_FILE = Path(".coding-agent") / "orca-run"
+
+
+def use_stored_run(root: Path) -> None:
+    """Make the Run stored by `run-init` the default for this process, unless the environment already names one."""
+    path = root / RUN_FILE
+    if os.environ.get(RUN_ENV) or not path.exists():
+        return
+    stored = path.read_text(encoding="utf-8").strip()
+    if stored:
+        os.environ[RUN_ENV] = stored
+
+
+def run_init(root: Path, objective: str) -> str:
+    """Create an Orca Run from this terminal and store its id for later commands and hooks. Returns the Run id.
+
+    Assumption, unverified against a live Orca: run-create answers the id at `result.run.id`, `result.id`, or `result.runId`.
+    """
+    answer = _call("run-create", "--objective", objective)
+    result = answer.get("result") if isinstance(answer, dict) else None
+    run = None
+    if isinstance(result, dict):
+        nested = result.get("run")
+        run = (nested.get("id") if isinstance(nested, dict) else None) or result.get("runId") or result.get("id")
+    if not isinstance(run, str) or not run:
+        raise OrcaError("the run-create answer has no run id")
+    path = root / RUN_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(run + "\n", encoding="utf-8")
+    return run
+
+
 def _run_args(run: str | None) -> list[str]:
     chosen = run_id(run)
     return ["--run", chosen] if chosen else []
@@ -121,10 +153,14 @@ def owner_of(root: Path, task_id: str) -> str | None:
     return links(root).get(task_id)
 
 
-def create_task(root: Path, *, project: str, t_id: str, spec: str, title: str, run: str | None = None) -> str:
-    """Create an Orca task that carries the durable `T-id` and the `project`, then link the two ids (FR-006)."""
+def create_task(root: Path, *, project: str, t_id: str, spec: str, title: str, run: str | None = None, deps: tuple[str, ...] = ()) -> str:
+    """Create an Orca task that carries the durable `T-id` and the `project`, then link the two ids (FR-006).
+
+    `deps` are the Orca task ids this task depends on; Orca records them with the task.
+    """
     header = f"project: {project}\nt_id: {t_id}\n\n"
-    task_id = task_id_of(_call("task-create", "--spec", header + spec, "--task-title", title, *_run_args(run)))
+    dep_args = ["--deps", json.dumps(list(deps))] if deps else []
+    task_id = task_id_of(_call("task-create", "--spec", header + spec, "--task-title", title, *dep_args, *_run_args(run)))
     orca.link(root, t_id=t_id, task_id=task_id, project=project)
     return task_id
 

@@ -88,6 +88,7 @@ def contract(python_src: str) -> str:
         "- Bạn tự quyết định: việc nhỏ, một bước, hoặc cần kết quả ngay thì tự làm; việc lớn, nhiều bước, hoặc chạy lâu thì giao worker.",
         "- Hook chỉ nhắc khi bạn sửa file hay chạy lệnh làm thay đổi trạng thái, không chặn. Ghi ngắn lý do làm trực tiếp hoặc giao việc trong câu trả lời.",
         f"- Giao việc bằng: PYTHONPATH={python_src} python3 -m coding_agent.cli delegate --title \"...\" --spec \"...\" [--agent claude|codex]",
+        "- Việc nhiều phần phụ thuộc nhau: viết plan YAML (tasks: id, title, spec, deps) rồi `plan-apply FILE` và `plan-next FILE`; `plan-status FILE` xem graph. Chỉ task đã xong hết phụ thuộc mới được giao.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",
     ])
@@ -121,12 +122,14 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
 def board_context(board: list[str], error: str | None) -> str:
     """The board block injected on each prompt. An unavailable Orca is reported, never hidden."""
     if error is not None:
-        return f"[coordinator] bảng việc không đọc được từ Orca: {error}. Hỏi người dùng trước khi nói về tiến độ."
+        hint = " Chưa có Orca Run: chạy `python3 -m coding_agent.cli run-init --objective \"...\"` một lần trong terminal này." if "run_required" in error else ""
+        return f"[coordinator] bảng việc không đọc được từ Orca: {error}.{hint} Hỏi người dùng trước khi nói về tiến độ."
     return "[coordinator] bảng việc hiện tại:\n" + "\n".join(board)
 
 
 def read_board(root: Path, run: str | None = None) -> tuple[list[str], str | None]:
     """The board lines for this repository, or the reason Orca could not be read."""
+    orca_cli.use_stored_run(root)
     try:
         tasks = orca_cli.list_tasks(run)
     except orca_cli.OrcaError as error:

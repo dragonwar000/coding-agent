@@ -38,9 +38,12 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"id": str(uuid.uuid4()), "ok": False, "error": {"code": "run_required", "message": "No Run is bound."}}))
         return 1
 
-    if command == "task-create":
+    if command == "run-create":
+        answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"run": {"id": "run_created", "objective": options.get("--objective", "")}}}
+    elif command == "task-create":
         task_id = f"task_{len(tasks) + 1:04d}"
-        tasks[task_id] = {"id": task_id, "title": options.get("--task-title", ""), "spec": options.get("--spec", ""), "status": "pending", "result": None}
+        tasks[task_id] = {"id": task_id, "title": options.get("--task-title", ""), "spec": options.get("--spec", ""), "status": "pending", "result": None,
+                          "deps": json.loads(options.get("--deps", "[]"))}
         answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"task": {"id": task_id, "status": "pending"}}}
     elif command == "task-update":
         task = tasks.get(options.get("--id", ""))
