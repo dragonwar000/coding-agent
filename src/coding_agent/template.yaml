@@ -1,0 +1,101 @@
+# Manifest duy nhất của harness. Mọi điểm nối với Claude Code và Codex được khai ở đây,
+# và `python -m coding_agent.gen` sinh cấu hình của từng công cụ từ file này.
+schema: 1
+
+# verified: false nghĩa là các ngưỡng và assumption trong file này là mặc định ước đoán, chưa đo trên phiên thật.
+# ADAPT-CHECKLIST (finalize khi có phiên thật):
+#   1. Chạy ở shadow ít nhất một tuần, rồi xem `python3 -m coding_agent.cli report`: số lần nhắc và chặn khớp hành vi thật.
+#   2. Đối chiếu từng `remind-repeat` và `stop-*` với transcript: lặp đó là kẹt thật hay là đang làm việc.
+#   3. Đo cấu trúc JSON thật của `orchestration task-list` và `task-create`: sửa `tasks_of` và `task_id_of` trong `orca_cli.py` nếu khác giả định.
+#   4. Chỉ khi (1) đến (3) đạt và người duyệt đồng ý: đổi một guard sang `enforce`, rồi đặt `verified: true`.
+verified: false
+
+# Thư mục chứa package, tính từ gốc repo (nơi đặt manifest này). Đường dẫn tương đối, không tuyệt đối.
+python_src: src
+
+# Lệnh verify chạy ở sự kiện Stop. Rỗng nghĩa là không có bằng chứng nào: phán quyết là `skipped`, không bao giờ `ok`.
+verify:
+  commands:
+    - "python3 -m pytest -q"
+  timeout_s: 300
+  max_continuations: 3
+
+# Bộ nhớ của agent: Zero-Mem (zm) với quy tắc episode của memory-distill.
+memory:
+  ingest: both                 # conversation | episodes | both
+  embedder: hash               # hash | default (default cần thư mục model của zm)
+  change_tools: [Write, Edit, MultiEdit]
+  transient_markers:
+    - "this session"
+    - "for now"
+    - "today only"
+    - "temporarily"
+    - "for this turn"
+    - "tạm thời"
+    - "chỉ trong phiên này"
+  max_episode_request_chars: 1000
+  max_episode_outcome_chars: 2000
+  max_episode_chars: 6000
+
+# Ngưỡng của loop-guard và denial budget (Task 5). Ngưỡng bằng 0 nghĩa là tắt.
+# ASSUMPTION: 3 lần lặp đúng một lời gọi là đủ để nhắc; 6 lần là đủ để dừng. Chưa đo trên phiên thật.
+loop:
+  remind_at: 3
+  stop_at: 6
+  max_tool_calls_per_turn: 400
+  max_denials_per_turn: 5     # ASSUMPTION: 5 lượt gọi tool bị từ chối hoặc lỗi trong một lượt là đủ để dừng việc thử lại.
+
+# Hook. `mode` có ba giá trị: off (không chạy), shadow (ghi quyết định, không chặn), enforce (được chặn).
+# Mặc định là shadow (FR-010). Mọi hook không off bắt buộc có `assumption`: câu nêu điều hook giả định về model.
+# Chỉ hook đã khai enforce mới được chặn. Hiện orca-guard (FR-009), stop-gate (SC-002) và coordinator-guard (bắt buộc chia việc theo graph) ở enforce.
+hooks:
+  - id: orca-guard
+    host: [claude_code, codex]
+    event: PreToolUse
+    matcher: Bash
+    mode: enforce
+    assumption: "Lệnh orca task-update với status ngoài enum là sai và Orca sẽ trả ok:false lặng lẽ."
+  - id: loop-guard
+    host: [claude_code]
+    event: PreToolUse
+    matcher: "Write|Edit|MultiEdit|Bash"
+    mode: shadow
+    assumption: "Model lặp đúng một lời gọi tool với cùng tham số, hoặc gặp quá nhiều lời gọi bị từ chối, là đang bị kẹt, không phải đang làm việc."
+  - id: prompt-reset
+    host: [claude_code, codex]
+    event: UserPromptSubmit
+    mode: shadow
+    assumption: "Mỗi prompt của người dùng bắt đầu một lượt mới; bộ đếm của lượt cũ không được mang sang."
+  - id: stop-gate
+    host: [claude_code]
+    event: Stop
+    mode: enforce
+    assumption: "Lệnh verify là bằng chứng đủ để một lượt được coi là xong; câu trả lời của model thì không."
+  - id: pre-compact
+    host: [claude_code]
+    event: PreCompact
+    mode: shadow
+    assumption: "Ghi nhận lúc nén ngữ cảnh là đủ để đối chiếu sau này; không cần sao chép gì khi nén."
+  - id: session-restore
+    host: [claude_code]
+    event: SessionStart
+    matcher: compact
+    mode: shadow
+    assumption: "Vài prompt gần nhất của người dùng là đủ để tiếp tục công việc sau khi nén ngữ cảnh."
+  - id: coordinator-guard
+    host: [claude_code]
+    event: PreToolUse
+    matcher: "Write|Edit|MultiEdit|NotebookEdit|Bash|Agent|Task"
+    mode: enforce
+    assumption: "Mọi thay đổi file của coordinator phải đi qua graph: worker Orca làm từng node trong worktree riêng. Coordinator chỉ ghi file plan và chạy lệnh của coding-agent."
+  - id: coordinator-context
+    host: [claude_code]
+    event: SessionStart
+    matcher: "startup|resume|clear|compact"
+    mode: shadow
+    assumption: "Hợp đồng coordinator và bảng việc đầu phiên là đủ để coordinator tiếp tục đúng vai sau khi khởi động hoặc nén ngữ cảnh."
+  - id: coordinator-board
+    host: [claude_code]
+    event: UserPromptSubmit
+    mode: shadow
+    assumption: "Bảng việc đọc từ Orca ở mỗi prompt đủ mới để trả lời người dùng về tiến độ."
