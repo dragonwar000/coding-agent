@@ -317,3 +317,8 @@ def test_a_worker_started_by_task_id_gets_its_name_from_the_title_orca_stores(re
     record = json.loads(fake_orca.read_text(encoding="utf-8"))["dispatches"][dispatch]
     assert record["name"] == "vat-the-tuong-tac-anh-sang" and record["display"] == "Vật thể tương tác, ánh sáng"
     assert not record["name"].startswith("ca-")
+
+
+def test_the_contract_asks_for_short_summary_titles():
+    text = coordinator.contract("harness/coding-agent/src")
+    assert "tóm tắt việc cần làm" in text and "40 ký tự" in text

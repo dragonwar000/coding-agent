@@ -116,6 +116,7 @@ def contract(python_src: str) -> str:
         "- Worker tách nhánh từ commit hiện tại: commit việc đang dở trước khi `plan-next`, nếu không worker sẽ không thấy nó.",
         f"- Giao việc bằng: PYTHONPATH={python_src} python3 -m coding_agent.cli delegate --title \"...\" --spec \"...\" [--agent claude|codex]",
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
+        "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
