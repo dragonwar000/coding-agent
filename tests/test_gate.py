@@ -45,3 +45,14 @@ def test_an_invalid_manifest_is_exit_two(tmp_path, capsys):
     bad.write_text("schema: 1\npython_src: src\nhooks: []\n", encoding="utf-8")
     assert gate.main(["--manifest", str(bad)]) == 2
     assert "verified must be true or false" in capsys.readouterr().err
+
+
+def test_a_missing_pyyaml_is_a_clear_exit_two(tmp_path, capsys, monkeypatch):
+    def no_yaml(_path):
+        raise ImportError("No module named 'yaml'")
+
+    monkeypatch.setattr(gate, "load", no_yaml)
+    manifest = tmp_path / "integration.yaml"
+    manifest.write_text("schema: 1\n", encoding="utf-8")
+    assert gate.main(["--manifest", str(manifest)]) == 2
+    assert "PyYAML is not importable" in capsys.readouterr().err

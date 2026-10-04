@@ -24,6 +24,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ManifestError, OSError) as error:
         print(f"gate: {error}", file=sys.stderr)
         return 2
+    except ImportError as error:
+        print(f"gate: PyYAML is not importable ({error}); install pyyaml into this python3", file=sys.stderr)
+        return 2
     problems = gen.drift(manifest)
     for problem in problems:
         print(f"gate: {problem}", file=sys.stderr)

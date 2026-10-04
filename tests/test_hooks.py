@@ -262,3 +262,24 @@ def test_without_an_env_mode_the_manifest_mode_applies(repo, monkeypatch):
     monkeypatch.delenv("CODING_AGENT_MODE_ORCA_GUARD", raising=False)
     assert context_for("orca-guard", {"cwd": str(repo)}).mode == "enforce"
     assert context_for("pre-compact", {"cwd": str(repo)}).mode == "off"
+
+
+def test_a_manifest_that_cannot_be_used_is_reported_by_every_hook(repo):
+    (repo / "integration.yaml").write_text("schema: 2\n", encoding="utf-8")
+    result = call(repo, "prompt-reset", {"session_id": "s30", "prompt": "hello", "cwd": str(repo)}, mode="shadow")
+    assert result.returncode == 0
+    assert "integration.yaml cannot be used" in result.stderr and "schema must be 1" in result.stderr
+    assert _events(repo)[-1]["kind"] == "manifest-error" and _events(repo)[-1]["applied"] is False
+
+
+def test_a_missing_pyyaml_in_the_hook_interpreter_is_reported(repo, monkeypatch):
+    from coding_agent import hooks
+
+    manifest(repo, verify=[])
+
+    def no_yaml(_path):
+        raise ImportError("No module named 'yaml'")
+
+    monkeypatch.setattr(hooks, "load", no_yaml)
+    ctx = hooks.context_for("prompt-reset", {"cwd": str(repo)})
+    assert ctx.manifest is None and "PyYAML is not importable" in ctx.manifest_error

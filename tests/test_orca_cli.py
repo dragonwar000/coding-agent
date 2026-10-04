@@ -15,6 +15,7 @@ def fake_orca(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     state = tmp_path / "orca-state.json"
     monkeypatch.setenv("CODING_AGENT_ORCA", str(FAKE))
     monkeypatch.setenv("FAKE_ORCA_STATE", str(state))
+    monkeypatch.setenv("CODING_AGENT_ORCA_RUN", "run_test")
     return state
 
 
@@ -112,3 +113,36 @@ def test_the_cli_create_status_and_claim_commands_run_end_to_end(repo, fake_orca
     assert cli.main(["--root", str(repo), "claim", "--task-id", "task_0001", "--project", "elsewhere"]) == 1
     assert "refused" in capsys.readouterr().err
     assert cli.main(["--root", str(repo), "claim", "--task-id", "task_0001"]) == 0
+
+
+def test_status_groups_only_this_repositorys_tasks(repo, fake_orca, capsys):
+    mine = orca_cli.create_task(repo, project="demo-repo", t_id="T-20", spec="x", title="Mine")
+    theirs = orca_cli.create_task(repo, project="other-repo", t_id="T-21", spec="y", title="Theirs")
+    orca_cli.set_status(repo, task_id=mine, requested="dispatched", basis=None)
+    orca_cli.set_status(repo, task_id=theirs, requested="dispatched", basis=None)
+    assert cli.main(["--root", str(repo), "status"]) == 0
+    view = json.loads(capsys.readouterr().out)
+    assert view["project"] == "demo-repo"
+    assert view["counts"]["running"] == 1
+    assert [t["id"] for t in view["tasks"]["running"]] == [mine]
+    assert all(t["id"] != theirs for group in view["tasks"].values() for t in group)
+
+
+def test_status_reports_a_failing_orca_cli(repo, fake_orca, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_ORCA_FAIL", "1")
+    assert cli.main(["--root", str(repo), "status"]) == 1
+    assert "daemon not running" in capsys.readouterr().err
+
+
+def test_without_a_run_the_cli_answers_run_required(repo, fake_orca, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_ORCA_RUN")
+    with pytest.raises(orca_cli.OrcaError, match="run_required"):
+        orca_cli.list_tasks()
+    assert orca_cli.list_tasks(run="run_explicit") == []
+
+
+def test_an_explicit_run_overrides_the_environment(repo, fake_orca, monkeypatch):
+    monkeypatch.setenv("CODING_AGENT_ORCA_RUN", "run_env")
+    assert orca_cli.run_id(None) == "run_env" and orca_cli.run_id("run_arg") == "run_arg"
+    monkeypatch.delenv("CODING_AGENT_ORCA_RUN")
+    assert orca_cli.run_id(None) is None

@@ -79,3 +79,15 @@ def test_the_guard_status_enum_matches_the_gate():
 
     assert orca.ORCA_STATUSES == {"pending", "ready", "dispatched", "completed", "failed", "blocked"}
     assert handlers.TASK_UPDATE.search("orca orchestration task-update --id x --status done")
+
+
+def test_a_basis_recorded_in_the_result_counts_as_proof():
+    assert orca.basis_of({"basis": "predicate"}) == "predicate"
+    assert orca.basis_of({"result": {"basis": "verifier"}}) == "verifier"
+    assert orca.basis_of({"result": {"provenance": "worker_report", "outcome": "succeeded"}}) is None
+    groups = orca.reconcile([
+        {"id": "p", "status": "completed", "result": {"basis": "predicate"}, "project": "demo-repo"},
+        {"id": "w", "status": "completed", "result": {"provenance": "worker_report"}, "project": "demo-repo"},
+    ], project="demo-repo")
+    assert [t["id"] for t in groups["unverified"]] == ["w"]
+    assert [t["id"] for t in groups["other"]] == ["p"]

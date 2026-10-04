@@ -9,6 +9,7 @@
 - `orca-status --task-id ID --status S [--basis B] [--artifact PATH ...]`: apply a status under the completion rule (FR-007).
 - `claim --task-id ID [--project NAME]`: refuse a task owned by another repository and log the refusal (FR-008).
 - `orca-check --tasks FILE [--strict]`: report `CLAIMED-DONE BUT ABSENT`; `--strict` exits 1 when any is found (SC-002).
+- `status`: this repository's Orca tasks by state, read from the live Orca CLI (FR-014, SC-001).
 """
 
 from __future__ import annotations
@@ -41,6 +42,25 @@ def _store(root: Path):
     return store
 
 
+def _status(root: Path, run: str | None) -> int:
+    """Group this repository's Orca tasks by state. Tasks are attributed to a repository by the link ledger, not by Orca."""
+    project = orca.project_name(root)
+    owners = orca_cli.links(root)
+    try:
+        tasks = orca_cli.list_tasks(run)
+    except orca_cli.OrcaError as error:
+        print(f"status: {error}", file=sys.stderr)
+        return 1
+    mine = [{**task, "project": owners[str(task.get("id"))]} for task in tasks if owners.get(str(task.get("id"))) == project]
+    groups = orca.reconcile(mine, project=project)
+    view = {
+        name: [{"id": t.get("id"), "title": t.get("task_title") or t.get("title"), "status": t.get("status"), "basis": orca.basis_of(t)} for t in items]
+        for name, items in groups.items()
+    }
+    print(json.dumps({"project": project, "counts": {name: len(items) for name, items in view.items()}, "tasks": view}, indent=2, ensure_ascii=False))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="coding_agent.cli")
     parser.add_argument("--root", help="project root (default: current directory)")
@@ -64,16 +84,21 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--t-id", required=True)
     create.add_argument("--title", required=True)
     create.add_argument("--spec", required=True)
+    create.add_argument("--run", help="Orca Run id (default: CODING_AGENT_ORCA_RUN or the CLI's bound Run)")
 
     status = sub.add_parser("orca-status", help="set an Orca task's status under the completion rule")
     status.add_argument("--task-id", required=True)
     status.add_argument("--status", required=True)
     status.add_argument("--basis")
     status.add_argument("--artifact", action="append", default=[])
+    status.add_argument("--run")
 
     claim = sub.add_parser("claim", help="claim an Orca task for this repository")
     claim.add_argument("--task-id", required=True)
     claim.add_argument("--project")
+
+    listing = sub.add_parser("status", help="this repository's Orca tasks by state")
+    listing.add_argument("--run")
 
     check = sub.add_parser("orca-check", help="find tasks that claim completion while an artifact is missing")
     check.add_argument("--tasks", required=True, type=Path)
@@ -86,15 +111,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "report":
             print(json.dumps(events.summarize(root), indent=2, ensure_ascii=False))
             return 0
+        if args.command == "status":
+            return _status(root, args.run)
         if args.command == "brief":
             print(brief(args.plan.read_text(encoding="utf-8"), args.task), end="")
             return 0
         if args.command == "orca-create":
-            task_id = orca_cli.create_task(root, project=orca.project_name(root), t_id=args.t_id, spec=args.spec, title=args.title)
+            task_id = orca_cli.create_task(root, project=orca.project_name(root), t_id=args.t_id, spec=args.spec, title=args.title, run=args.run)
             print(json.dumps({"t_id": args.t_id, "task_id": task_id, "project": orca.project_name(root)}, ensure_ascii=False))
             return 0
         if args.command == "orca-status":
-            outcome = orca_cli.set_status(root, task_id=args.task_id, requested=args.status, basis=args.basis, artifacts=tuple(args.artifact))
+            outcome = orca_cli.set_status(root, task_id=args.task_id, requested=args.status, basis=args.basis, artifacts=tuple(args.artifact), run=args.run)
             print(json.dumps({"decision": outcome.decision, "sent": outcome.sent, "reason": outcome.reason}, ensure_ascii=False))
             return 0
         if args.command == "claim":

@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +34,8 @@ class Context:
     session: str
     manifest: Manifest | None
     payload: dict[str, Any] = field(default_factory=dict)
+    # Why `integration.yaml` exists but cannot be used, so the hook reports it instead of going quiet.
+    manifest_error: str | None = None
 
     def note(self, *, guard: str, kind: str, applied: bool, detail: dict[str, Any] | None = None) -> None:
         events.record(self.root, guard=guard, kind=kind, mode=self.mode, applied=applied, session=self.session, detail=detail)
@@ -46,22 +48,28 @@ def _root(payload: dict[str, Any]) -> Path:
     return Path.cwd()
 
 
-def _manifest(root: Path) -> Manifest | None:
-    """The repository's manifest, or None. A hook never fails on configuration: the gate and the CLI report it instead."""
+def _manifest(root: Path) -> tuple[Manifest | None, str | None]:
+    """The manifest and None, or None and the reason it cannot be used.
+
+    A hook never breaks the session over configuration. It reports the reason as an event and a warning,
+    and `coding_agent.gate` exits 2 on the same reason.
+    """
     path = root / "integration.yaml"
     if not path.exists():
-        return None
+        return None, None
     try:
-        return load(path.resolve())
-    except (ManifestError, OSError, ImportError, ValueError):
-        return None
+        return load(path.resolve()), None
+    except ImportError as error:
+        return None, f"PyYAML is not importable by this python3 ({error}); install pyyaml into the interpreter that runs the hooks"
+    except (ManifestError, OSError, ValueError) as error:
+        return None, str(error)
 
 
 def context_for(hook_id: str, payload: dict[str, Any]) -> Context:
     """The hook's context. The mode comes from the generated command's env var; without one, the manifest's mode applies, and an unknown hook is `off`."""
     env_name = "CODING_AGENT_MODE_" + hook_id.upper().replace("-", "_")
     root = _root(payload)
-    manifest = _manifest(root)
+    manifest, manifest_error = _manifest(root)
     declared = manifest.hook(hook_id) if manifest is not None else None
     return Context(
         hook_id=hook_id,
@@ -70,6 +78,7 @@ def context_for(hook_id: str, payload: dict[str, Any]) -> Context:
         session=str(payload.get("session_id") or "default"),
         manifest=manifest,
         payload=payload,
+        manifest_error=manifest_error,
     )
 
 
@@ -78,8 +87,13 @@ def run(hook_id: str, payload: dict[str, Any], handler: Callable[[Context], Hook
     ctx = context_for(hook_id, payload)
     if ctx.mode == "off":
         return HookResult()
+    warning = ""
+    if ctx.manifest_error is not None:
+        warning = f"[{hook_id}] integration.yaml cannot be used, so manifest rules are not applied: {ctx.manifest_error}"
+        ctx.note(guard=hook_id, kind="manifest-error", applied=False, detail={"error": ctx.manifest_error})
     try:
-        return handler(ctx)
+        result = handler(ctx)
+        return replace(result, stderr="\n".join(part for part in (warning, result.stderr) if part)) if warning else result
     except Exception as error:  # fail-open: a hook never breaks the session
         try:
             ctx.note(guard=hook_id, kind="hook-error", applied=False, detail={"error": repr(error), "trace": traceback.format_exc()[-800:]})

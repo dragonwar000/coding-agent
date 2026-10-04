@@ -24,7 +24,8 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
-| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `orca-create`, `orca-status`, `claim`, `orca-check` |
+| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check` |
+| `src/coding_agent/project_install.py` | Cài package, manifest và hook vào một dự án (FR-001, FR-004) |
 | `src/coding_agent/gate.py` | Cổng của package (FR-003): thất bại khi file đang dùng lệch manifest |
 | `tests/` | Test gồm `fixtures/fake_orca.py` làm Orca giả lập cho FR-013 |
 
@@ -49,24 +50,24 @@ Test `hooks` và `zeromem` cần binary `zm` trên `PATH` (hoặc `CODING_AGENT_
 các test đó được bỏ qua và báo rõ là bỏ qua. Test Orca dùng `fake_orca.py` qua `CODING_AGENT_ORCA`,
 không cần Orca thật.
 
-## Cài vào một repo đích
+## Cài vào một dự án
 
-Lệnh hook sinh ra tham chiếu package qua `python_src`, tương đối với gốc repo đích (FR-002). Vì vậy
-package phải nằm trong repo đích. Cách cài hiện tại: chép `src/coding_agent` vào repo đích (ví dụ
-`<repo>/harness/src/coding_agent`) và đặt `python_src: harness/src` trong manifest của repo đó. Cài
-từ một commit đã ghim là FR-005, chưa làm.
+Cần: Python 3.11 trở lên, git, và PyYAML trong `python3` mà hook chạy bằng. Nếu thiếu PyYAML, hook báo lỗi
+trong stderr và ghi event `manifest-error`; cổng `gate` thoát 2.
 
 ```sh
-# Sinh đề xuất cấu hình (không ghi đè gì). PYTHONPATH trỏ tới src của package đang dùng.
-PYTHONPATH=<package>/src python3 -m coding_agent.gen --manifest <repo>/integration.yaml
-# Xem .claude/settings.proposed.json, rồi áp dụng khi đã chấp nhận
-PYTHONPATH=<package>/src python3 -m coding_agent.gen --manifest <repo>/integration.yaml --apply
-# Kiểm drift (thoát 1 nếu file đang dùng khác manifest)
-PYTHONPATH=<package>/src python3 -m coding_agent.gen --manifest <repo>/integration.yaml --check
+# 1. Cài package, manifest, và hook vào dự án (không ghi đè manifest có sẵn)
+PYTHONPATH=<đường dẫn coding-agent>/src python3 -m coding_agent.project_install --project <dự án> [--python-src harness/src] [--verify "python3 -m pytest -q"]
+# 2. Cổng: thoát 0 khi file hook đang dùng khớp manifest
+PYTHONPATH=<dự án>/harness/src python3 -m coding_agent.gate --manifest <dự án>/integration.yaml
 ```
 
-Lệnh hook dùng `$CLAUDE_PROJECT_DIR` (Claude Code) hoặc `$(git rev-parse --show-toplevel)` (Codex),
-nên không có đường dẫn tuyệt đối của máy nào trong file sinh ra.
+Installer chép `src/coding_agent` vào `<dự án>/<python_src>/coding_agent`. Bản đã cài chỉ được thay khi
+còn dấu harness; bản cũ được sao lưu vào `.coding-agent/backups/`. Thư mục không có dấu bị từ chối và
+giữ nguyên. Lệnh hook dùng `$CLAUDE_PROJECT_DIR` (Claude Code) hoặc `$(git rev-parse --show-toplevel)`
+(Codex), nên file sinh ra không chứa đường dẫn tuyệt đối của máy nào.
+
+Lệnh `verify` trong manifest chạy trong PATH của hook. Dự án cần có công cụ đó (ví dụ pytest) trong PATH.
 
 ## Mode và assumption
 
@@ -89,6 +90,10 @@ nên không có đường dẫn tuyệt đối của máy nào trong file sinh r
 
 ## Orca
 
+- Lệnh task của Orca chạy trong một Run. Đặt `CODING_AGENT_ORCA_RUN=<run_id>` hoặc truyền `--run`. Không có
+  Run thì CLI trả `run_required`. `orca orchestration run-list` liệt kê các Run.
+- `status [--run ID]` đọc task của Run qua CLI thật và chỉ hiện task do repo này tạo, theo sổ liên kết.
+
 - `orca-create` tạo task với `project` (tên repo) và `T-id` trong spec, rồi ghi liên kết vào
   `.coding-agent/links.jsonl` (FR-006).
 - `claim` chỉ cho phép khi task thuộc repo hiện tại. Từ chối thì ghi event `claim-refused` (FR-008).
@@ -108,8 +113,9 @@ Adapter giả định `task-create` và `task-update` trả `result.task.id`, v�
 | 3. Hoàn thành có bằng chứng | Xong | `completion()` ở `orca.py`, `set_status()` ở `orca_cli.py` |
 | 4. Cách ly theo repo | Xong | Claim từ repo khác bị từ chối và ghi event |
 | 5. Guard vòng lặp và ngân sách | Xong ở shadow | `loop-guard` có trần lượt và denial budget; `stop-gate` ghi `denial-budget` |
-| 6. An toàn cài đặt | Xong trong package | `install.py`. Bootstrap ghim commit (FR-005): xem dưới |
-| 7. Fixture end-to-end | Một phần | Fake Orca CLI và test CLI chạy thật. Chưa có chạy đủ propose → gate → dispatch → verify. Đăng ký vào `fdk-gate`, `mechanisms.yaml`, `harness-doctor` của setup: bỏ, vì coding-agent tự đứng riêng |
+| 6. An toàn cài đặt | Một phần | `install.py` và `project_install.py` đã chạy được trên dự án thử. Ghim commit khi cài (FR-005) chưa làm: xem dưới |
+| 7. Fixture end-to-end | Một phần | Fake Orca CLI (có Run, `run_required`) và test CLI chạy thật. Chưa có dispatch nên chưa chạy đủ propose → gate → dispatch → verify. Đăng ký vào `fdk-gate`, `mechanisms.yaml`, `harness-doctor` của setup: bỏ, vì coding-agent tự đứng riêng |
+| FR-014 / SC-001. Lệnh `status` | Xong | `status [--run ID]`, đọc task của Run qua CLI thật (đã kiểm với Orca cài trên máy) |
 
 Các câu hỏi mở của đề xuất đã có câu trả lời (ghi trong đề xuất, mục Assumptions):
 
@@ -119,12 +125,15 @@ Các câu hỏi mở của đề xuất đã có câu trả lời (ghi trong đ�
 
 ## Chưa làm, và vì sao
 
+- **Dispatch:** chưa có lệnh giao task cho worker. Vì vậy chuỗi propose → gate → dispatch → verify chưa chạy được từ đầu đến cuối (FR-013).
+- **Định dạng Orca chưa đo đủ:** `task-list` đã kiểm trên Orca thật (`result.tasks`, task có `task_title`, `result`).
+  `task-create` và `task-update` chưa kiểm vì gọi sẽ tạo hoặc đổi trạng thái task thật. Giả định nằm ở `tasks_of` và `task_id_of`.
 - **Enum status:** khớp CLI đang cài: `pending, ready, dispatched, completed, failed, blocked`.
   `in_progress` đã bỏ.
 - **Ngoài package:** `harness/setup` không còn là nơi chạy coding-agent, nên các mục của setup
   (`fdk-gate`, `mechanisms.yaml`, `harness-doctor`, bootstrap) không áp dụng cho package này.
-  - FR-005 (bootstrap ghim commit) cho việc cài coding-agent chưa làm. Phải publish trước, rồi ghim.
+  - FR-005 (cài từ commit đã ghim): chưa làm. Repo `dragonwar000/coding-agent` đã có, PR #1 đang mở. Phải merge rồi ghim SHA.
   - `install.sh` của setup vẫn có `rm -rf` trên `fdk/tools` và `harness/scripts` (dòng 242). Không sửa theo
     quyết định của người duyệt. Repo này không dùng `install.sh` đó.
 - **Độ phủ:** 82% dòng lệnh. Chưa đặt cổng 100% theo từng file, vì đề xuất không yêu cầu cho repo này.
-- **Repo:** đã tách khỏi `harness/` thành repo riêng tại `~/Documents/Development/coding-agent`. Chưa có remote.
+- **Repo:** đã tách khỏi `harness/` thành repo riêng tại `~/Documents/Development/coding-agent`. Remote: `dragonwar000/coding-agent` (private).

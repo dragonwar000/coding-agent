@@ -86,6 +86,16 @@ def link(root: Path, *, t_id: str, task_id: str, project: str) -> None:
         handle.write(json.dumps({"t_id": t_id, "task_id": task_id, "project": project}, ensure_ascii=False) + "\n")
 
 
+def basis_of(task: dict[str, Any]) -> str | None:
+    """The basis a task recorded: top-level `basis`, else `result.basis` (where `task-update --result` stores it)."""
+    if isinstance(task.get("basis"), str):
+        return task["basis"]
+    result = task.get("result")
+    if isinstance(result, dict) and isinstance(result.get("basis"), str):
+        return result["basis"]
+    return None
+
+
 def reconcile(tasks: list[dict[str, Any]], *, project: str | None = None) -> dict[str, list[dict[str, Any]]]:
     """Group tasks the way the reconcile report reads them (SC-001): running, never dispatched, stuck, unverified.
 
@@ -102,7 +112,7 @@ def reconcile(tasks: list[dict[str, Any]], *, project: str | None = None) -> dic
             groups["never_dispatched"].append(task)
         elif status == "blocked":
             groups["stuck"].append(task)
-        elif status == "completed" and task.get("basis") not in PROOF_BASES:
+        elif status == "completed" and basis_of(task) not in PROOF_BASES:
             groups["unverified"].append(task)
         else:
             groups["other"].append(task)

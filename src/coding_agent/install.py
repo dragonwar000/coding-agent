@@ -64,7 +64,7 @@ def safe_replace(target: Path, source: Path, *, backup_root: Path) -> Path | Non
     if target.exists():
         kept = backup(target, backup_root)
         shutil.rmtree(target)
-    shutil.copytree(source, target)
+    shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     mark_owned(target)
     return kept
 

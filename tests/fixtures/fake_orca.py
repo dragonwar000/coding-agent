@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fake `orca` CLI for tests. Tasks live in `$FAKE_ORCA_STATE` as JSON; answers follow the envelope the adapter expects.
 
-Like the real CLI, an unknown id or a status outside the enum answers `ok: false` with exit 0.
+Like the real CLI, an unknown id or a status outside the enum answers `ok: false` with exit 0, and the
+task commands without `--run` (and no bound run) answer `run_required` with exit 1.
 `FAKE_ORCA_FAIL=1` exits 3 with a message on stderr, to test the adapter's failure path.
 """
 
@@ -33,6 +34,9 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"ok": False, "error": "unknown command"}))
         return 0
     command, options = argv[1], _options(argv[2:])
+    if command in ("task-create", "task-update", "task-list") and "--run" not in options:
+        print(json.dumps({"id": str(uuid.uuid4()), "ok": False, "error": {"code": "run_required", "message": "No Run is bound."}}))
+        return 1
 
     if command == "task-create":
         task_id = f"task_{len(tasks) + 1:04d}"
