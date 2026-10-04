@@ -119,10 +119,12 @@ def _hook_command(document: dict[str, Any] | None, hook_id: str) -> str | None:
     return None
 
 
-def _run_hook(command: str, project: Path, payload: dict[str, Any]) -> subprocess.CompletedProcess:
+def _run_hook(command: str, project: Path, payload: dict[str, Any], role: str | None = None) -> subprocess.CompletedProcess:
     import os
 
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project), "PYTHONDONTWRITEBYTECODE": "1"}
+    if role is not None:
+        env["CODING_AGENT_ROLE"] = role
     return subprocess.run(["sh", "-c", command], input=json.dumps(payload), capture_output=True, text=True, cwd=project, env=env, timeout=PAYLOAD_TIMEOUT_S, check=False)
 
 
@@ -150,6 +152,19 @@ def verify_wiring(project: Path, manifest_path: Path, hosts: list[str]) -> list[
     if reset.returncode != 0:
         raise InstallError(f"prompt-reset answered exit {reset.returncode}: {reset.stderr.strip()[:200]}")
     report.append("verify: prompt-reset answered exit 0")
+
+    coordinator_command = _hook_command(document, "coordinator-guard")
+    if coordinator_command is None:
+        raise InstallError(".claude/settings.json has no coding-agent command for coordinator-guard")
+    write = _run_hook(coordinator_command, project, {"session_id": "install-check", "cwd": str(project), "tool_name": "Write", "tool_input": {"file_path": "install-check.txt"}}, role="coordinator")
+    expected_write = 2 if manifest.hook("coordinator-guard").mode == "enforce" else 0
+    if write.returncode != expected_write:
+        raise InstallError(f"coordinator-guard answered exit {write.returncode} to a direct write, expected {expected_write}")
+    report.append(f"verify: coordinator-guard ({manifest.hook('coordinator-guard').mode}) answered exit {expected_write} to a direct write")
+    worker = _run_hook(coordinator_command, project, {"session_id": "install-check", "cwd": str(project), "tool_name": "Write", "tool_input": {"file_path": "install-check.txt"}}, role="worker")
+    if worker.returncode != 0:
+        raise InstallError(f"coordinator-guard blocked a worker session (exit {worker.returncode})")
+    report.append("verify: coordinator-guard leaves worker sessions alone")
     return report
 
 

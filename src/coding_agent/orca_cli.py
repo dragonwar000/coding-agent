@@ -158,3 +158,34 @@ def set_status(root: Path, *, task_id: str, requested: str, basis: str | None, a
 def list_tasks(run: str | None = None) -> list[dict[str, Any]]:
     """Every task of the Run the CLI reports, as records."""
     return tasks_of(_call("task-list", *_run_args(run)))
+
+
+def dispatch_id_of(answer: Any) -> str:
+    """The dispatch id from a worker-start answer. Unverified against a live Orca; see the module note."""
+    result = answer.get("result") if isinstance(answer, dict) else None
+    if isinstance(result, dict):
+        for key in ("dispatch", "worker"):
+            value = result.get(key)
+            if isinstance(value, dict) and isinstance(value.get("id"), str):
+                return value["id"]
+        if isinstance(result.get("dispatchId"), str):
+            return result["dispatchId"]
+    raise OrcaError("the worker-start answer has no dispatch id")
+
+
+def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, worktree: str = "new-child", session: str = "cli") -> str:
+    """Start one supervised worker on `task_id` in its own worktree, and return the dispatch id.
+
+    `new-child` gives the worker a linked git worktree, which is how the coordinator tells it is not the coordinator.
+    """
+    dispatch = dispatch_id_of(_call("worker-start", "--task", task_id, "--agent", agent, "--worktree", worktree, *_run_args(run)))
+    events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
+                  detail={"task_id": task_id, "agent": agent, "dispatch": dispatch})
+    return dispatch
+
+
+def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: str | None = None, session: str = "cli") -> tuple[str, str]:
+    """Create a task for this repository and start a worker on it. Returns (task id, dispatch id)."""
+    task_id = create_task(root, project=orca.project_name(root), t_id=t_id, spec=spec, title=title, run=run)
+    return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session)
+

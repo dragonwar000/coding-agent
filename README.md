@@ -83,6 +83,32 @@ Kiểm tra trạng thái sau khi cài:
 PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.gate --manifest integration.yaml   # 0: khớp manifest
 ```
 
+## Coordinator: giao việc, không làm trực tiếp
+
+Session chính ở cây làm việc chính của repo là **coordinator**. Nó lập kế hoạch, giao việc cho worker
+Orca, và trả lời người dùng liên tục. Worker chạy trong git worktree riêng (`worker-start --worktree new-child`),
+nên một session ở worktree liên kết được nhận diện là worker và không chịu các ràng buộc này.
+
+- **Guard (`coordinator-guard`, enforce):** chặn `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, và lệnh shell làm
+  thay đổi trạng thái (`sed -i`, `>`, `rm`, `git commit`, `pip install`, ...). Lệnh đọc (`git status`, `ls`, `cat`)
+  và lệnh giao việc đơn lẻ được qua. Đây là heuristic, không phải sandbox.
+- **Hợp đồng và bảng việc (`coordinator-context`, `coordinator-board`):** đầu phiên và sau nén ngữ cảnh, coordinator
+  nhận hợp đồng vai trò. Mỗi prompt, nó nhận bảng việc đọc từ Orca. Nếu Orca không đọc được, bảng việc ghi rõ lỗi,
+  và coordinator được dặn hỏi người dùng thay vì đoán tiến độ.
+- **Giao việc:**
+
+```sh
+python3 -m coding_agent.cli delegate --title "Tách module" --spec "..." [--agent claude|codex]
+python3 -m coding_agent.cli board          # bảng việc hiện tại
+```
+
+  `delegate` tạo task (kèm `project` và `T-id`), rồi `worker-start` trên task đó. Cần có Orca Run:
+  `CODING_AGENT_ORCA_RUN` hoặc `--run`. `CODING_AGENT_WORKER_AGENT` đặt agent mặc định (`claude`).
+- **Ghi đè vai trò:** `CODING_AGENT_ROLE=coordinator|worker` ghi đè việc nhận diện theo worktree.
+
+Chưa kiểm trên Orca thật: định dạng trả về của `worker-start` (`result.dispatch.id`) và cách Orca chọn agent.
+Installer kiểm guard này khi cài (ghi vào `verify`).
+
 ## Mode và assumption
 
 - `mode` có ba giá trị: `off` (không chạy), `shadow` (ghi quyết định, không chặn), `enforce` (được chặn).

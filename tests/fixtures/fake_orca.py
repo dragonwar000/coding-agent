@@ -34,7 +34,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"ok": False, "error": "unknown command"}))
         return 0
     command, options = argv[1], _options(argv[2:])
-    if command in ("task-create", "task-update", "task-list") and "--run" not in options:
+    if command in ("task-create", "task-update", "task-list", "worker-start") and "--run" not in options:
         print(json.dumps({"id": str(uuid.uuid4()), "ok": False, "error": {"code": "run_required", "message": "No Run is bound."}}))
         return 1
 
@@ -51,6 +51,15 @@ def main(argv: list[str]) -> int:
             task["status"] = status
             task["result"] = json.loads(options["--result"]) if "--result" in options else None
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"task": {"id": task["id"], "status": status}}}
+    elif command == "worker-start":
+        task = tasks.get(options.get("--task", ""))
+        if task is None or options.get("--agent") is None:
+            answer = {"ok": False, "error": {"code": "unknown_task", "message": "no such task or agent"}}
+        else:
+            dispatch_id = f"dsp_{len(data.setdefault('dispatches', {})) + 1:04d}"
+            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": options.get("--worktree")}
+            task["status"] = "dispatched"
+            answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"dispatch": {"id": dispatch_id}, "task": {"id": task["id"], "status": "dispatched"}}}
     elif command == "task-list":
         answer = {"ok": True, "result": {"tasks": list(tasks.values())}}
     else:

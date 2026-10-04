@@ -47,7 +47,7 @@ loop:
 
 # Hook. `mode` có ba giá trị: off (không chạy), shadow (ghi quyết định, không chặn), enforce (được chặn).
 # Mặc định là shadow (FR-010). Mọi hook không off bắt buộc có `assumption`: câu nêu điều hook giả định về model.
-# Chỉ hook đã khai enforce mới được chặn. Hiện orca-guard (FR-009) và stop-gate (SC-002) ở enforce.
+# Chỉ hook đã khai enforce mới được chặn. Hiện orca-guard (FR-009), stop-gate (SC-002) và coordinator-guard (coordinator giao việc) ở enforce.
 hooks:
   - id: orca-guard
     host: [claude_code, codex]
@@ -82,3 +82,20 @@ hooks:
     matcher: compact
     mode: shadow
     assumption: "Vài prompt gần nhất của người dùng là đủ để tiếp tục công việc sau khi nén ngữ cảnh."
+  - id: coordinator-guard
+    host: [claude_code]
+    event: PreToolUse
+    matcher: "Write|Edit|MultiEdit|NotebookEdit|Bash"
+    mode: enforce
+    assumption: "Session chính ở cây làm việc chính là coordinator: việc sửa file và lệnh ghi phải giao cho worker trong worktree riêng, không làm trực tiếp."
+  - id: coordinator-context
+    host: [claude_code]
+    event: SessionStart
+    matcher: "startup|resume|clear|compact"
+    mode: shadow
+    assumption: "Hợp đồng coordinator và bảng việc đầu phiên là đủ để coordinator tiếp tục đúng vai sau khi khởi động hoặc nén ngữ cảnh."
+  - id: coordinator-board
+    host: [claude_code]
+    event: UserPromptSubmit
+    mode: shadow
+    assumption: "Bảng việc đọc từ Orca ở mỗi prompt đủ mới để trả lời người dùng về tiến độ."

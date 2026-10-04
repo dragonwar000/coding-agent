@@ -10,6 +10,8 @@
 - `claim --task-id ID [--project NAME]`: refuse a task owned by another repository and log the refusal (FR-008).
 - `orca-check --tasks FILE [--strict]`: report `CLAIMED-DONE BUT ABSENT`; `--strict` exits 1 when any is found (SC-002).
 - `status`: this repository's Orca tasks by state, read from the live Orca CLI (FR-014, SC-001).
+- `delegate --title ... --spec ... [--agent claude|codex] [--t-id T-x]`: create a task and start an Orca worker on it in its own worktree (coordinator).
+- `board`: the task board the coordinator sees on each prompt.
 """
 
 from __future__ import annotations
@@ -19,7 +21,10 @@ import json
 import sys
 from pathlib import Path
 
-from coding_agent import events, orca, orca_cli
+import os
+import uuid
+
+from coding_agent import coordinator, events, orca, orca_cli
 from coding_agent.brief import BriefError, brief
 from coding_agent.manifest import ManifestError, load
 from coding_agent.memory import zeromem
@@ -99,6 +104,14 @@ def main(argv: list[str] | None = None) -> int:
 
     listing = sub.add_parser("status", help="this repository's Orca tasks by state")
     listing.add_argument("--run")
+    sub.add_parser("board", help="the task board the coordinator sees")
+
+    delegate = sub.add_parser("delegate", help="create a task and start an Orca worker on it")
+    delegate.add_argument("--title", required=True)
+    delegate.add_argument("--spec", required=True)
+    delegate.add_argument("--t-id", help="durable task id (default: a new one)")
+    delegate.add_argument("--agent", help="Orca agent id (default: CODING_AGENT_WORKER_AGENT or claude)")
+    delegate.add_argument("--run", help="Orca Run id (default: CODING_AGENT_ORCA_RUN or the bound Run)")
 
     check = sub.add_parser("orca-check", help="find tasks that claim completion while an artifact is missing")
     check.add_argument("--tasks", required=True, type=Path)
@@ -113,6 +126,24 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "status":
             return _status(root, args.run)
+        if args.command == "board":
+            lines, error = coordinator.read_board(root)
+            if error is not None:
+                print(f"board: {error}", file=sys.stderr)
+                return 1
+            print("\n".join(lines))
+            return 0
+        if args.command == "delegate":
+            task_id, dispatch = orca_cli.delegate(
+                root,
+                title=args.title,
+                spec=args.spec,
+                t_id=args.t_id or f"T-{uuid.uuid4().hex[:8]}",
+                agent=args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude"),
+                run=args.run,
+            )
+            print(json.dumps({"task_id": task_id, "dispatch": dispatch}, ensure_ascii=False))
+            return 0
         if args.command == "brief":
             print(brief(args.plan.read_text(encoding="utf-8"), args.task), end="")
             return 0

@@ -11,9 +11,10 @@ import json
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Callable
 
-from coding_agent import events, orca, state, transcript
+from coding_agent import coordinator, events, orca, state, transcript
 from coding_agent.hooks import Context, HookResult
 from coding_agent.manifest import Loop
 from coding_agent.memory import record, zeromem
@@ -238,6 +239,38 @@ def _line_count(value: Any) -> int:
         return 0
 
 
+def _cwd(ctx: Context) -> Path:
+    return Path(str(ctx.payload.get("cwd") or ctx.root))
+
+
+def coordinator_guard(ctx: Context) -> HookResult:
+    """In the coordinator's session, block direct writes and mutating shell commands; workers are never affected."""
+    if coordinator.role_for(_cwd(ctx)) != "coordinator":
+        return HookResult()
+    tool = str(ctx.payload.get("tool_name") or "")
+    reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"))
+    if reason is None:
+        return HookResult()
+    enforce = ctx.mode == "enforce"
+    ctx.note(guard="coordinator-guard", kind="blocked", applied=enforce, detail={"tool": tool})
+    if enforce:
+        return HookResult(code=2, stderr=reason)
+    return HookResult()
+
+
+def coordinator_context(ctx: Context) -> HookResult:
+    """Inject the coordinator contract at session start and the task board on every prompt. Workers get nothing."""
+    if coordinator.role_for(_cwd(ctx)) != "coordinator" or ctx.manifest is None:
+        return HookResult()
+    event = str(ctx.payload.get("hook_event_name") or "SessionStart")
+    board, error = coordinator.read_board(ctx.root)
+    text = coordinator.board_context(board, error)
+    if event == "SessionStart":
+        text = coordinator.contract(ctx.manifest.python_src) + "\n" + text
+    ctx.note(guard="coordinator-context", kind="injected", applied=False, detail={"event": event, "board_lines": len(board), "error": error})
+    return HookResult(stdout=_inject(event, text))
+
+
 REGISTRY: dict[str, Callable[[Context], HookResult]] = {
     "orca-guard": orca_guard,
     "loop-guard": loop_guard,
@@ -245,4 +278,7 @@ REGISTRY: dict[str, Callable[[Context], HookResult]] = {
     "stop-gate": stop_gate,
     "pre-compact": pre_compact,
     "session-restore": session_restore,
+    "coordinator-guard": coordinator_guard,
+    "coordinator-context": coordinator_context,
+    "coordinator-board": coordinator_context,
 }
