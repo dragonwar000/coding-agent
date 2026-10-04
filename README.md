@@ -74,6 +74,11 @@ Installer thực hiện, theo thứ tự:
 
 Cài lại là an toàn: lệnh giống nhau cho cùng kết quả. Gỡ giữ nguyên `integration.yaml` và mọi hook của bạn.
 
+**Nâng cấp dự án đã cài:** chạy lại lệnh cài của bản mới trong dự án. Package được thay (bản cũ vào
+`.coding-agent/backups/`), còn `integration.yaml` được giữ nguyên. Nếu bản mới có hook mà manifest của bạn chưa có,
+installer in tên các hook đó. Thêm `--add-new-hooks` để bổ sung chúng vào cuối manifest (giữ `integration.yaml.bak`).
+Các giá trị bạn đã sửa trong manifest không bị đổi.
+
 Cần có: Python 3.11 trở lên, git, và lệnh verify trong manifest chạy được trong PATH (mặc định `python3 -m pytest -q`).
 Hook chạy bằng `python3` trên PATH, nên `python3` đó cũng phải có PyYAML.
 

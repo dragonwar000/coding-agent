@@ -57,6 +57,52 @@ def manifest_text(python_src: str, verify: str) -> str:
     return text
 
 
+HOOK_START = "  - id: "
+
+
+def template_hook_blocks() -> dict[str, str]:
+    """Each hook of the shipped template as its YAML text, by id."""
+    blocks: dict[str, list[str]] = {}
+    current: str | None = None
+    in_hooks = False
+    for line in TEMPLATE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("hooks:"):
+            in_hooks = True
+            continue
+        if not in_hooks:
+            continue
+        if line.startswith(HOOK_START):
+            current = line[len(HOOK_START):].strip()
+            blocks[current] = [line]
+        elif current is not None and line.startswith("    "):
+            blocks[current].append(line)
+        else:
+            current = None
+    return {hook_id: "\n".join(lines) + "\n" for hook_id, lines in blocks.items()}
+
+
+def missing_hooks(manifest_path: Path) -> list[str]:
+    """Template hook ids the project's manifest does not declare, in template order."""
+    declared = {hook.id for hook in load(manifest_path.resolve()).hooks}
+    return [hook_id for hook_id in template_hook_blocks() if hook_id not in declared]
+
+
+def add_hooks(manifest_path: Path, hook_ids: list[str]) -> None:
+    """Append template hooks to a manifest whose last top-level key is `hooks:`, keeping a `.bak`. Anything else is refused."""
+    text = manifest_path.read_text(encoding="utf-8")
+    top_level = [line.split(":")[0] for line in text.splitlines() if line and not line[0].isspace() and not line.startswith("#") and ":" in line]
+    if not top_level or top_level[-1] != "hooks":
+        raise InstallError("integration.yaml does not end with its hooks list; add the new hooks by hand (see template.yaml)")
+    blocks = template_hook_blocks()
+    manifest_path.with_name(manifest_path.name + ".bak").write_text(text, encoding="utf-8")
+    manifest_path.write_text(text.rstrip("\n") + "\n" + "".join(blocks[hook_id] for hook_id in hook_ids), encoding="utf-8")
+    try:
+        load(manifest_path.resolve())
+    except ManifestError as error:
+        manifest_path.write_text(text, encoding="utf-8")
+        raise InstallError(f"adding hooks made integration.yaml invalid, so it was restored: {error}") from error
+
+
 def ensure_pyyaml(report: list[str]) -> None:
     """Make sure this interpreter can import PyYAML, installing it with pip when it cannot."""
     try:
@@ -153,6 +199,9 @@ def verify_wiring(project: Path, manifest_path: Path, hosts: list[str]) -> list[
         raise InstallError(f"prompt-reset answered exit {reset.returncode}: {reset.stderr.strip()[:200]}")
     report.append("verify: prompt-reset answered exit 0")
 
+    if manifest.hook("coordinator-guard") is None:
+        report.append("verify: coordinator-guard is not in this manifest; skipped")
+        return report
     coordinator_command = _hook_command(document, "coordinator-guard")
     if coordinator_command is None:
         raise InstallError(".claude/settings.json has no coding-agent command for coordinator-guard")
@@ -179,7 +228,7 @@ def _ignore_state(project: Path, report: list[str]) -> None:
         report.append("gitignore: added .coding-agent/")
 
 
-def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str = DEFAULT_VERIFY, vendors: str | None = None, run_verify: bool = True, ci: bool = True) -> list[str]:
+def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str = DEFAULT_VERIFY, vendors: str | None = None, run_verify: bool = True, ci: bool = True, add_new_hooks: bool = False) -> list[str]:
     """Install into `project` and return one report line per step. Raises InstallError or NotOwned."""
     if not project.is_dir():
         raise InstallError(f"{project} is not a directory")
@@ -203,8 +252,15 @@ def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str 
         report.append("manifest: wrote integration.yaml (verified: false; hooks in shadow except orca-guard and stop-gate)")
     try:
         manifest = load(manifest_path.resolve())
+        new_hooks = missing_hooks(manifest_path)
     except ManifestError as error:
         raise InstallError(f"integration.yaml is invalid: {error}") from error
+    if new_hooks and add_new_hooks:
+        add_hooks(manifest_path, new_hooks)
+        manifest = load(manifest_path.resolve())
+        report.append(f"manifest: added hooks {', '.join(new_hooks)} (previous file kept as integration.yaml.bak)")
+    elif new_hooks:
+        report.append(f"manifest: this version has hooks your manifest lacks: {', '.join(new_hooks)}. Run again with --add-new-hooks to add them")
 
     for path in gen.write(manifest, apply=True, hosts=hosts):
         report.append(f"hooks: merged {path.relative_to(project)} (previous file kept as .bak)")
@@ -282,6 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-verify", action="store_true", help="skip the wiring check after install")
     parser.add_argument("--no-ci", action="store_true", help="do not write the CI gate")
     parser.add_argument("--clean", action="store_true", help="uninstall first, then install")
+    parser.add_argument("--add-new-hooks", action="store_true", help="append hooks this version ships that an existing manifest lacks")
     parser.add_argument("--uninstall", action="store_true", help="remove the harness wiring and the package copy")
     parser.add_argument("--keep-core", action="store_true", help="with --uninstall: keep the package copy")
     args = parser.parse_args(argv)
@@ -293,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
             lines = []
             if args.clean:
                 lines.extend(uninstall(project))
-            lines.extend(install(project, python_src=args.python_src, verify=args.verify, vendors=args.vendor, run_verify=not args.no_verify, ci=not args.no_ci))
+            lines.extend(install(project, python_src=args.python_src, verify=args.verify, vendors=args.vendor, run_verify=not args.no_verify, ci=not args.no_ci, add_new_hooks=args.add_new_hooks))
     except (InstallError, safe_install.NotOwned, gen.GenError, OSError) as error:
         print(f"project-install: {error}", file=sys.stderr)
         return 2

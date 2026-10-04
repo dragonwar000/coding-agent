@@ -225,3 +225,41 @@ def test_gitignore_gets_the_state_directory_once(tmp_path: Path):
     project_install.install(project, run_verify=False)
     project_install.install(project, run_verify=False)
     assert (project / ".gitignore").read_text(encoding="utf-8").splitlines().count(".coding-agent/") == 1
+
+
+def old_manifest(project: Path) -> None:
+    """A manifest from before the coordinator hooks existed."""
+    text = (ROOT / "integration.yaml").read_text(encoding="utf-8").replace("python_src: src", "python_src: harness/coding-agent/src")
+    (project / "integration.yaml").write_text(text[:text.index("  - id: coordinator-guard")], encoding="utf-8")
+
+
+def test_upgrading_over_an_older_manifest_passes_and_names_the_new_hooks(tmp_path: Path):
+    project = git_project(tmp_path)
+    old_manifest(project)
+    report = project_install.install(project)
+    assert any("hooks your manifest lacks: coordinator-guard, coordinator-context, coordinator-board" in line for line in report)
+    assert "verify: coordinator-guard is not in this manifest; skipped" in report
+    assert load(project / "integration.yaml").hook("coordinator-guard") is None
+
+
+def test_add_new_hooks_appends_them_and_keeps_a_backup(tmp_path: Path):
+    project = git_project(tmp_path)
+    old_manifest(project)
+    before = (project / "integration.yaml").read_text(encoding="utf-8")
+    report = project_install.install(project, add_new_hooks=True)
+    manifest = load(project / "integration.yaml")
+    assert manifest.hook("coordinator-guard").mode == "shadow" and manifest.hook("coordinator-board") is not None
+    assert (project / "integration.yaml.bak").read_text(encoding="utf-8") == before
+    assert "verify: coordinator-guard (shadow) answered exit 0 to a direct write" in report
+    assert "coordinator-guard" in (project / ".claude" / "settings.json").read_text(encoding="utf-8")
+    assert project_install.missing_hooks(project / "integration.yaml") == []
+
+
+def test_add_new_hooks_refuses_a_manifest_that_does_not_end_with_hooks(tmp_path: Path):
+    project = git_project(tmp_path)
+    old_manifest(project)
+    path = project / "integration.yaml"
+    path.write_text(path.read_text(encoding="utf-8") + "extra_key: 1\n", encoding="utf-8")
+    with pytest.raises(project_install.InstallError, match="by hand"):
+        project_install.add_hooks(path, ["coordinator-guard"])
+    assert not (project / "integration.yaml.bak").exists()
