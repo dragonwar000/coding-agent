@@ -154,7 +154,16 @@ python3 -m coding_agent.cli plan-status plan.yaml        # graph: trạng thái 
 
 Plan bị từ chối khi có id trùng, phụ thuộc không tồn tại, tự phụ thuộc, hoặc vòng lặp. Node có phụ thuộc `failed`
 hay `blocked` không bao giờ được giao. Ánh xạ plan id → Orca task id nằm ở `.coding-agent/plan.json`.
-Chưa có: tự chạy `plan-next` khi một worker xong (coordinator gọi lại lệnh), và ratchet giữ bản tốt nhất như DSH.
+**Khi worker xong:** Orca gửi `worker_done` về hộp thư của Run. Mỗi prompt, bảng việc của coordinator liệt kê các báo cáo
+chưa xử lý, kèm node tương ứng và việc cần làm. Đọc bảng không đánh dấu đã đọc; `inbox --ack` mới đánh dấu.
+
+```sh
+python3 -m coding_agent.cli inbox          # báo cáo worker chưa xử lý
+python3 -m coding_agent.cli inbox --ack    # đánh dấu đã xử lý
+```
+
+Chưa có: tự chạy `plan-next` mà không cần coordinator (bảng việc chỉ hiện ở prompt kế tiếp của người dùng), và ratchet giữ
+bản tốt nhất như DSH.
 
 ## Mode và assumption
 

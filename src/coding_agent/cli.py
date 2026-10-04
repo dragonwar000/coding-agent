@@ -12,6 +12,7 @@
 - `status`: this repository's Orca tasks by state, read from the live Orca CLI (FR-014, SC-001).
 - `delegate --title ... --spec ... [--agent claude|codex] [--t-id T-x]`: create a task and start an Orca worker on it in its own worktree (coordinator).
 - `board`: the task board the coordinator sees on each prompt.
+- `inbox [--ack]`: worker reports the coordinator has not handled; `--ack` acknowledges them.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
 - `plan-apply FILE`, `plan-next FILE [--max N]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
 """
@@ -108,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
     listing = sub.add_parser("status", help="this repository's Orca tasks by state")
     listing.add_argument("--run")
     sub.add_parser("board", help="the task board the coordinator sees")
+    inbox = sub.add_parser("inbox", help="unhandled worker reports")
+    inbox.add_argument("--ack", action="store_true", help="acknowledge the reports after printing them")
+    inbox.add_argument("--run")
     run_init = sub.add_parser("run-init", help="create an Orca Run from this terminal and store it")
     run_init.add_argument("--objective", required=True)
     for name, text in (("plan-apply", "create the Orca tasks of a plan graph"), ("plan-next", "start workers for the ready nodes"), ("plan-status", "show the graph and each node's state")):
@@ -139,6 +143,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "status":
             return _status(root, args.run)
+        if args.command == "inbox":
+            reports = orca_cli.ack_reports(args.run) if args.ack else orca_cli.unread_reports(args.run)
+            lines = coordinator.report_lines(reports, coordinator._plan_ids(root))
+            print("\n".join(lines[:-1]) if lines else "inbox: no worker reports")
+            if args.ack and reports:
+                print(f"inbox: acknowledged {len(reports)} report(s)")
+            return 0
         if args.command == "run-init":
             print(json.dumps({"run": orca_cli.run_init(root, args.objective)}))
             return 0

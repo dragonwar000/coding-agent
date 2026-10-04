@@ -38,7 +38,18 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"id": str(uuid.uuid4()), "ok": False, "error": {"code": "run_required", "message": "No Run is bound."}}))
         return 1
 
-    if command == "run-create":
+    if command == "check":
+        messages = data.setdefault("messages", [])
+        if "--ack" in options:
+            data["messages"] = [m for m in messages if m.get("delivery") != options["--ack"]]
+            answer = {"ok": True, "result": {"runId": options.get("--run"), "messages": [], "count": 0}}
+        elif "--peek" in argv:
+            answer = {"ok": True, "result": {"runId": options.get("--run"), "messages": messages, "count": len(messages)}}
+        else:
+            for m in messages:
+                m["delivery"] = "delivery_1"
+            answer = {"ok": True, "result": {"runId": options.get("--run"), "messages": messages, "count": len(messages), "deliveryId": "delivery_1"}}
+    elif command == "run-create":
         answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"run": {"id": "run_created", "objective": options.get("--objective", "")}}}
     elif command == "task-create":
         task_id = f"task_{len(tasks) + 1:04d}"

@@ -161,3 +161,50 @@ def test_the_board_hints_at_run_init_when_no_run_is_bound():
 
     assert "run-init" in coordinator.board_context([], "orca task-list answered ok:false: run_required: No Run is bound.")
     assert "run-init" not in coordinator.board_context([], "daemon not running")
+
+
+def report(state: Path, task_id: str, outcome: str = "succeeded", subject: str = "DONE") -> None:
+    """Put a worker report in the fake Orca's inbox, in the shape the real CLI returns."""
+    data = orca_state(state)
+    data.setdefault("messages", []).append({"id": f"msg_{task_id}", "type": "worker_done", "subject": subject, "body": "done",
+                                            "payload": json.dumps({"taskId": task_id, "dispatchId": "ctx_1", "outcome": outcome})})
+    state.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_the_board_names_the_node_a_worker_reported_and_the_next_step(repo, tmp_path, fake_orca):
+    from coding_agent import coordinator
+
+    nodes = plan.load(plan_file(tmp_path))
+    plan.apply(repo, nodes)
+    plan.dispatch_ready(repo, nodes, default_agent="claude")
+    ids = plan.ledger(repo)
+    report(fake_orca, ids["protocol"])
+    lines, error = coordinator.read_board(repo)
+    assert error is None
+    text = "\n".join(lines)
+    assert "worker vừa báo, chưa xử lý (1):" in text
+    assert f"node protocol ({ids['protocol']}): succeeded — DONE" in text
+    assert "plan-next" in text and "inbox --ack" in text
+
+
+def test_reading_the_board_does_not_consume_reports_and_ack_does(repo, tmp_path, fake_orca, capsys):
+    nodes = plan.load(plan_file(tmp_path))
+    plan.apply(repo, nodes)
+    report(fake_orca, plan.ledger(repo)["protocol"], outcome="failed", subject="tests red")
+    assert len(orca_cli.unread_reports()) == 1 and len(orca_cli.unread_reports()) == 1
+    assert cli.main(["--root", str(repo), "inbox"]) == 0
+    assert "failed — tests red" in capsys.readouterr().out
+    assert cli.main(["--root", str(repo), "inbox", "--ack"]) == 0
+    assert "acknowledged 1 report(s)" in capsys.readouterr().out
+    assert orca_cli.unread_reports() == []
+    assert cli.main(["--root", str(repo), "inbox"]) == 0
+    assert "no worker reports" in capsys.readouterr().out
+
+
+def test_messages_that_are_not_worker_reports_are_left_out():
+    reports = orca_cli._reports({"result": {"messages": [
+        {"type": "note", "subject": "hi"},
+        {"type": "worker_done", "subject": "DONE", "payload": "not json"},
+        {"type": "worker_done", "subject": "DONE", "payload": {"taskId": "task_1", "outcome": "succeeded"}},
+    ]}})
+    assert [r["task_id"] for r in reports] == [None, "task_1"]

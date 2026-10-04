@@ -12,6 +12,7 @@ coordinator keeps the user's question in view while workers run.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -114,7 +115,8 @@ def contract(python_src: str) -> str:
         "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và gộp kết quả: `git add`, `git commit`, `git merge <nhánh worker>`.",
         "- Worker tách nhánh từ commit hiện tại: commit việc đang dở trước khi `plan-next`, nếu không worker sẽ không thấy nó.",
         f"- Giao việc bằng: PYTHONPATH={python_src} python3 -m coding_agent.cli delegate --title \"...\" --spec \"...\" [--agent claude|codex]",
-        "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao; gọi lại `plan-next` khi một worker xong.",
+        "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
+        "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",
@@ -161,7 +163,36 @@ def read_board(root: Path, run: str | None = None) -> tuple[list[str], str | Non
         tasks = orca_cli.list_tasks(run)
     except orca_cli.OrcaError as error:
         return [], str(error)[:300]
-    return board_lines(tasks, orca_cli.links(root), orca.project_name(root)), None
+    lines = board_lines(tasks, orca_cli.links(root), orca.project_name(root))
+    try:
+        reports = orca_cli.unread_reports(run)
+    except orca_cli.OrcaError as error:
+        return lines + [f"hộp thư worker không đọc được: {str(error)[:160]}"], None
+    return lines + report_lines(reports, _plan_ids(root)), None
+
+
+def _plan_ids(root: Path) -> dict[str, str]:
+    """Orca task id to plan node id, from the plan ledger."""
+    path = root / ".coding-agent" / "plan.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {task_id: node for node, task_id in data.items() if isinstance(node, str) and isinstance(task_id, str)} if isinstance(data, dict) else {}
+
+
+def report_lines(reports: list[dict[str, Any]], plan_ids: dict[str, str]) -> list[str]:
+    """Lines for the unacknowledged worker reports, with the next step. Empty when there are none."""
+    if not reports:
+        return []
+    lines = [f"worker vừa báo, chưa xử lý ({len(reports)}):"]
+    for report in reports[:10]:
+        task_id = str(report.get("task_id") or "?")
+        node = plan_ids.get(task_id)
+        name = f"node {node} ({task_id})" if node else task_id
+        lines.append(f"  - {name}: {report.get('outcome') or report.get('type')} — {report.get('subject', '')[:80]}")
+    lines.append("  việc cần làm: kiểm kết quả của worker, gộp nhánh nếu đạt, chạy `plan-next` để giao node kế, rồi `inbox --ack`.")
+    return lines
 
 
 def dirty_paths(root: Path) -> list[str] | None:

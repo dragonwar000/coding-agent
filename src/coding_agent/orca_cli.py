@@ -289,3 +289,47 @@ def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: s
     task_id = create_task(root, project=orca.project_name(root), t_id=t_id, spec=spec, title=title, run=run)
     return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session)
 
+
+def _reports(answer: Any) -> list[dict[str, Any]]:
+    """Worker reports in a `check` answer: `{task_id, dispatch, outcome, type, subject, body}` per message.
+
+    Orca puts `taskId`, `dispatchId`, and `outcome` in the message `payload`, a JSON string.
+    """
+    result = answer.get("result") if isinstance(answer, dict) else None
+    out: list[dict[str, Any]] = []
+    for message in (result.get("messages") if isinstance(result, dict) else None) or []:
+        if not isinstance(message, dict) or not str(message.get("type", "")).startswith("worker_"):
+            continue
+        payload = message.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        out.append({
+            "task_id": payload.get("taskId"),
+            "dispatch": payload.get("dispatchId"),
+            "outcome": payload.get("outcome"),
+            "type": message.get("type"),
+            "subject": str(message.get("subject") or ""),
+            "body": str(message.get("body") or ""),
+        })
+    return out
+
+
+def unread_reports(run: str | None = None) -> list[dict[str, Any]]:
+    """Worker reports the coordinator has not acknowledged. Reading them this way does not mark them read."""
+    return _reports(_call("check", "--peek", *_run_args(run)))
+
+
+def ack_reports(run: str | None = None) -> list[dict[str, Any]]:
+    """Take delivery of the unread reports and acknowledge them. Returns the reports that were acknowledged."""
+    answer = _call("check", *_run_args(run))
+    reports = _reports(answer)
+    result = answer.get("result") if isinstance(answer, dict) else None
+    delivery = (result.get("deliveryId") or result.get("delivery_id")) if isinstance(result, dict) else None
+    if isinstance(delivery, str) and delivery:
+        _call("check", "--ack", delivery, *_run_args(run))
+    return reports
+
