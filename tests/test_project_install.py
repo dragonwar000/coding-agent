@@ -263,3 +263,28 @@ def test_add_new_hooks_refuses_a_manifest_that_does_not_end_with_hooks(tmp_path:
     with pytest.raises(project_install.InstallError, match="by hand"):
         project_install.add_hooks(path, ["coordinator-guard"])
     assert not (project / "integration.yaml.bak").exists()
+
+
+def test_purge_and_remove_manifest_leave_the_project_as_it_was(tmp_path: Path):
+    project = git_project(tmp_path)
+    (project / "app.py").write_text("x = 1\n", encoding="utf-8")
+    project_install.install(project)
+    project_install.install(project, add_new_hooks=True)
+    report = project_install.uninstall(project, purge=True, remove_manifest=True)
+    left = sorted(p.name for p in project.iterdir() if p.name != ".git")
+    assert left == ["app.py"]
+    assert "manifest: removed integration.yaml" in report
+
+
+def test_a_plain_uninstall_keeps_state_backups_and_the_manifest(tmp_path: Path):
+    project = git_project(tmp_path)
+    project_install.install(project, run_verify=False)
+    project_install.uninstall(project)
+    assert (project / "integration.yaml").exists() and (project / ".coding-agent" / "backups").is_dir()
+
+
+def test_uninstalling_where_nothing_is_installed_says_so(tmp_path: Path):
+    project = git_project(tmp_path)
+    assert project_install.uninstall(project) == ["nothing to remove: coding-agent is not installed here"]
+    with pytest.raises(project_install.InstallError, match="not a directory"):
+        project_install.uninstall(tmp_path / "nowhere")

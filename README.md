@@ -62,6 +62,16 @@ bash install.sh <dự án> --uninstall [--keep-core] # gỡ: hook của coding-a
 bash install.sh <dự án> --clean                   # gỡ rồi cài lại
 ```
 
+Gỡ khỏi dự án:
+
+```sh
+bash uninstall.sh <dự án>                              # gỡ hook, CI, bản copy package; giữ integration.yaml
+bash uninstall.sh <dự án> --purge --remove-manifest    # gỡ sạch: thêm .bak, .coding-agent/, integration.yaml
+```
+
+Hook và cài đặt riêng của bạn trong `.claude/settings.json` được giữ nguyên. Bộ nhớ Zero-Mem ở `~/.coding-agent/zeromem`
+nằm ngoài dự án và không bị xoá.
+
 Installer thực hiện, theo thứ tự:
 
 1. Kiểm PyYAML cho `python3` đang chạy installer. Thiếu thì tự `pip install pyyaml`.

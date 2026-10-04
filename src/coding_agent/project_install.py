@@ -283,8 +283,25 @@ def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str 
     return report
 
 
-def uninstall(project: Path, *, keep_core: bool = False) -> list[str]:
-    """Reverse the install: harness hooks, the CI gate, the install record, and the package copy. The manifest stays."""
+def _remove_empty_parents(path: Path, project: Path) -> None:
+    """Remove the directories above `path` that are now empty, stopping at the project root."""
+    for parent in path.parents:
+        if parent == project or not parent.is_relative_to(project) or not parent.is_dir() or any(parent.iterdir()):
+            break
+        parent.rmdir()
+
+
+BAK_FILES = (".claude/settings.json.bak", ".codex/hooks.json.bak", "integration.yaml.bak")
+
+
+def uninstall(project: Path, *, keep_core: bool = False, purge: bool = False, remove_manifest: bool = False) -> list[str]:
+    """Reverse the install: harness hooks, the CI gate, the install record, and the package copy.
+
+    The manifest stays unless `remove_manifest` is set. `purge` also deletes the `.bak` files the installer made and
+    the `.coding-agent/` directory (events, session state, package backups). The Zero-Mem store outside the project is never touched.
+    """
+    if not project.is_dir():
+        raise InstallError(f"{project} is not a directory")
     report: list[str] = []
     for host in gen.HOSTS:
         target = gen._target(project, host)
@@ -303,6 +320,7 @@ def uninstall(project: Path, *, keep_core: bool = False) -> list[str]:
     if ci_path.exists() and CI_MARK in ci_path.read_text(encoding="utf-8"):
         ci_path.unlink()
         report.append(f"ci: removed {CI_FILE}")
+        _remove_empty_parents(ci_path, project)
     record = project / ".coding-agent" / "installed.json"
     python_src = DEFAULT_PYTHON_SRC
     if record.exists():
@@ -320,12 +338,31 @@ def uninstall(project: Path, *, keep_core: bool = False) -> list[str]:
         except safe_install.NotOwned as error:
             raise InstallError(str(error)) from error
         report.append(f"package: removed {python_src}/coding_agent (backup at {kept})")
-        for parent in package.parents:
-            if parent == project or not parent.is_relative_to(project) or any(parent.iterdir()):
-                break
-            parent.rmdir()
-    if (project / "integration.yaml").exists():
-        report.append("manifest: kept integration.yaml (your own file)")
+        _remove_empty_parents(package, project)
+    if purge:
+        import shutil
+
+        for name in BAK_FILES:
+            if (project / name).exists():
+                (project / name).unlink()
+                report.append(f"purge: removed {name}")
+        if (project / ".coding-agent").is_dir():
+            shutil.rmtree(project / ".coding-agent")
+            report.append("purge: removed .coding-agent/ (events, session state, package backups)")
+        for host in gen.HOSTS:
+            target = gen._target(project, host)
+            if target.exists() and target.read_text(encoding="utf-8").strip() == "{}":
+                target.unlink()
+                report.append(f"purge: removed empty {target.relative_to(project)}")
+                _remove_empty_parents(target, project)
+    manifest_path = project / "integration.yaml"
+    if manifest_path.exists() and remove_manifest:
+        manifest_path.unlink()
+        report.append("manifest: removed integration.yaml")
+    elif manifest_path.exists():
+        report.append("manifest: kept integration.yaml (your own file; --remove-manifest deletes it)")
+    if not report:
+        report.append("nothing to remove: coding-agent is not installed here")
     return report
 
 
@@ -341,11 +378,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--add-new-hooks", action="store_true", help="append hooks this version ships that an existing manifest lacks")
     parser.add_argument("--uninstall", action="store_true", help="remove the harness wiring and the package copy")
     parser.add_argument("--keep-core", action="store_true", help="with --uninstall: keep the package copy")
+    parser.add_argument("--purge", action="store_true", help="with --uninstall: also delete the .bak files and .coding-agent/")
+    parser.add_argument("--remove-manifest", action="store_true", help="with --uninstall: also delete integration.yaml")
     args = parser.parse_args(argv)
     project = args.project.resolve()
     try:
         if args.uninstall:
-            lines = uninstall(project, keep_core=args.keep_core)
+            lines = uninstall(project, keep_core=args.keep_core, purge=args.purge, remove_manifest=args.remove_manifest)
         else:
             lines = []
             if args.clean:
