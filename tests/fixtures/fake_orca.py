@@ -30,6 +30,13 @@ def main(argv: list[str]) -> int:
     state_path = Path(os.environ["FAKE_ORCA_STATE"])
     data = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {"tasks": {}}
     tasks = data["tasks"]
+    if argv[:2] == ["worktree", "create"]:
+        options = _options(argv[2:])
+        path = os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
+        data.setdefault("created_worktrees", []).append({"name": options["--name"], "repo": options.get("--repo")})
+        state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps({"ok": True, "result": {"worktree": {"id": f"repo::{path}", "path": path}}}))
+        return 0
     if argv[:1] != ["orchestration"] or len(argv) < 2:
         print(json.dumps({"ok": False, "error": "unknown command"}))
         return 0
@@ -71,14 +78,17 @@ def main(argv: list[str]) -> int:
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"task": {"id": task["id"], "status": status}}}
     elif command == "worker-start":
         task = tasks.get(options.get("--task", ""))
-        if options.get("--worktree") == "new-child" and "--name" not in options:
+        if options.get("--worktree") == "new-child" and os.environ.get("FAKE_ORCA_NO_NEW_CHILD") == "1":
+            answer = {"ok": False, "error": {"code": "selector_not_found", "message": "selector_not_found"}}
+        elif options.get("--worktree") == "new-child" and "--name" not in options:
             answer = {"ok": False, "error": {"code": "invalid_argument", "message": "New worktrees require --name."}}
         elif task is None or options.get("--agent") is None:
             answer = {"ok": False, "error": {"code": "unknown_task", "message": "no such task or agent"}}
         else:
             dispatch_id = f"dsp_{len(data.setdefault('dispatches', {})) + 1:04d}"
-            worktree = os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
-            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": options.get("--worktree"), "name": options["--name"]}
+            selector = options.get("--worktree", "")
+            worktree = selector[5:] if selector.startswith("path:") else os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
+            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": selector, "name": options.get("--name", os.path.basename(worktree))}
             task["status"] = "dispatched"
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"runId": options["--run"], "taskId": task["id"], "dispatchId": dispatch_id,
                                                                  "effects": [{"kind": "worktree", "action": "created_child", "id": f"repo::{worktree}"}]}}

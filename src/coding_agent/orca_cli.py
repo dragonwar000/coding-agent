@@ -92,7 +92,17 @@ def _run_args(run: str | None) -> list[str]:
 
 def _call(*args: str) -> Any:
     """Run `orca orchestration <args> --json` and return the parsed answer."""
-    command = [binary(), "orchestration", *args, "--json"]
+    return _run_orca("orchestration", *args)
+
+
+def _call_tool(*args: str) -> Any:
+    """Run `orca <args> --json`, for commands outside `orchestration`, and return the parsed answer."""
+    return _run_orca(*args)
+
+
+def _run_orca(*words: str) -> Any:
+    args = words[1:] if words[0] == "orchestration" else words
+    command = [binary(), *words, "--json"]
     try:
         run = subprocess.run(command, capture_output=True, text=True, timeout=TIMEOUT_S, check=False)
     except (OSError, subprocess.SubprocessError) as error:
@@ -268,13 +278,43 @@ def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str) -> 
         handle.write(json.dumps({"worktree": str(Path(worktree).resolve()), "task_id": task_id, "dispatch": dispatch}) + "\n")
 
 
+def _repo_path(root: Path) -> Path | None:
+    """The repository path Orca registers: the main worktree, which holds the git common directory."""
+    common = _git_common_dir(root)
+    return common.parent if common is not None and common.name == ".git" else None
+
+
+def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, run: str | None) -> Any:
+    """Start a worker in a new worktree.
+
+    `new-child` makes the worktree a child of the calling terminal's worktree. Orca answers `selector_not_found`
+    when that terminal's workspace is no longer in its catalog (seen when a folder project became a git repository
+    after the terminal opened). Then the worktree is created from the repository path and the worker is started on it.
+    """
+    try:
+        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, *_run_args(run))
+    except OrcaError as error:
+        if "selector_not_found" not in str(error):
+            raise
+    repo = _repo_path(root)
+    if repo is None:
+        raise OrcaError("worker-start could not place a new worktree, and this directory is not a git repository Orca can create one from")
+    created = _call_tool("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent")
+    result = created.get("result") if isinstance(created, dict) else None
+    worktree = result.get("worktree") if isinstance(result, dict) else None
+    path = worktree.get("path") if isinstance(worktree, dict) else None
+    if not isinstance(path, str) or not path:
+        raise OrcaError("the worktree create answer has no worktree path")
+    return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", *_run_args(run))
+
+
 def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli") -> str:
-    """Start one supervised worker on `task_id` in a new child worktree, and return the dispatch id.
+    """Start one supervised worker on `task_id` in a new worktree, and return the dispatch id.
 
     The worktree is recorded in the workers ledger, which is how a session in it is recognised as a worker.
     """
     name = f"ca-{task_id.removeprefix('task_')[:12]}"
-    answer = _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, *_run_args(run))
+    answer = _start_in_new_worktree(root, task_id, agent, name, run)
     dispatch = dispatch_id_of(answer)
     worktree = worktree_of(answer)
     if worktree is not None:

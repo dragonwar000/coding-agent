@@ -261,3 +261,37 @@ def test_stop_gate_records_files_the_coordinator_tree_gained_during_the_turn(rep
 
 def test_dirty_paths_is_none_outside_git(tmp_path):
     assert coordinator.dirty_paths(tmp_path) is None
+
+
+def test_worker_start_falls_back_to_an_explicit_worktree_when_new_child_cannot_be_placed(repo, fake_orca, monkeypatch):
+    committed_repo(repo)
+    monkeypatch.setenv("FAKE_ORCA_NO_NEW_CHILD", "1")
+    task_id, dispatch = orca_cli.delegate(repo, title="Models", spec="x", t_id="T-50", agent="claude")
+    state = json.loads(fake_orca.read_text(encoding="utf-8"))
+    assert state["created_worktrees"] == [{"name": "ca-0001", "repo": f"path:{repo.resolve()}"}]
+    assert state["dispatches"][dispatch]["worktree"].startswith("path:") and state["dispatches"][dispatch]["task"] == task_id
+    assert len(orca_cli.worker_worktrees(repo)) == 1
+
+
+def test_another_worker_start_error_is_not_retried(repo, fake_orca):
+    committed_repo(repo)
+    with pytest.raises(orca_cli.OrcaError, match="unknown_task"):
+        orca_cli.worker_start(repo, task_id="task_nope", agent="claude")
+    assert "created_worktrees" not in json.loads(fake_orca.read_text(encoding="utf-8"))
+
+
+def test_worker_adopt_records_a_worktree_started_elsewhere(repo, tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
+    committed_repo(repo)
+    worktree = linked_worktree(repo, tmp_path, worker=False, name="by-hand")
+    assert coordinator.role_for(worktree) == "coordinator"
+    assert cli.main(["--root", str(repo), "worker-adopt", "--worktree", str(worktree)]) == 0
+    assert coordinator.role_for(worktree) == "worker"
+    assert cli.main(["--root", str(repo), "worker-adopt", "--worktree", str(tmp_path / "missing")]) == 1
+
+
+def test_the_cli_starts_a_worker_on_an_existing_task(repo, fake_orca, capsys):
+    committed_repo(repo)
+    task_id = orca_cli.create_task(repo, project="demo-repo", t_id="T-51", spec="x", title="x")
+    assert cli.main(["--root", str(repo), "worker-start", "--task-id", task_id, "--agent", "codex"]) == 0
+    assert json.loads(capsys.readouterr().out)["dispatch"].startswith("dsp_")

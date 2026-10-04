@@ -12,6 +12,8 @@
 - `status`: this repository's Orca tasks by state, read from the live Orca CLI (FR-014, SC-001).
 - `delegate --title ... --spec ... [--agent claude|codex] [--t-id T-x]`: create a task and start an Orca worker on it in its own worktree (coordinator).
 - `board`: the task board the coordinator sees on each prompt.
+- `worker-start --task-id ID [--agent A]`: start a worker on an existing task, recorded as a worker worktree.
+- `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator.
 - `inbox [--ack]`: worker reports the coordinator has not handled; `--ack` acknowledges them.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
 - `plan-apply FILE`, `plan-next FILE [--max N]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
@@ -109,6 +111,13 @@ def main(argv: list[str] | None = None) -> int:
     listing = sub.add_parser("status", help="this repository's Orca tasks by state")
     listing.add_argument("--run")
     sub.add_parser("board", help="the task board the coordinator sees")
+    start = sub.add_parser("worker-start", help="start a worker on an existing task")
+    start.add_argument("--task-id", required=True)
+    start.add_argument("--agent")
+    start.add_argument("--run")
+    adopt = sub.add_parser("worker-adopt", help="record an existing worktree as a worker's")
+    adopt.add_argument("--worktree", required=True, type=Path)
+    adopt.add_argument("--task-id", default="adopted")
     inbox = sub.add_parser("inbox", help="unhandled worker reports")
     inbox.add_argument("--ack", action="store_true", help="acknowledge the reports after printing them")
     inbox.add_argument("--run")
@@ -143,6 +152,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "status":
             return _status(root, args.run)
+        if args.command == "worker-start":
+            agent = args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude")
+            print(json.dumps({"task_id": args.task_id, "dispatch": orca_cli.worker_start(root, task_id=args.task_id, agent=agent, run=args.run)}))
+            return 0
+        if args.command == "worker-adopt":
+            if not args.worktree.is_dir():
+                print(f"worker-adopt: {args.worktree} is not a directory", file=sys.stderr)
+                return 1
+            orca_cli.record_worker(root, worktree=str(args.worktree), task_id=args.task_id, dispatch="adopted")
+            print(f"worker-adopt: recorded {args.worktree.resolve()}")
+            return 0
         if args.command == "inbox":
             reports = orca_cli.ack_reports(args.run) if args.ack else orca_cli.unread_reports(args.run)
             lines = coordinator.report_lines(reports, coordinator._plan_ids(root))
