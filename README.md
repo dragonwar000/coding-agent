@@ -53,7 +53,22 @@ không cần Orca thật.
 
 ## Cài vào một dự án
 
-Một lệnh, giống install.sh của harness/setup:
+Cài, nâng cấp, hoặc gỡ bằng một dòng, chạy trong thư mục dự án:
+
+```sh
+# cài mới hoặc cài lại
+curl -fsSL https://raw.githubusercontent.com/dragonwar000/coding-agent/feat/standalone-harness/bootstrap.sh | bash
+# nâng cấp dự án đã cài, thêm các hook mới vào manifest cũ
+curl -fsSL https://raw.githubusercontent.com/dragonwar000/coding-agent/feat/standalone-harness/bootstrap.sh | bash -s -- --add-new-hooks
+# gỡ (thêm --purge --remove-manifest để gỡ sạch)
+curl -fsSL https://raw.githubusercontent.com/dragonwar000/coding-agent/feat/standalone-harness/bootstrap.sh | bash -s -- --uninstall
+```
+
+URL này không đổi giữa các bản. `bootstrap.sh` tự ghim vào một commit code đã kiểm (`PINNED_REF`), nên lệnh luôn cài bản
+mới nhất đã phát hành. Muốn cố định một bản: thay tên nhánh trong URL bằng SHA của commit chứa `bootstrap.sh`, hoặc đặt
+`CODING_AGENT_REF=<sha>`. Xem nguồn trước khi cài: thêm `-s -- --print-source`.
+
+Nếu đã clone repo, dùng `install.sh` trực tiếp:
 
 ```sh
 bash install.sh <dự án>                           # cài: dò vendor, merge hook, ghi CI, verify
