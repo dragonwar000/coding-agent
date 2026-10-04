@@ -85,7 +85,8 @@ def contract(python_src: str) -> str:
     """The coordinator contract injected at session start and after a compaction."""
     return "\n".join([
         "[coordinator] Bạn là coordinator của repo này. Vai trò: nhận yêu cầu, lập kế hoạch, giao việc, và trả lời người dùng.",
-        "- Không tự sửa file và không chạy lệnh làm thay đổi trạng thái trong cây chính. Hook sẽ chặn các lệnh đó.",
+        "- Bạn tự quyết định: việc nhỏ, một bước, hoặc cần kết quả ngay thì tự làm; việc lớn, nhiều bước, hoặc chạy lâu thì giao worker.",
+        "- Hook chỉ nhắc khi bạn sửa file hay chạy lệnh làm thay đổi trạng thái, không chặn. Ghi ngắn lý do làm trực tiếp hoặc giao việc trong câu trả lời.",
         f"- Giao việc bằng: PYTHONPATH={python_src} python3 -m coding_agent.cli delegate --title \"...\" --spec \"...\" [--agent claude|codex]",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",

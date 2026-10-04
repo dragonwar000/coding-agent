@@ -38,7 +38,7 @@ def test_a_fresh_project_gets_the_package_manifest_hooks_ci_and_a_passing_verify
     assert "vendors: claude_code" in report
     assert "verify: orca-guard (enforce) answered exit 2 to an invalid status" in report
     assert "verify: prompt-reset answered exit 0" in report
-    assert "verify: coordinator-guard (enforce) answered exit 2 to a direct write" in report
+    assert "verify: coordinator-guard (shadow) answered exit 0 to a direct write" in report
     assert "verify: coordinator-guard leaves worker sessions alone" in report
     assert gate.main(["--manifest", str(project / "integration.yaml")]) == 0
 

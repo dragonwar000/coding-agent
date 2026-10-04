@@ -252,10 +252,10 @@ def coordinator_guard(ctx: Context) -> HookResult:
     if reason is None:
         return HookResult()
     enforce = ctx.mode == "enforce"
-    ctx.note(guard="coordinator-guard", kind="blocked", applied=enforce, detail={"tool": tool})
+    ctx.note(guard="coordinator-guard", kind="blocked" if enforce else "nudged", applied=enforce, detail={"tool": tool})
     if enforce:
         return HookResult(code=2, stderr=reason)
-    return HookResult()
+    return HookResult(stdout=_inject("PreToolUse", reason + " Quyết định là của coordinator: làm trực tiếp nếu việc nhỏ và một bước, giao worker nếu lớn hoặc nhiều bước."))
 
 
 def coordinator_context(ctx: Context) -> HookResult:

@@ -89,14 +89,17 @@ def test_the_coordinator_guard_blocks_a_write_in_enforce_and_lets_a_worker_write
     assert worker.returncode == 0
 
 
-def test_the_coordinator_guard_in_shadow_records_without_blocking(repo, monkeypatch):
+def test_the_coordinator_guard_in_shadow_nudges_and_never_blocks(repo, monkeypatch):
     monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
     manifest(repo, verify=[])
     committed_repo(repo)
     result = call(repo, "coordinator-guard", {"session_id": "c2", "cwd": str(repo), "tool_name": "Edit", "tool_input": {}}, mode="shadow")
     assert result.returncode == 0
+    body = json.loads(result.stdout)["hookSpecificOutput"]
+    assert body["hookEventName"] == "PreToolUse"
+    assert "Quyết định là của coordinator" in body["additionalContext"]
     last = json.loads(events.log_path(repo).read_text(encoding="utf-8").splitlines()[-1])
-    assert last["guard"] == "coordinator-guard" and last["kind"] == "blocked" and last["applied"] is False
+    assert last["guard"] == "coordinator-guard" and last["kind"] == "nudged" and last["applied"] is False
 
 
 def test_session_start_injects_the_contract_and_the_board(repo, fake_orca, monkeypatch):
