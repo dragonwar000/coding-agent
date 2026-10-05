@@ -37,6 +37,19 @@ def main(argv: list[str]) -> int:
         state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         print(json.dumps({"ok": True, "result": {"worktree": {"id": f"repo::{path}", "path": path}}}))
         return 0
+    if argv[:2] == ["worktree", "rm"]:
+        options = _options(argv[2:])
+        path = options.get("--worktree", "")[5:]
+        if os.environ.get("FAKE_ORCA_RM_FAIL") == "1":
+            print(json.dumps({"ok": False, "error": {"code": "worktree_dirty", "message": "worktree has changes"}}))
+            return 1
+        data.setdefault("removed_worktrees", []).append({"path": path, "force": "--force" in argv})
+        state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        if os.path.isdir(path):
+            import subprocess
+            subprocess.run(["git", "-C", path, "worktree", "remove", "--force", path], capture_output=True)
+        print(json.dumps({"ok": True, "result": {"removed": True}}))
+        return 0
     if argv[:1] != ["orchestration"] or len(argv) < 2:
         print(json.dumps({"ok": False, "error": "unknown command"}))
         return 0
@@ -45,7 +58,10 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"id": str(uuid.uuid4()), "ok": False, "error": {"code": "run_required", "message": "No Run is bound."}}))
         return 1
 
-    if command == "check":
+    if command == "worker-release":
+        data.setdefault("released", []).append(options.get("--dispatch"))
+        answer = {"ok": True, "result": {"dispatchId": options.get("--dispatch"), "state": "released"}}
+    elif command == "check":
         messages = data.setdefault("messages", [])
         if "--ack" in options:
             data["messages"] = [m for m in messages if m.get("delivery") != options["--ack"]]
@@ -89,7 +105,7 @@ def main(argv: list[str]) -> int:
             selector = options.get("--worktree", "")
             worktree = selector[5:] if selector.startswith("path:") else os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
             data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": selector, "name": options.get("--name", os.path.basename(worktree)),
-                                               "display": options.get("--display-name")}
+                                               "display": options.get("--display-name"), "base": options.get("--base-branch")}
             task["status"] = "dispatched"
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"runId": options["--run"], "taskId": task["id"], "dispatchId": dispatch_id,
                                                                  "effects": [{"kind": "worktree", "action": "created_child", "id": f"repo::{worktree}"}]}}

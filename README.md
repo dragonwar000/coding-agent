@@ -133,7 +133,7 @@ Nó không tự sửa file.
 - **Nới lỏng:** đổi `coordinator-guard` sang `mode: shadow` trong `integration.yaml` rồi cài lại. Khi đó hook chỉ nhắc.
 
 Lưu ý khi dùng:
-- Worker tách nhánh từ commit hiện tại. Việc chưa commit ở cây chính thì worker không thấy.
+- Worker tách nhánh từ commit hiện tại của coordinator. Việc chưa commit ở cây chính thì worker không thấy.
 - Worktree mới chưa có phụ thuộc đã cài (ví dụ `node_modules`), nên lệnh verify ở `stop-gate` của worker sẽ fail cho tới khi
   worker cài. Cấu hình setup của repo trong Orca để tránh.
 - Orca đánh task `completed` khi worker tự báo xong. Bảng việc xếp nó vào "báo xong nhưng chưa có bằng chứng"; node phụ
@@ -183,6 +183,28 @@ python3 -m coding_agent.cli inbox --ack    # đánh dấu đã xử lý
 
 Chưa có: tự chạy `plan-next` mà không cần coordinator (bảng việc chỉ hiện ở prompt kế tiếp của người dùng), và ratchet giữ
 bản tốt nhất như DSH.
+
+## Dọn worktree của worker
+
+Khi task của worker đã `completed` hoặc `failed`, bảng việc của coordinator liệt kê worktree đó ở mục "chờ dọn". Coordinator
+hỏi người dùng, rồi chạy lệnh xoá. Hook `coordinator-guard` trả quyết định `ask` cho lệnh này, nên **Claude Code tự hỏi
+người dùng xác nhận** trước khi lệnh chạy, ở mọi mode trừ `off`.
+
+```sh
+python3 -m coding_agent.cli worktree-list                          # worktree chờ dọn và thứ sẽ mất nếu xoá
+python3 -m coding_agent.cli worktree-clean --task-id <id> --yes    # xoá một worktree
+python3 -m coding_agent.cli worktree-clean --all --yes             # xoá mọi worktree đã xong
+```
+
+- Thiếu `--yes` thì lệnh từ chối. Cờ này là lớp chặn dự phòng khi hook chưa được cài.
+- Worktree còn file chưa commit, hoặc còn commit của worker mà nhánh của coordinator chưa có, được **giữ lại**. Gộp trước
+  rồi chạy lại. `--discard` xoá cả những worktree đó và làm mất phần việc ấy.
+- Nếu git không so sánh được, worktree cũng được giữ.
+- Xoá gồm: nhả terminal của worker, `orca worktree rm` (xoá cả nhánh), và ghi `removed` vào sổ worker.
+
+Worker bắt đầu từ commit hiện tại của coordinator (`--base-branch`). Không truyền thì Orca tạo worktree từ nhánh gốc mặc định
+của repo, và worker sẽ thiếu việc mới nhất. Commit gốc của worktree được ghi vào sổ để chỉ đếm commit do worker thêm.
+Đã kiểm với Orca cài trên máy (2026-10-05): tạo, chạy, liệt kê và xoá một worktree thật.
 
 ## Mode và assumption
 

@@ -82,6 +82,20 @@ def is_plan_file(root: Path, file_path: Any) -> bool:
 
 # The coordinator's own delegation command, run alone. A chained or substituted command is not allowed through.
 DELEGATE_CALL = re.compile(r"^\s*(PYTHONPATH=\S+\s+)?python3?\s+-m\s+coding_agent\.cli\s")
+# Removing a worker's worktree deletes its directory and branch, so the host asks the user before this command runs.
+CLEAN_CALL = re.compile(r"coding_agent\.cli\s+(--root\s+\S+\s+)?worktree-clean\b")
+
+
+def needs_user_confirmation(tool: str, tool_input: Any) -> str | None:
+    """The question the host should put to the user before this call runs, or None when no confirmation is needed."""
+    if tool != "Bash" or not isinstance(tool_input, dict):
+        return None
+    command = str(tool_input.get("command") or "")
+    if CLEAN_CALL.search(command):
+        return "coding-agent sắp xoá worktree và nhánh của worker đã xong. Lệnh: " + command.strip()[:300]
+    return None
+
+
 CHAINING = re.compile(r"(&&|\|\||;|\||`|\$\()")
 
 
@@ -118,6 +132,7 @@ def contract(python_src: str) -> str:
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",
+        "- Khi bảng việc ghi 'worktree chờ dọn': hỏi người dùng có xoá không, rồi chạy `worktree-clean --task-id <id> --yes`. Host sẽ hỏi người dùng xác nhận lệnh đó. Worktree còn việc chưa gộp thì gộp trước; lệnh từ chối xoá nó.",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",
@@ -169,7 +184,14 @@ def read_board(root: Path, run: str | None = None) -> tuple[list[str], str | Non
         reports = orca_cli.unread_reports(run)
     except orca_cli.OrcaError as error:
         return lines + [f"hộp thư worker không đọc được: {str(error)[:160]}"], None
-    return lines + report_lines(reports, _plan_ids(root)), None
+    lines = lines + report_lines(reports, _plan_ids(root))
+    try:
+        from coding_agent import cleanup
+
+        lines = lines + cleanup.board_lines(cleanup.candidates(root, run))
+    except orca_cli.OrcaError as error:
+        lines.append(f"danh sách worktree chờ dọn không đọc được: {str(error)[:160]}")
+    return lines, None
 
 
 def _plan_ids(root: Path) -> dict[str, str]:

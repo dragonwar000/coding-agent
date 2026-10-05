@@ -266,6 +266,13 @@ def coordinator_guard(ctx: Context) -> HookResult:
     if coordinator.role_for(_cwd(ctx)) != "coordinator":
         return HookResult()
     tool = str(ctx.payload.get("tool_name") or "")
+    question = coordinator.needs_user_confirmation(tool, ctx.payload.get("tool_input"))
+    if question is not None:
+        # Asked in every mode but `off`: this is the user's confirmation of a deletion, not a guard decision.
+        ctx.note(guard="coordinator-guard", kind="confirm-requested", applied=True, detail={"tool": tool})
+        return HookResult(stdout=json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": question,
+        }}, ensure_ascii=False))
     reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"), ctx.root)
     if reason is None:
         return HookResult()

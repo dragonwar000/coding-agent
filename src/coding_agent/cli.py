@@ -14,6 +14,9 @@
 - `board`: the task board the coordinator sees on each prompt.
 - `worker-start --task-id ID [--agent A]`: start a worker on an existing task, recorded as a worker worktree.
 - `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator.
+- `worktree-list`: worker worktrees whose task settled, and what removing each would lose.
+- `worktree-clean (--task-id ID ... | --all) --yes [--discard]`: remove them after the user confirmed. Without `--discard`,
+  a worktree with uncommitted files or unmerged commits is kept.
 - `inbox [--ack]`: worker reports the coordinator has not handled; `--ack` acknowledges them.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
 - `plan-apply FILE`, `plan-next FILE [--max N]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
@@ -29,7 +32,7 @@ from pathlib import Path
 import os
 import uuid
 
-from coding_agent import coordinator, events, orca, orca_cli
+from coding_agent import cleanup, coordinator, events, orca, orca_cli
 from coding_agent import plan as plan_graph
 from coding_agent.brief import BriefError, brief
 from coding_agent.manifest import ManifestError, load
@@ -118,6 +121,14 @@ def main(argv: list[str] | None = None) -> int:
     adopt = sub.add_parser("worker-adopt", help="record an existing worktree as a worker's")
     adopt.add_argument("--worktree", required=True, type=Path)
     adopt.add_argument("--task-id", default="adopted")
+    wt_list = sub.add_parser("worktree-list", help="worker worktrees waiting for removal")
+    wt_list.add_argument("--run")
+    wt_clean = sub.add_parser("worktree-clean", help="remove settled workers' worktrees after the user confirmed")
+    wt_clean.add_argument("--task-id", action="append", default=[])
+    wt_clean.add_argument("--all", action="store_true", help="every settled worker worktree")
+    wt_clean.add_argument("--yes", action="store_true", help="the user confirmed the removal")
+    wt_clean.add_argument("--discard", action="store_true", help="also remove worktrees with uncommitted files or unmerged commits; that work is lost")
+    wt_clean.add_argument("--run")
     inbox = sub.add_parser("inbox", help="unhandled worker reports")
     inbox.add_argument("--ack", action="store_true", help="acknowledge the reports after printing them")
     inbox.add_argument("--run")
@@ -163,6 +174,26 @@ def main(argv: list[str] | None = None) -> int:
             orca_cli.record_worker(root, worktree=str(args.worktree), task_id=args.task_id, dispatch="adopted")
             print(f"worker-adopt: recorded {args.worktree.resolve()}")
             return 0
+        if args.command in ("worktree-list", "worktree-clean"):
+            found = cleanup.candidates(root, args.run)
+            if args.command == "worktree-list":
+                lines = cleanup.board_lines(found)
+                print("\n".join(lines[:-1]) if lines else "worktree-list: no settled worker worktree")
+                return 0
+            if not args.yes:
+                print("worktree-clean: refused. Ask the user to confirm the removal, then pass --yes.", file=sys.stderr)
+                return 2
+            if not args.all and not args.task_id:
+                print("worktree-clean: name the worktrees with --task-id, or pass --all.", file=sys.stderr)
+                return 2
+            chosen = found if args.all else [item for item in found if item.task_id in args.task_id]
+            unknown = [] if args.all else [task for task in args.task_id if task not in {item.task_id for item in found}]
+            for task in unknown:
+                print(f"worktree-clean: {task} has no settled worker worktree", file=sys.stderr)
+            results = cleanup.clean(root, chosen, discard=args.discard)
+            for item, outcome in results:
+                print(f"{outcome}: {Path(item.worktree).name} ({item.task_id})")
+            return 1 if unknown or any(not outcome.startswith("removed") for _item, outcome in results) else 0
         if args.command == "inbox":
             reports = orca_cli.ack_reports(args.run) if args.ack else orca_cli.unread_reports(args.run)
             lines = coordinator.report_lines(reports, coordinator._plan_ids(root))

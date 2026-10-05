@@ -253,29 +253,66 @@ def workers_ledger(root: Path) -> Path | None:
     return common / "coding-agent-workers.jsonl" if common is not None else None
 
 
-def worker_worktrees(root: Path) -> set[str]:
-    """Resolved paths of the worktrees that coding-agent started workers in."""
+def worker_records(root: Path) -> list[dict[str, str]]:
+    """The worker worktrees still in place: `{worktree, task_id, dispatch, base}`, in the order they were started.
+
+    A later `removed` line for a worktree drops its earlier record.
+    """
     path = workers_ledger(root)
     if path is None or not path.exists():
-        return set()
-    found: set[str] = set()
+        return []
+    live: dict[str, dict[str, str]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(record, dict) and isinstance(record.get("worktree"), str):
-            found.add(record["worktree"])
-    return found
+        if not isinstance(record, dict) or not isinstance(record.get("worktree"), str):
+            continue
+        if record.get("removed") is True:
+            live.pop(record["worktree"], None)
+        else:
+            live[record["worktree"]] = {"worktree": record["worktree"], "task_id": str(record.get("task_id") or ""), "dispatch": str(record.get("dispatch") or ""),
+                                        "base": str(record.get("base") or "")}
+    return list(live.values())
 
 
-def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str) -> None:
-    """Add a worker worktree to the ledger. Outside git there is no ledger and nothing is recorded."""
+def worker_worktrees(root: Path) -> set[str]:
+    """Resolved paths of the worktrees that coding-agent started workers in and has not removed."""
+    return {record["worktree"] for record in worker_records(root)}
+
+
+def mark_removed(root: Path, worktree: str) -> None:
+    """Record that a worker worktree was removed, so it is no longer a worker's and no longer a cleanup candidate."""
     path = workers_ledger(root)
     if path is None:
         return
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"worktree": str(Path(worktree).resolve()), "task_id": task_id, "dispatch": dispatch}) + "\n")
+        handle.write(json.dumps({"worktree": worktree, "removed": True}) + "\n")
+
+
+def release_worker(dispatch: str) -> None:
+    """Release the terminal of one settled worker."""
+    _call("worker-release", "--dispatch", dispatch)
+
+
+def remove_worktree(path: str, *, force: bool = False) -> None:
+    """Remove a worktree from Orca and git; Orca deletes its branch too. `force` removes one that still has changes."""
+    _call_tool("worktree", "rm", "--worktree", f"path:{path}", *(["--force"] if force else []))
+
+
+def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str) -> None:
+    """Add a worker worktree to the ledger, with the commit it starts from. Outside git there is no ledger and nothing is recorded.
+
+    The start commit is what later tells the worker's own commits apart from the difference between branches.
+    """
+    path = workers_ledger(root)
+    if path is None:
+        return
+    resolved = Path(worktree).resolve()
+    record = {"worktree": str(resolved), "task_id": task_id, "dispatch": dispatch, "base": _head(resolved) if resolved.is_dir() else None}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
 
 
 def _repo_path(root: Path) -> Path | None:
@@ -317,6 +354,25 @@ def _title_of(task_id: str, run: str | None) -> str:
     return ""
 
 
+def _head(cwd: Path) -> str | None:
+    """The commit `cwd` has checked out, or None outside git."""
+    try:
+        run = subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return run.stdout.strip() if run.returncode == 0 and run.stdout.strip() else None
+
+
+def _base_args(root: Path) -> list[str]:
+    """`--base-branch <commit>` for the coordinator's current commit.
+
+    Orca creates a worktree from the repository's default base unless told otherwise, so without this a worker
+    starts from a commit that lacks the coordinator's latest work (measured on the installed Orca).
+    """
+    head = _head(root)
+    return ["--base-branch", head] if head is not None else []
+
+
 def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None) -> Any:
     """Start a worker in a new worktree.
 
@@ -325,14 +381,15 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     after the terminal opened). Then the worktree is created from the repository path and the worker is started on it.
     """
     try:
-        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, "--display-name", display, *_run_args(run))
+        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, "--display-name", display,
+                     *_base_args(root), *_run_args(run))
     except OrcaError as error:
         if "selector_not_found" not in str(error):
             raise
     repo = _repo_path(root)
     if repo is None:
         raise OrcaError("worker-start could not place a new worktree, and this directory is not a git repository Orca can create one from")
-    created = _call_tool("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent")
+    created = _call_tool("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent", *_base_args(root))
     result = created.get("result") if isinstance(created, dict) else None
     worktree = result.get("worktree") if isinstance(result, dict) else None
     path = worktree.get("path") if isinstance(worktree, dict) else None
