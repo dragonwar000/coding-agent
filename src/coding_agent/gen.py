@@ -36,7 +36,7 @@ class GenError(RuntimeError):
 def command_for(manifest: Manifest, hook: Hook, root_expr: str) -> str:
     """The shell command a host runs for one hook."""
     src = f"{root_expr}/{manifest.python_src}"
-    return f"{hook.env_name}={hook.mode} PYTHONPATH={src} python3 -m {HARNESS_MARK} {hook.id}"
+    return f"{hook.env_name}={hook.mode} PYTHONPATH={src} {manifest.python} -m {HARNESS_MARK} {hook.id}"
 
 
 def _render_host(manifest: Manifest, host: str, root_expr: str) -> dict[str, Any]:

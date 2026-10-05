@@ -10,7 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import re
+
 HOSTS = ("claude_code", "codex")
+# The interpreter the generated hook commands call. A bare command name only: it is written into a shell command.
+PYTHON_NAME = re.compile(r"[A-Za-z0-9._-]+")
 MODES = ("off", "shadow", "enforce")
 # A hook with no `mode` in the manifest runs as `shadow` (FR-010): it records decisions and blocks nothing.
 DEFAULT_MODE = "shadow"
@@ -59,6 +63,7 @@ class Loop:
 class Manifest:
     path: Path
     verified: bool
+    python: str
     python_src: str
     verify_commands: tuple[str, ...]
     verify_timeout_s: int
@@ -133,6 +138,9 @@ def load(path: Path) -> Manifest:
     if not isinstance(verified, bool):
         raise ManifestError("verified must be true or false; false marks the values as unconfirmed defaults")
 
+    python = raw.get("python", "python3")
+    if not isinstance(python, str) or not PYTHON_NAME.fullmatch(python):
+        raise ManifestError("python must be an interpreter command such as python3, python, or py: letters, digits, dots, dashes, underscores")
     python_src = _require_str(raw.get("python_src"), "python_src")
     if python_src.startswith("/") or ".." in Path(python_src).parts:
         raise ManifestError("python_src must be a relative path inside the repository")
@@ -187,6 +195,7 @@ def load(path: Path) -> Manifest:
     return Manifest(
         path=path,
         verified=verified,
+        python=python,
         python_src=python_src,
         verify_commands=verify_commands,
         verify_timeout_s=verify_timeout,

@@ -44,13 +44,21 @@ class InstallError(RuntimeError):
     """The project cannot take the install as requested; nothing after the failing step is changed."""
 
 
-def manifest_text(python_src: str, verify: str) -> str:
-    """The shipped template with the project's source path and verify command.
+def default_python() -> str:
+    """The interpreter command hooks should call on this machine: `python3` where it exists, else `python`."""
+    import shutil
+
+    return "python3" if shutil.which("python3") else "python"
+
+
+def manifest_text(python_src: str, verify: str, python: str = "python3") -> str:
+    """The shipped template with the project's interpreter, source path, and verify command.
 
     Raises InstallError when the template no longer has the lines these substitutions need.
     """
     text = TEMPLATE.read_text(encoding="utf-8")
-    for old, new in (("python_src: src\n", f"python_src: {python_src}\n"), ('    - "python3 -m pytest -q"\n', f'    - "{verify}"\n')):
+    for old, new in (("python: python3\n", f"python: {python}\n"), ("python_src: src\n", f"python_src: {python_src}\n"),
+                     ('    - "python3 -m pytest -q"\n', f'    - "{verify}"\n')):
         if text.count(old) != 1:
             raise InstallError(f"template.yaml has no unique line {old.strip()!r}; the installer cannot set it")
         text = text.replace(old, new)
@@ -165,13 +173,20 @@ def _hook_command(document: dict[str, Any] | None, hook_id: str) -> str | None:
     return None
 
 
+def posix_shell() -> str | None:
+    """A POSIX shell to run a generated hook command with: `sh`, else `bash` (Git Bash on Windows), else None."""
+    import shutil
+
+    return shutil.which("sh") or shutil.which("bash")
+
+
 def _run_hook(command: str, project: Path, payload: dict[str, Any], role: str | None = None) -> subprocess.CompletedProcess:
     import os
 
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project), "PYTHONDONTWRITEBYTECODE": "1"}
     if role is not None:
         env["CODING_AGENT_ROLE"] = role
-    return subprocess.run(["sh", "-c", command], input=json.dumps(payload), capture_output=True, text=True, cwd=project, env=env, timeout=PAYLOAD_TIMEOUT_S, check=False)
+    return subprocess.run([str(posix_shell()), "-c", command], input=json.dumps(payload), capture_output=True, text=True, cwd=project, env=env, timeout=PAYLOAD_TIMEOUT_S, check=False)
 
 
 def verify_wiring(project: Path, manifest_path: Path, hosts: list[str]) -> list[str]:
@@ -183,6 +198,9 @@ def verify_wiring(project: Path, manifest_path: Path, hosts: list[str]) -> list[
         raise InstallError("; ".join(problems))
     report.append(f"verify: gate passed for {', '.join(hosts)}")
     if "claude_code" not in hosts:
+        return report
+    if posix_shell() is None:
+        report.append("verify: hook commands not run: no sh or bash on PATH. On Windows, install Git for Windows and run the installer from Git Bash")
         return report
     document = gen._read(project / gen.CLAUDE_FILE)
     guard_command = _hook_command(document, "orca-guard")
@@ -228,7 +246,7 @@ def _ignore_state(project: Path, report: list[str]) -> None:
         report.append("gitignore: added .coding-agent/")
 
 
-def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str = DEFAULT_VERIFY, vendors: str | None = None, run_verify: bool = True, ci: bool = True, add_new_hooks: bool = False) -> list[str]:
+def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str | None = None, vendors: str | None = None, run_verify: bool = True, ci: bool = True, add_new_hooks: bool = False, python: str | None = None) -> list[str]:
     """Install into `project` and return one report line per step. Raises InstallError or NotOwned."""
     if not project.is_dir():
         raise InstallError(f"{project} is not a directory")
@@ -248,7 +266,8 @@ def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str 
     if manifest_path.exists():
         report.append("manifest: kept existing integration.yaml")
     else:
-        manifest_path.write_text(manifest_text(python_src, verify), encoding="utf-8")
+        interpreter = python or default_python()
+        manifest_path.write_text(manifest_text(python_src, verify or f"{interpreter} -m pytest -q", interpreter), encoding="utf-8")
         report.append("manifest: wrote integration.yaml (verified: false; hooks in shadow except orca-guard and stop-gate)")
     try:
         manifest = load(manifest_path.resolve())
@@ -371,7 +390,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", type=Path, default=Path("."), help="project root (default: current directory)")
     parser.add_argument("--vendor", help="claude, codex, or claude,codex (default: detected from the project)")
     parser.add_argument("--python-src", default=DEFAULT_PYTHON_SRC, help="package location inside the project (default: harness/coding-agent/src)")
-    parser.add_argument("--verify", default=DEFAULT_VERIFY, help="verify command written to a new manifest (default: python3 -m pytest -q)")
+    parser.add_argument("--verify", help="verify command written to a new manifest (default: <python> -m pytest -q)")
+    parser.add_argument("--python", help="interpreter command the hooks call, written to a new manifest (default: python3 where it exists, else python)")
     parser.add_argument("--no-verify", action="store_true", help="skip the wiring check after install")
     parser.add_argument("--no-ci", action="store_true", help="do not write the CI gate")
     parser.add_argument("--clean", action="store_true", help="uninstall first, then install")
@@ -389,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
             lines = []
             if args.clean:
                 lines.extend(uninstall(project))
-            lines.extend(install(project, python_src=args.python_src, verify=args.verify, vendors=args.vendor, run_verify=not args.no_verify, ci=not args.no_ci, add_new_hooks=args.add_new_hooks))
+            lines.extend(install(project, python_src=args.python_src, verify=args.verify, vendors=args.vendor, run_verify=not args.no_verify, ci=not args.no_ci, add_new_hooks=args.add_new_hooks, python=args.python))
     except (InstallError, safe_install.NotOwned, gen.GenError, OSError) as error:
         print(f"project-install: {error}", file=sys.stderr)
         return 2

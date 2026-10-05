@@ -10,6 +10,9 @@ schema: 1
 #   4. Chỉ khi (1) đến (3) đạt và người duyệt đồng ý: đổi một guard sang `enforce`, rồi đặt `verified: true`.
 verified: false
 
+# Lệnh Python mà hook gọi. `python3` trên macOS và Linux; trên Windows thường là `python`.
+python: python3
+
 # Thư mục chứa package, tính từ gốc repo (nơi đặt manifest này). Đường dẫn tương đối, không tuyệt đối.
 python_src: src
 

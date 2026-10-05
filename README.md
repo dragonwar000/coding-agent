@@ -113,6 +113,72 @@ Kiểm tra trạng thái sau khi cài:
 PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.gate --manifest integration.yaml   # 0: khớp manifest
 ```
 
+## Windows
+
+Trạng thái: script cài và gỡ bằng PowerShell đã chạy được với PowerShell 7 trên macOS. **Chưa chạy trên máy Windows thật**,
+nên coi các bước dưới là hướng dẫn cần kiểm lại lần đầu dùng.
+
+### Cần có
+
+- **Git for Windows.** Bắt buộc, không chỉ để có `git`: trên Windows, Claude Code chạy hook bằng Git Bash, và lệnh hook của
+  coding-agent viết theo cú pháp shell POSIX. Không có Git Bash thì Claude Code chạy hook bằng PowerShell, lệnh hook lỗi, và
+  các guard ngừng chặn mà không báo. Nếu Claude Code không tìm thấy Git Bash, đặt trong `settings.json`:
+  `"env": { "CLAUDE_CODE_GIT_BASH_PATH": "C:\\Program Files\\Git\\bin\\bash.exe" }`.
+- **Python 3.11 trở lên** từ python.org, có trong PATH. Trên Windows lệnh thường là `python`, không phải `python3`.
+  Installer tự chọn và ghi vào `integration.yaml` (`python: python`).
+- **PyYAML** cho đúng Python đó. Installer tự cài nếu thiếu.
+
+### Cài
+
+PowerShell, trong thư mục dự án:
+
+```powershell
+irm https://raw.githubusercontent.com/dragonwar000/coding-agent/main/bootstrap.ps1 | iex
+```
+
+Hoặc Git Bash, trong thư mục dự án (cùng lệnh với macOS và Linux):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dragonwar000/coding-agent/main/bootstrap.sh | bash
+```
+
+Nếu PowerShell chặn script: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` rồi chạy lại.
+
+### Nâng cấp
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dragonwar000/coding-agent/main/bootstrap.ps1))) --add-new-hooks
+```
+
+### Gỡ
+
+```powershell
+# gỡ hook, CI, bản copy package; giữ integration.yaml và hook riêng của bạn
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dragonwar000/coding-agent/main/bootstrap.ps1))) --uninstall
+# gỡ sạch
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dragonwar000/coding-agent/main/bootstrap.ps1))) --uninstall --purge --remove-manifest
+```
+
+Git Bash: `curl -fsSL https://raw.githubusercontent.com/dragonwar000/coding-agent/main/bootstrap.sh | bash -s -- --uninstall`.
+
+### Kiểm sau khi cài
+
+```powershell
+$env:PYTHONPATH = "harness\coding-agent\src"; python -m coding_agent.gate --manifest integration.yaml
+```
+
+Thoát 0 là file hook khớp manifest. Bước verify của installer chạy thử lệnh hook bằng `sh` hoặc `bash`; nếu không có cả hai
+trong PATH (chạy từ PowerShell mà Git Bash không nằm trong PATH), installer báo bỏ qua bước đó và nhắc cài Git for Windows.
+
+### Khác biệt và giới hạn
+
+- Đổi lệnh Python sau khi cài: sửa `python:` trong `integration.yaml` rồi chạy lại lệnh cài. Giá trị chỉ là tên lệnh
+  (`python`, `python3`, `py`), không nhận đường dẫn có dấu cách hay tham số.
+- Lệnh verify mặc định là `<python> -m pytest -q`. Đổi trong `integration.yaml` cho hợp dự án.
+- Zero-Mem cần binary `zm` trong PATH. Chưa kiểm bản `zm` cho Windows.
+- Orca: chưa kiểm coding-agent với Orca trên Windows.
+- WSL: dùng hướng dẫn Linux bên trong WSL. Khi đó Claude Code cũng phải chạy trong WSL.
+
 ## Coordinator: bắt buộc chia việc theo graph
 
 Session chính là **coordinator**. Nó lập plan, giao từng node cho worker Orca, gộp kết quả, và trả lời người dùng.
