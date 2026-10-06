@@ -1,8 +1,8 @@
 """The coordinator role: the main session plans, delegates to Orca workers, and stays free to answer the user.
 
 Role is decided per session. The main worktree of the repository is the coordinator; a linked worktree
-(where `worker-start --worktree new-child` puts a worker) is a worker. `CODING_AGENT_ROLE=coordinator|worker`
-overrides the detection. A worker never gets the coordinator contract, and the coordinator guard does
+(where `worker-start --worktree new-child` puts a worker) is a worker. `CODING_AGENT_ROLE=coordinator|worker|maintainer`
+overrides the detection; a maintainer session is not blocked, and what the guard would have blocked is still logged. A worker never gets the coordinator contract, and the coordinator guard does
 nothing in a worker.
 
 The guard blocks direct file writes and mutating shell commands in the coordinator, so the work goes to a
@@ -22,6 +22,7 @@ from typing import Any
 from coding_agent import orca, orca_cli
 
 ROLE_ENV = "CODING_AGENT_ROLE"
+ROLES = ("coordinator", "worker", "maintainer")
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 BOARD_LIMIT = 20
 
@@ -36,6 +37,53 @@ MUTATING_BASH = re.compile(
 )
 
 
+def code_only(command: str) -> str:
+    """`command` with quoted text removed, so a `>` or `rm` inside a string is not read as shell.
+
+    Single-quoted text is dropped whole. Double-quoted text is dropped except `$(...)` and backtick
+    substitutions, because the shell runs those. Quotes stay as empty pairs so word boundaries hold.
+    """
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        char = command[i]
+        if char == "\\" and i + 1 < n:
+            out.append(command[i:i + 2])
+            i += 2
+        elif char == "'":
+            end = command.find("'", i + 1)
+            i = n if end < 0 else end + 1
+            out.append("''")
+        elif char == '"':
+            i += 1
+            kept: list[str] = []
+            while i < n and command[i] != '"':
+                if command[i] == "\\" and i + 1 < n:
+                    i += 2
+                elif command.startswith("$(", i):
+                    depth, start = 0, i
+                    i += 1
+                    while i < n:
+                        depth += {"(": 1, ")": -1}.get(command[i], 0)
+                        i += 1
+                        if depth == 0:
+                            break
+                    kept.append(command[start:i])
+                elif command[i] == "`":
+                    end = command.find("`", i + 1)
+                    stop = n if end < 0 else end + 1
+                    kept.append(command[i:stop])
+                    i = stop
+                else:
+                    i += 1
+            i += 1
+            out.append('"' + " ".join(kept) + '"')
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
 def _git(cwd: Path, *args: str) -> str | None:
     try:
         run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=10, check=False)
@@ -45,13 +93,15 @@ def _git(cwd: Path, *args: str) -> str | None:
 
 
 def role_for(cwd: Path | None) -> str:
-    """`coordinator` or `worker` for a session working in `cwd`.
+    """`coordinator`, `worker`, or `maintainer` for a session working in `cwd`.
 
     A session is a worker only in a worktree that coding-agent started a worker in (the workers ledger).
     Any other session, in the main worktree or in a linked one such as an Orca workspace, is the coordinator.
+    `maintainer` comes only from the environment: a person starts the session that way for work that is not
+    code (pulling repositories, generating docs). It is not a file the agent could write to lift the guard.
     """
     override = os.environ.get(ROLE_ENV)
-    if override in ("coordinator", "worker"):
+    if override in ROLES:
         return override
     if cwd is None:
         return "coordinator"
@@ -86,9 +136,30 @@ DELEGATE_CALL = re.compile(r"^\s*(PYTHONPATH=\S+\s+)?python3?\s+-m\s+coding_agen
 CLEAN_CALL = re.compile(r"coding_agent\.cli\s+(--root\s+\S+\s+)?worktree-clean\b")
 
 
-def needs_user_confirmation(tool: str, tool_input: Any) -> str | None:
+# The files that set the hooks' modes. Writing them directly is how a person lifts a guard, so the host asks
+# instead of refusing: refusing would leave the guard unable to be turned off from inside the session.
+HOOK_CONFIG_FILES = (Path(".claude") / "settings.json", Path(".claude") / "settings.local.json", Path("integration.yaml"))
+
+
+def is_hook_config(root: Path, file_path: Any) -> bool:
+    """True when `file_path` is one of the files that set the hooks' modes in `root`."""
+    if not isinstance(file_path, str) or not file_path:
+        return False
+    target = Path(file_path)
+    target = (target if target.is_absolute() else root / target).resolve()
+    return any(target == (root / name).resolve() for name in HOOK_CONFIG_FILES)
+
+
+def needs_user_confirmation(tool: str, tool_input: Any, root: Path | None = None) -> str | None:
     """The question the host should put to the user before this call runs, or None when no confirmation is needed."""
-    if tool != "Bash" or not isinstance(tool_input, dict):
+    if not isinstance(tool_input, dict):
+        return None
+    if tool in WRITE_TOOLS and root is not None:
+        file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
+        if is_hook_config(root, file_path):
+            return f"coding-agent: {tool} sửa cấu hình hook ({file_path}), có thể đổi mode của guard. Cho phép?"
+        return None
+    if tool != "Bash":
         return None
     command = str(tool_input.get("command") or "")
     if CLEAN_CALL.search(command):
@@ -114,9 +185,10 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None) -> str | 
         return f"[coordinator] subagent nội bộ không qua graph, nên bảng việc không thấy nó. {HOW}"
     if tool == "Bash":
         command = str(data.get("command") or "")
-        if DELEGATE_CALL.search(command) and not CHAINING.search(command):
+        shell = code_only(command)
+        if DELEGATE_CALL.search(command) and not CHAINING.search(shell):
             return None
-        if MUTATING_BASH.search(command):
+        if MUTATING_BASH.search(shell):
             return f"[coordinator] lệnh shell này làm thay đổi file hoặc trạng thái repo. {HOW}"
     return None
 

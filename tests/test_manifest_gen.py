@@ -41,6 +41,7 @@ def test_loads_the_shipped_manifest():
     assert manifest.hook("stop-gate").mode == "enforce"
     assert manifest.hook("prompt-reset").mode == "shadow"
     assert manifest.verified is False
+    assert manifest.verify_when == "changed" and manifest.verify_scope == "root"
 
 
 BAD = {
@@ -57,7 +58,9 @@ BAD = {
     "default mode needs an assumption": ("schema: 1\nverified: false\npython_src: src\nhooks:\n  - {id: x, host: [codex], event: Stop}\n", "runs in mode 'shadow' and needs a non-blank assumption"),
     "negative denial budget": ("schema: 1\nverified: false\npython_src: src\nloop: {max_denials_per_turn: -1}\nhooks: []\n", "max_denials_per_turn must be an integer >= 0"),
     "episode limit below the fixed lines": ("schema: 1\nverified: false\npython_src: src\nmemory: {max_episode_chars: 10}\nhooks: []\n", "max_episode_chars must be at least"),
-    "loop thresholds inverted": ("schema: 1\nverified: false\npython_src: src\nloop: {remind_at: 6, stop_at: 3}\nhooks: []\n", "remind_at must be less"),
+    "unknown verify.when": ("schema: 1\nverified: false\npython_src: src\nverify: {when: sometimes}\nhooks: []\n", "verify.when must be one of"),
+    "unknown verify.scope": ("schema: 1\nverified: false\npython_src: src\nverify: {scope: everywhere}\nhooks: []\n", "verify.scope must be one of"),
+    "loop thresholds inverted":("schema: 1\nverified: false\npython_src: src\nloop: {remind_at: 6, stop_at: 3}\nhooks: []\n", "remind_at must be less"),
 }
 
 

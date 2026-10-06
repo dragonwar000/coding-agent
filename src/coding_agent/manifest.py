@@ -20,6 +20,8 @@ MODES = ("off", "shadow", "enforce")
 DEFAULT_MODE = "shadow"
 INGEST = ("conversation", "episodes", "both")
 EMBEDDERS = ("hash", "default")
+VERIFY_WHEN = ("changed", "always")
+VERIFY_SCOPES = ("root", "changed-repos")
 
 
 class ManifestError(ValueError):
@@ -70,6 +72,10 @@ class Manifest:
     max_continuations: int
     memory: Memory
     loop: Loop
+    # `changed`: verify only a turn that changed files. `always`: every turn.
+    verify_when: str = "changed"
+    # `root`: run the commands in the repository root. `changed-repos`: in each git repository the turn changed.
+    verify_scope: str = "root"
     hooks: tuple[Hook, ...] = field(default_factory=tuple)
 
     @property
@@ -149,6 +155,12 @@ def load(path: Path) -> Manifest:
     verify_commands = _str_list(verify.get("commands", []), "verify.commands")
     verify_timeout = _require_int(verify.get("timeout_s", 300), "verify.timeout_s", 1)
     max_continuations = _require_int(verify.get("max_continuations", 3), "verify.max_continuations", 0)
+    verify_when = verify.get("when", "changed")
+    if verify_when not in VERIFY_WHEN:
+        raise ManifestError(f"verify.when must be one of {', '.join(VERIFY_WHEN)}")
+    verify_scope = verify.get("scope", "root")
+    if verify_scope not in VERIFY_SCOPES:
+        raise ManifestError(f"verify.scope must be one of {', '.join(VERIFY_SCOPES)}")
 
     mem = raw.get("memory") or {}
     ingest = mem.get("ingest", "both")
@@ -202,5 +214,7 @@ def load(path: Path) -> Manifest:
         max_continuations=max_continuations,
         memory=memory,
         loop=loop,
+        verify_when=verify_when,
+        verify_scope=verify_scope,
         hooks=hooks,
     )

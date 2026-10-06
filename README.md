@@ -175,6 +175,11 @@ trong PATH (chạy từ PowerShell mà Git Bash không nằm trong PATH), instal
 - Đổi lệnh Python sau khi cài: sửa `python:` trong `integration.yaml` rồi chạy lại lệnh cài. Giá trị chỉ là tên lệnh
   (`python`, `python3`, `py`), không nhận đường dẫn có dấu cách hay tham số.
 - Lệnh verify mặc định là `<python> -m pytest -q`. Đổi trong `integration.yaml` cho hợp dự án.
+- `verify.when: changed` (mặc định) bỏ qua verify khi lượt không sửa file: không có `Write`/`Edit` thành công trong transcript
+  và `git status` của gốc không đổi so với đầu lượt. Ngoài git, chỉ transcript làm bằng chứng. Không chắc thì vẫn verify.
+  Event là `no-change`. Đặt `when: always` để verify mọi lượt như trước.
+- `verify.scope: changed-repos` cho workspace nhiều repo (gốc không phải một dự án): lệnh verify chạy trong từng git repo con
+  có file bị sửa thay vì ở gốc. Mặc định `root`.
 - Zero-Mem cần binary `zm` trong PATH. Chưa kiểm bản `zm` cho Windows.
 - Orca: chưa kiểm coding-agent với Orca trên Windows.
 - WSL: dùng hướng dẫn Linux bên trong WSL. Khi đó Claude Code cũng phải chạy trong WSL.
@@ -186,12 +191,18 @@ Nó không tự sửa file.
 
 - **`coordinator-guard` (enforce)** chặn trong session coordinator: `Write`, `Edit`, `MultiEdit`, `NotebookEdit`; lệnh shell
   sửa nội dung hay viết lại trạng thái (`sed -i`, `>`, `rm`, `git reset`, `git checkout`, `pip install`, ...); và tool
-  `Agent`/`Task` (subagent nội bộ không qua graph).
+  `Agent`/`Task` (subagent nội bộ không qua graph). Guard bỏ phần nằm trong dấu nháy trước khi so khớp, nên `echo "a -> b"`
+  hay `git commit -m "rm cũ"` không bị chặn; `$(...)` và backtick trong nháy kép vẫn được xét vì shell chạy chúng.
+- **Sửa cấu hình hook** (`.claude/settings.json`, `.claude/settings.local.json`, `integration.yaml`) bằng `Write`/`Edit`
+  không bị chặn mà host hỏi người dùng xác nhận, để guard luôn tắt được từ trong phiên.
 - **Coordinator vẫn được:** đọc file, lệnh đọc, ghi `.coding-agent/plan.yaml`, chạy một lệnh `coding_agent.cli` đơn lẻ,
   và `git add` / `git commit` / `git merge` để gộp nhánh của worker.
 - **Ai là worker:** chỉ session chạy trong worktree mà `worker-start` của coding-agent tạo ra. Danh sách nằm ở
   `<git-common-dir>/coding-agent-workers.jsonl`, dùng chung cho mọi worktree. Session ở worktree khác (kể cả workspace
-  Orca) là coordinator. `CODING_AGENT_ROLE=coordinator|worker` ghi đè.
+  Orca) là coordinator. `CODING_AGENT_ROLE=coordinator|worker|maintainer` ghi đè.
+- **Maintainer:** khởi động phiên với `CODING_AGENT_ROLE=maintainer` cho việc không phải code (pull repo, sinh tài liệu).
+  Guard không chặn, nhưng mỗi lệnh nó lẽ ra chặn được ghi event `maintainer-allowed`. Vai trò này chỉ đến từ biến môi
+  trường do người khởi động phiên đặt, không phải file agent tự ghi được.
 - **Phát hiện phần guard bỏ sót:** guard shell là heuristic. Cuối lượt, `stop-gate` so `git status` với đầu lượt và ghi
   event `direct-change` nếu cây của coordinator có file mới đổi. Đây là phát hiện, không hoàn tác. Sửa tay của người dùng
   trong lúc đó cũng bị tính.

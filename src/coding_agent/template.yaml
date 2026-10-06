@@ -22,6 +22,10 @@ verify:
     - "python3 -m pytest -q"
   timeout_s: 300
   max_continuations: 3
+  # changed: chỉ verify lượt có sửa file (theo transcript và git status). always: mọi lượt.
+  when: changed
+  # root: chạy ở gốc repo. changed-repos: chạy trong từng git repo con có file bị sửa (workspace nhiều repo).
+  scope: root
 
 # Bộ nhớ của agent: Zero-Mem (zm) với quy tắc episode của memory-distill.
 memory:

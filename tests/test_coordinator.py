@@ -86,6 +86,13 @@ def test_the_role_environment_variable_overrides_detection(repo, monkeypatch):
     ("Bash", {"command": "ls -la > /dev/null"}, False),
     ("Bash", {"command": "PYTHONPATH=harness/src python3 -m coding_agent.cli delegate --title t --spec 'x > y'"}, False),
     ("Bash", {"command": "python3 -m coding_agent.cli delegate --title t --spec x && rm -rf build"}, True),
+    ("Bash", {"command": 'echo "$d | $b -> $a"'}, False),
+    ("Bash", {"command": "echo '> out.txt and rm -rf build'"}, False),
+    ("Bash", {"command": 'git commit -m "move a -> b; rm old"'}, False),
+    ("Bash", {"command": 'echo "$(rm -rf build)"'}, True),
+    ("Bash", {"command": 'echo "`touch x`"'}, True),
+    ("Bash", {"command": 'echo "a" > out.txt'}, True),
+    ("Bash", {"command": "python3 -m coding_agent.cli delegate --title t --spec 'a && b'"}, False),
     ("Read", {"file_path": "a.py"}, False),
     ("Agent", {"description": "do it all"}, True),
     ("Task", {"description": "do it all"}, True),
@@ -324,3 +331,48 @@ def test_a_worker_started_by_task_id_gets_its_name_from_the_title_orca_stores(re
 def test_the_contract_asks_for_short_summary_titles():
     text = coordinator.contract("harness/coding-agent/src")
     assert "tóm tắt việc cần làm" in text and "40 ký tự" in text
+
+
+def test_the_quote_aware_view_keeps_substitutions_and_drops_strings():
+    assert ">" not in coordinator.code_only('echo "$b -> $a"')
+    assert "rm -rf x" in coordinator.code_only('echo "$(rm -rf x)"')
+    assert coordinator.code_only("echo 'a > b' > out") == "echo '' > out"
+
+
+@pytest.mark.parametrize("file_path", [".claude/settings.json", ".claude/settings.local.json", "integration.yaml"])
+def test_editing_the_hook_config_asks_the_user_instead_of_blocking(repo, monkeypatch, file_path):
+    monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
+    manifest(repo, verify=[])
+    committed_repo(repo)
+    payload = {"session_id": "c30", "cwd": str(repo), "tool_name": "Edit", "tool_input": {"file_path": str(repo / file_path)}}
+    result = call(repo, "coordinator-guard", payload, mode="enforce")
+    assert result.returncode == 0
+    body = json.loads(result.stdout)["hookSpecificOutput"]
+    assert body["permissionDecision"] == "ask" and file_path.split("/")[-1] in body["permissionDecisionReason"]
+
+
+def test_another_file_in_claude_is_still_blocked(repo, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
+    manifest(repo, verify=[])
+    committed_repo(repo)
+    payload = {"session_id": "c31", "cwd": str(repo), "tool_name": "Write", "tool_input": {"file_path": str(repo / ".claude" / "hooks.py")}}
+    assert call(repo, "coordinator-guard", payload, mode="enforce").returncode == 2
+
+
+def test_a_maintainer_session_is_let_through_and_logged(repo, monkeypatch):
+    monkeypatch.setenv("CODING_AGENT_ROLE", "maintainer")
+    manifest(repo, verify=[])
+    committed_repo(repo)
+    assert coordinator.role_for(repo) == "maintainer"
+    result = call(repo, "coordinator-guard", {"session_id": "c32", "cwd": str(repo), **{"tool_name": "Bash", "tool_input": {"command": "git stash"}}}, mode="enforce")
+    assert result.returncode == 0 and result.stdout == ""
+    last = json.loads(events.log_path(repo).read_text(encoding="utf-8").splitlines()[-1])
+    assert last["kind"] == "maintainer-allowed" and last["applied"] is False
+
+
+def test_a_maintainer_is_still_asked_before_a_worktree_is_removed(repo, monkeypatch):
+    monkeypatch.setenv("CODING_AGENT_ROLE", "maintainer")
+    manifest(repo, verify=[])
+    command = "python3 -m coding_agent.cli worktree-clean --task-id t1 --yes"
+    result = call(repo, "coordinator-guard", {"session_id": "c33", "cwd": str(repo), "tool_name": "Bash", "tool_input": {"command": command}}, mode="enforce")
+    assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask"

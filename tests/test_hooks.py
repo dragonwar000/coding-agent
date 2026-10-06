@@ -283,3 +283,66 @@ def test_a_missing_pyyaml_in_the_hook_interpreter_is_reported(repo, monkeypatch)
     monkeypatch.setattr(hooks, "load", no_yaml)
     ctx = hooks.context_for("prompt-reset", {"cwd": str(repo)})
     assert ctx.manifest is None and "PyYAML is not importable" in ctx.manifest_error
+
+
+def _verify_options(repo: Path, **options) -> None:
+    doc = yaml.safe_load((repo / "integration.yaml").read_text(encoding="utf-8"))
+    doc["verify"].update(options)
+    (repo / "integration.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+
+def _read_only_turn(path: Path) -> Path:
+    entries = [
+        {"type": "user", "message": {"role": "user", "content": "pull the repos"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "git status"}}]}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": False}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Nothing to change."}]}},
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+    return path
+
+
+def test_stop_gate_skips_verification_when_the_turn_changed_nothing(repo, tmp_path):
+    manifest(repo, verify=["false"], mode="enforce")
+    call(repo, "prompt-reset", {"session_id": "s20", "prompt": "pull", "cwd": str(repo)}, mode="shadow")
+    path = _read_only_turn(tmp_path / "t.jsonl")
+    result = call(repo, "stop-gate", {"session_id": "s20", "transcript_path": str(path), "cwd": str(repo)}, zm_base=tmp_path / "zm")
+    assert result.returncode == 0
+    assert [e["kind"] for e in _events(repo) if e["guard"] == "stop-gate"] == ["no-change"]
+
+
+def test_stop_gate_verifies_a_turn_that_changed_files_through_the_shell(repo, tmp_path):
+    manifest(repo, verify=["false"], mode="enforce")
+    (repo / ".gitignore").write_text(".coding-agent/\nintegration.yaml\n", encoding="utf-8")
+    call(repo, "prompt-reset", {"session_id": "s21", "prompt": "pull", "cwd": str(repo)}, mode="shadow")
+    (repo / "made_by_shell.py").write_text("x = 1\n", encoding="utf-8")
+    path = _read_only_turn(tmp_path / "t.jsonl")
+    result = call(repo, "stop-gate", {"session_id": "s21", "transcript_path": str(path), "cwd": str(repo)}, zm_base=tmp_path / "zm")
+    assert result.returncode == 2
+
+
+def test_stop_gate_when_always_verifies_every_turn(repo, tmp_path):
+    manifest(repo, verify=["false"], mode="enforce")
+    _verify_options(repo, when="always")
+    path = _read_only_turn(tmp_path / "t.jsonl")
+    result = call(repo, "stop-gate", {"session_id": "s22", "transcript_path": str(path), "cwd": str(repo)}, zm_base=tmp_path / "zm")
+    assert result.returncode == 2
+
+
+def test_stop_gate_scoped_to_changed_repos_runs_in_the_repo_that_changed(tmp_path):
+    workspace = tmp_path / "workspace"
+    for name in ("svc-a", "svc-b"):
+        (workspace / name).mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(workspace / name)], check=True)
+    (workspace / "svc-b" / "broken").write_text("", encoding="utf-8")
+    check = f"{sys.executable} -c \"import os,sys; sys.exit(1 if os.path.exists('broken') else 0)\""
+    manifest(workspace, verify=[check], mode="enforce")
+    _verify_options(workspace, scope="changed-repos")
+
+    edited_a = transcript(tmp_path / "a.jsonl", prompt="fix a", edited=str(workspace / "svc-a" / "app.py"), answer="Done.")
+    ok = call(workspace, "stop-gate", {"session_id": "s23", "transcript_path": str(edited_a), "cwd": str(workspace)}, zm_base=tmp_path / "zm")
+    assert ok.returncode == 0
+
+    edited_b = transcript(tmp_path / "b.jsonl", prompt="fix b", edited=str(workspace / "svc-b" / "app.py"), answer="Done.")
+    failed = call(workspace, "stop-gate", {"session_id": "s24", "transcript_path": str(edited_b), "cwd": str(workspace)}, zm_base=tmp_path / "zm")
+    assert failed.returncode == 2 and "(in svc-b)" in failed.stderr
