@@ -126,8 +126,8 @@ def prompt_reset(ctx: Context) -> HookResult:
         prompts.append({"ts": int(time.time()), "text": prompt[:4000]})
     data = state.expire_prompts({**data, "prompts": prompts[-20:]})
     data.update({"sig_counts": {}, "calls_this_turn": 0, "continuations": 0})
-    if coordinator.role_for(_cwd(ctx)) == "coordinator":
-        data["dirty_at_prompt"] = coordinator.dirty_paths(ctx.root)
+    # Taken for every role: stop-gate compares against it to tell a turn that changed nothing.
+    data["dirty_at_prompt"] = coordinator.dirty_paths(ctx.root)
     state.save(ctx.root, ctx.session, data)
     return HookResult()
 
@@ -148,6 +148,59 @@ def _verify(commands: tuple[str, ...], cwd: str, timeout: int) -> list[dict[str,
     return checks
 
 
+def _turn_changed(ctx: Context, turn: transcript.Turn, data: dict[str, Any], has_transcript: bool) -> bool:
+    """Whether the turn changed files. Unknown counts as changed, so verification is never skipped on a guess.
+
+    Evidence, in order: a successful change tool in the transcript; the git status of the root against the
+    snapshot prompt-reset took. Outside git, a readable transcript with no change is the only evidence.
+    """
+    if turn.changes:
+        return True
+    now = coordinator.dirty_paths(ctx.root)
+    before = data.get("dirty_at_prompt")
+    if now is not None:
+        if not isinstance(before, list):
+            return True
+        # The harness writes its own state during the turn; that is not a change the turn made.
+        return {p for p in now if not p.startswith(".coding-agent")} != {p for p in before if not p.startswith(".coding-agent")}
+    return not has_transcript
+
+
+def _changed_repos(root: Path, paths: list[str]) -> list[Path]:
+    """The git repositories under `root` that hold `paths`: the nearest directory with a `.git`, up to `root`."""
+    root = root.resolve()
+    repos: set[Path] = set()
+    for value in paths:
+        target = Path(value)
+        target = (target if target.is_absolute() else root / target).resolve()
+        if root not in target.parents:
+            continue
+        for parent in target.parents:
+            if (parent / ".git").exists():
+                repos.add(parent)
+                break
+            if parent == root:
+                break
+    return sorted(repos)
+
+
+def _verify_turn(ctx: Context, turn: transcript.Turn) -> list[dict[str, Any]]:
+    """Run the verification commands where the manifest's scope says: the root, or each changed repository."""
+    manifest = ctx.manifest
+    assert manifest is not None
+    places = _changed_repos(ctx.root, list(turn.changes)) if manifest.verify_scope == "changed-repos" else []
+    if not places:
+        return _verify(manifest.verify_commands, str(ctx.root), manifest.verify_timeout_s)
+    checks: list[dict[str, Any]] = []
+    for place in places:
+        found = _verify(manifest.verify_commands, str(place), manifest.verify_timeout_s)
+        label = place.relative_to(ctx.root.resolve()).as_posix()
+        checks.extend({**check, "command": f"{check['command']} (in {label})"} for check in found)
+        if found and found[-1]["exit"] != 0:
+            break
+    return checks
+
+
 def stop_gate(ctx: Context) -> HookResult:
     """Verify at the end of a turn; in enforce mode a failing turn continues up to the budget; record the turn to memory."""
     if ctx.manifest is None:
@@ -157,14 +210,16 @@ def stop_gate(ctx: Context) -> HookResult:
     path = ctx.payload.get("transcript_path")
     turn = transcript.read_turn(_path(path), manifest.memory.change_tools) if path else transcript.Turn()
     lines = _line_count(path)
-
-    if manifest.verify_commands:
-        checks = _verify(manifest.verify_commands, str(ctx.root), manifest.verify_timeout_s)
-        verdict = "ok" if checks and all(c["exit"] == 0 for c in checks) else "not-ok"
-    else:
-        checks, verdict = [], "skipped"
-
     data = state.load(ctx.root, ctx.session)
+
+    if not manifest.verify_commands:
+        checks, verdict = [], "skipped"
+    elif manifest.verify_when == "changed" and not _turn_changed(ctx, turn, data, bool(path)):
+        checks, verdict = [], "no-change"
+    else:
+        checks = _verify_turn(ctx, turn)
+        verdict = "ok" if checks and all(c["exit"] == 0 for c in checks) else "not-ok"
+
     continuations = int(data.get("continuations", 0))
     result = HookResult()
 
@@ -262,11 +317,15 @@ def _cwd(ctx: Context) -> Path:
 
 
 def coordinator_guard(ctx: Context) -> HookResult:
-    """In the coordinator's session, block direct writes and mutating shell commands; workers are never affected."""
-    if coordinator.role_for(_cwd(ctx)) != "coordinator":
+    """In the coordinator's session, block direct writes and mutating shell commands; workers are never affected.
+
+    A maintainer session is let through, and each call the guard would have blocked is logged as `maintainer-allowed`.
+    """
+    role = coordinator.role_for(_cwd(ctx))
+    if role not in ("coordinator", "maintainer"):
         return HookResult()
     tool = str(ctx.payload.get("tool_name") or "")
-    question = coordinator.needs_user_confirmation(tool, ctx.payload.get("tool_input"))
+    question = coordinator.needs_user_confirmation(tool, ctx.payload.get("tool_input"), ctx.root)
     if question is not None:
         # Asked in every mode but `off`: this is the user's confirmation of a deletion, not a guard decision.
         ctx.note(guard="coordinator-guard", kind="confirm-requested", applied=True, detail={"tool": tool})
@@ -275,6 +334,9 @@ def coordinator_guard(ctx: Context) -> HookResult:
         }}, ensure_ascii=False))
     reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"), ctx.root)
     if reason is None:
+        return HookResult()
+    if role == "maintainer":
+        ctx.note(guard="coordinator-guard", kind="maintainer-allowed", applied=False, detail={"tool": tool})
         return HookResult()
     enforce = ctx.mode == "enforce"
     ctx.note(guard="coordinator-guard", kind="blocked" if enforce else "nudged", applied=enforce, detail={"tool": tool})
