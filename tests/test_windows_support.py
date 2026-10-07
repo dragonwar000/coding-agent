@@ -1,11 +1,14 @@
-"""What Windows needs from the package: a configurable interpreter, a shell check in verify, and two bootstraps on one pin."""
+"""What Windows needs from the package: a configurable interpreter, a shell check in verify, two bootstraps on one pin, and UTF-8 output on a cp1252 console."""
 
+import io
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
-from coding_agent import gen, project_install
+from coding_agent import cli, gen, hooks, project_install
+from coding_agent.hooks import HookResult
 from coding_agent.manifest import ManifestError, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,3 +76,37 @@ def test_both_bootstraps_pin_the_same_commit():
     sh = re.search(r'^PINNED_REF="([0-9a-f]{40})"', (ROOT / "bootstrap.sh").read_text(encoding="utf-8"), re.M)
     ps = re.search(r"^\$PinnedRef = '([0-9a-f]{40})'", (ROOT / "bootstrap.ps1").read_text(encoding="utf-8"), re.M)
     assert sh and ps and sh.group(1) == ps.group(1)
+
+
+VIETNAMESE = "Nhiệm vụ: sửa lỗi mã hoá trên Windows"
+
+
+def cp1252_console(monkeypatch) -> tuple[io.BytesIO, io.BytesIO]:
+    """stdout and stderr as a Windows console opens them: text streams over the cp1252 code page.
+
+    Called from the test body, not a fixture: pytest swaps `sys.stdout` between its setup and call phases.
+    """
+    out, err = io.BytesIO(), io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(out, encoding="cp1252", newline="\n", write_through=True))
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(err, encoding="cp1252", newline="\n", write_through=True))
+    return out, err
+
+
+def test_a_hook_writes_utf8_on_a_cp1252_console(tmp_path, monkeypatch):
+    from coding_agent.hooks import handlers
+
+    out, err = cp1252_console(monkeypatch)
+    monkeypatch.setitem(handlers.REGISTRY, "utf8-probe", lambda ctx: HookResult(stdout=VIETNAMESE, stderr=VIETNAMESE))
+    monkeypatch.setenv("CODING_AGENT_MODE_UTF8_PROBE", "shadow")
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"hook_event_name": "SessionStart", "session_id": "x", "cwd": "%s"}' % tmp_path.as_posix()))
+    assert hooks.main(["utf8-probe"]) == 0
+    assert out.getvalue().decode("utf-8") == VIETNAMESE + "\n"
+    assert err.getvalue().decode("utf-8") == VIETNAMESE + "\n"
+
+
+def test_the_cli_writes_utf8_on_a_cp1252_console(tmp_path, monkeypatch):
+    out, _ = cp1252_console(monkeypatch)
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(f"# PLAN\n\n## Global constraints\n- {VIETNAMESE}\n\n## Plan\n### Task 1 — Việc\n**Files:** `a.py`\n", encoding="utf-8")
+    assert cli.main(["brief", "--plan", str(plan), "--task", "1"]) == 0
+    assert VIETNAMESE in out.getvalue().decode("utf-8")

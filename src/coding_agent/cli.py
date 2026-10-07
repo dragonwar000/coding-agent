@@ -35,6 +35,7 @@ import uuid
 from coding_agent import cleanup, coordinator, events, orca, orca_cli
 from coding_agent import plan as plan_graph
 from coding_agent.brief import BriefError, brief
+from coding_agent.hooks import utf8_output
 from coding_agent.manifest import ManifestError, load
 from coding_agent.memory import zeromem
 
@@ -76,6 +77,7 @@ def _status(root: Path, run: str | None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    utf8_output()
     parser = argparse.ArgumentParser(prog="coding_agent.cli")
     parser.add_argument("--root", help="project root (default: current directory)")
     sub = parser.add_subparsers(dest="command", required=True)

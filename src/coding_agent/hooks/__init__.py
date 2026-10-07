@@ -110,9 +110,26 @@ def _read_payload() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def utf8_output() -> None:
+    """Emit UTF-8 whatever the console's locale is.
+
+    A Windows console defaults to a code page such as cp1252, and `sys.stdout.write` raises UnicodeEncodeError on the
+    first character outside it (a Vietnamese task title, for instance). The hosts read UTF-8, so the streams are
+    reconfigured; a stream without `reconfigure` (a test double, a closed pipe) is left as it is.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     from coding_agent.hooks import handlers
 
+    utf8_output()
     args = argv if argv is not None else sys.argv[1:]
     if not args:
         return 0
