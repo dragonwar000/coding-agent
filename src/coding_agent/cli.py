@@ -14,6 +14,9 @@
 - `board`: the task board the coordinator sees on each prompt.
 - `worker-start --task-id ID [--agent A]`: start a worker on an existing task, recorded as a worker worktree.
 - `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator.
+- `worker-kick --task-id ID`: record the task's worktree as a worker's and send the kick-off to its terminal, for a worker that never received its task.
+- `worker-settle --task-id ID --basis B [--artifact PATH ...]`: abandon the task's active dispatch and mark it completed, once the coordinator
+  has checked the result; for a worker whose `worker_done` Orca rejected.
 - `worktree-list`: worker worktrees whose task settled, and what removing each would lose.
 - `worktree-clean (--task-id ID ... | --all) --yes [--discard]`: remove them after the user confirmed. Without `--discard`,
   a worktree with uncommitted files or unmerged commits is kept.
@@ -123,6 +126,14 @@ def main(argv: list[str] | None = None) -> int:
     adopt = sub.add_parser("worker-adopt", help="record an existing worktree as a worker's")
     adopt.add_argument("--worktree", required=True, type=Path)
     adopt.add_argument("--task-id", default="adopted")
+    kick = sub.add_parser("worker-kick", help="send the task's worker its kick-off and record its worktree")
+    kick.add_argument("--task-id", required=True)
+    kick.add_argument("--run")
+    settle = sub.add_parser("worker-settle", help="abandon the task's dispatch and complete the task after checking its result")
+    settle.add_argument("--task-id", required=True)
+    settle.add_argument("--basis", required=True, choices=sorted(orca.PROOF_BASES))
+    settle.add_argument("--artifact", action="append", default=[])
+    settle.add_argument("--run")
     wt_list = sub.add_parser("worktree-list", help="worker worktrees waiting for removal")
     wt_list.add_argument("--run")
     wt_clean = sub.add_parser("worktree-clean", help="remove settled workers' worktrees after the user confirmed")
@@ -176,6 +187,14 @@ def main(argv: list[str] | None = None) -> int:
             orca_cli.record_worker(root, worktree=str(args.worktree), task_id=args.task_id, dispatch="adopted")
             print(f"worker-adopt: recorded {args.worktree.resolve()}")
             return 0
+        if args.command == "worker-kick":
+            outcome = orca_cli.kick_by_hand(root, task_id=args.task_id, run=args.run)
+            print(json.dumps(outcome, ensure_ascii=False))
+            return 0 if outcome["kicked"] else 1
+        if args.command == "worker-settle":
+            outcome = orca_cli.settle(root, task_id=args.task_id, basis=args.basis, artifacts=tuple(args.artifact), run=args.run)
+            print(json.dumps(outcome, ensure_ascii=False))
+            return 0 if outcome["sent"] else 1
         if args.command in ("worktree-list", "worktree-clean"):
             found = cleanup.candidates(root, args.run)
             if args.command == "worktree-list":

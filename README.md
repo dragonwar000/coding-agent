@@ -24,7 +24,7 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
-| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check` |
+| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-settle` |
 | `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
 | `install.sh` | Lệnh một dòng cho `project_install` |
 | `src/coding_agent/gate.py` | Cổng của package (FR-003): thất bại khi file đang dùng lệch manifest |
@@ -260,6 +260,25 @@ python3 -m coding_agent.cli inbox --ack    # đánh dấu đã xử lý
 
 Chưa có: tự chạy `plan-next` mà không cần coordinator (bảng việc chỉ hiện ở prompt kế tiếp của người dùng), và ratchet giữ
 bản tốt nhất như DSH.
+
+## Khi worker không nhận đề bài / không báo
+
+Đo trên Orca CLI 1.4.206 (Windows 11, 2026-10-07): `worker-start` có thể trả `ok: true` nhưng thoát 1, với
+`result.stage = turn_start_unobserved` (worktree và terminal đã tạo, Claude Code mở ở prompt trống, đề bài không tới).
+Preamble mà worker đọc bằng `dispatch-show` không có token `--dispatch-capability`, nên `worker_done` của nó bị Orca từ chối và
+về hộp thư với subject `Rejected worker_done: ...`; task vẫn `blocked`, và `orca-status --status completed` bị từ chối khi
+dispatch còn active. coding-agent xử lý như sau:
+
+- **Tự động trong `plan-next` / `delegate`:** câu trả lời `ok: true` được nhận dù exit khác 0 (exit ghi ở `_exit`). Worktree luôn
+  được ghi vào sổ worker (tìm bằng `git worktree list` theo tên nhánh khi Orca không trả `effects`), nên guard nhận đúng vai worker.
+  Khi turn start chưa được quan sát, coordinator đợi TUI lên (tối đa 30 giây), gửi kick-off một dòng qua `orca terminal send --enter
+  --wait-submit 20` tới `assignee_handle` của dispatch, đọc lại màn hình sau 5 giây và gửi lại tối đa 2 lần. Event `kicked`
+  (`applied` là đã thấy kick-off trên màn hình hay chưa). Kick thất bại không làm `plan-next` lỗi: lệnh để gửi tay in ra stderr.
+- **`worker-kick --task-id <id>`:** phục hồi tay cho worker vẫn im: ghi worktree của task vào sổ worker (như `worker-adopt`) rồi gửi
+  kick-off như trên. Thoát 1 khi không thấy kick-off trên màn hình.
+- **`worker-settle --task-id <id> --basis verifier|predicate|human [--artifact FILE ...]`:** chốt task mà worker đã báo nhưng báo cáo
+  bị từ chối. Coordinator kiểm kết quả trước; lệnh `worker-abandon` dispatch còn active rồi gửi `completed` theo quy tắc bằng chứng
+  (FR-007). Dispatch đã settled thì không abandon. Bảng việc và `inbox` in gợi ý lệnh này ngay dưới báo cáo `Rejected worker_done`.
 
 ## Dọn worktree của worker
 

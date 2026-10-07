@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -61,11 +62,17 @@ def test_denial_budget_stops_retries_of_refused_calls():
     assert handlers.decide_loop(loop, 1, 1, denials=5) == "stop-denials"
 
 
-def test_verify_timeout_counts_as_a_failed_check():
-    checks = handlers._verify(("sleep 5",), cwd="/tmp", timeout=1)
+def py(code: str) -> str:
+    """A verify command that runs under the shell of any platform: this interpreter with one statement."""
+    return f'"{sys.executable}" -c "{code}"'
+
+
+def test_verify_timeout_counts_as_a_failed_check(tmp_path):
+    checks = handlers._verify((py("import time; time.sleep(5)"),), cwd=str(tmp_path), timeout=1)
     assert checks[0]["exit"] is None and "timed out" in checks[0]["output"]
 
 
-def test_verify_stops_at_the_first_failure():
-    checks = handlers._verify(("true", "false", "echo never"), cwd="/tmp", timeout=10)
-    assert [c["command"] for c in checks] == ["true", "false"]
+def test_verify_stops_at_the_first_failure(tmp_path):
+    ok, bad = py("raise SystemExit(0)"), py("raise SystemExit(1)")
+    checks = handlers._verify((ok, bad, "echo never"), cwd=str(tmp_path), timeout=10)
+    assert [c["command"] for c in checks] == [ok, bad]

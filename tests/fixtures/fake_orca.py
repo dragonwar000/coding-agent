@@ -4,6 +4,11 @@
 Like the real CLI, an unknown id or a status outside the enum answers `ok: false` with exit 0, and the
 task commands without `--run` (and no bound run) answer `run_required` with exit 1.
 `FAKE_ORCA_FAIL=1` exits 3 with a message on stderr, to test the adapter's failure path.
+`FAKE_ORCA_EXIT=<n>` makes every answer exit `n` after printing it, like the real CLI's `ok: true` with exit 1.
+`FAKE_ORCA_TURN_UNOBSERVED=1` makes `worker-start` answer the measured "turn start unobserved" shape (no `effects`,
+exit 1) and `terminal send` exit 1 with `ok: true`. `FAKE_ORCA_DEAF=1` makes the fake terminal's screen never show
+what was sent to it. `terminal read` shows a prompt line plus the texts sent so far; `dispatch-show`, `worker-show`,
+and `worker-abandon` read and change the dispatch records that `worker-start` creates.
 """
 
 import json
@@ -47,13 +52,59 @@ def main(argv: list[str]) -> int:
         state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         if os.path.isdir(path):
             import subprocess
-            subprocess.run(["git", "-C", path, "worktree", "remove", "--force", path], capture_output=True)
+            # Run the removal from the main worktree: on Windows, git cannot delete the directory it was started in.
+            common = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True).stdout.strip()
+            main_tree = os.path.dirname(common) if common else path
+            subprocess.run(["git", "-C", main_tree, "worktree", "remove", "--force", path], capture_output=True)
         print(json.dumps({"ok": True, "result": {"removed": True}}))
         return 0
+    exit_code = int(os.environ.get("FAKE_ORCA_EXIT") or 0)
+    if argv[:2] == ["terminal", "read"]:
+        options = _options(argv[2:])
+        handle = options.get("--terminal", "")
+        sent = [] if os.environ.get("FAKE_ORCA_DEAF") == "1" else [m["text"] for m in data.get("sent", []) if m["terminal"] == handle]
+        tail = ["❯ "] + [f"❯ {text}" for text in sent]
+        print(json.dumps({"ok": True, "result": {"terminal": {"handle": handle, "status": "running", "tail": tail, "source": "screen"}}}, ensure_ascii=False))
+        return exit_code
+    if argv[:2] == ["terminal", "send"]:
+        options = _options(argv[2:])
+        data.setdefault("sent", []).append({"terminal": options.get("--terminal"), "text": options.get("--text", ""), "enter": "--enter" in argv,
+                                            "wait_submit": options.get("--wait-submit")})
+        state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        unobserved = os.environ.get("FAKE_ORCA_TURN_UNOBSERVED") == "1"
+        print(json.dumps({"ok": True, "result": {"accepted": True, "submission": "unobserved" if unobserved else "observed"}}))
+        return 1 if unobserved else exit_code
     if argv[:1] != ["orchestration"] or len(argv) < 2:
         print(json.dumps({"ok": False, "error": "unknown command"}))
         return 0
     command, options = argv[1], _options(argv[2:])
+    if command in ("dispatch-show", "worker-show", "worker-abandon"):
+        dispatches = data.setdefault("dispatches", {})
+        if command == "dispatch-show":
+            found = [(d_id, d) for d_id, d in dispatches.items() if d["task"] == options.get("--task")]
+            if not found:
+                answer = {"ok": False, "error": {"code": "dispatch_not_found", "message": f"no dispatch for task {options.get('--task')}"}}
+            else:
+                d_id, d = found[-1]
+                answer = {"ok": True, "result": {"dispatch": {"id": d_id, "task_id": d["task"], "assignee_handle": f"term_{d['task']}", "status": d.get("status", "pending")}}}
+        elif command == "worker-show":
+            d = dispatches.get(options.get("--dispatch", ""))
+            if d is None:
+                answer = {"ok": False, "error": {"code": "dispatch_not_found", "message": "no such dispatch"}}
+            else:
+                answer = {"ok": True, "result": {"dispatch": {"id": options["--dispatch"], "status": d.get("status", "pending")},
+                                                 "worker": {"dispatchId": options["--dispatch"], "state": d.get("state", "start_unknown")}}}
+        else:
+            d = dispatches.get(options.get("--dispatch", ""))
+            if d is None:
+                answer = {"ok": False, "error": {"code": "dispatch_not_found", "message": "no such dispatch"}}
+            else:
+                d["state"], d["status"] = "abandoned", "abandoned"
+                data.setdefault("abandoned", []).append(options["--dispatch"])
+                answer = {"ok": True, "result": {"dispatchId": options["--dispatch"], "state": "abandoned"}}
+        state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps(answer, ensure_ascii=False))
+        return exit_code
     if command in ("task-create", "task-update", "task-list", "worker-start") and "--run" not in options:
         print(json.dumps({"id": str(uuid.uuid4()), "ok": False, "error": {"code": "run_required", "message": "No Run is bound."}}))
         return 1
@@ -109,6 +160,11 @@ def main(argv: list[str]) -> int:
             task["status"] = "dispatched"
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"runId": options["--run"], "taskId": task["id"], "dispatchId": dispatch_id,
                                                                  "effects": [{"kind": "worktree", "action": "created_child", "id": f"repo::{worktree}"}]}}
+            if os.environ.get("FAKE_ORCA_TURN_UNOBSERVED") == "1":
+                del answer["result"]["effects"]
+                answer["result"].update({"state": "outcome_unknown", "stage": "turn_start_unobserved", "turnStart": "unobserved",
+                                         "lastError": "Dispatch input was written and submitted, but claude's turn start could not be verified"})
+                exit_code = 1
     elif command == "task-list":
         answer = {"ok": True, "result": {"tasks": list(tasks.values())}}
     else:
@@ -116,7 +172,7 @@ def main(argv: list[str]) -> int:
 
     state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(answer, ensure_ascii=False))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

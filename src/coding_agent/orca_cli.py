@@ -13,6 +13,14 @@ dependencies starts `ready`, one with open dependencies starts `pending`, and Or
 complete; `worker-start --worktree new-child` requires `--name` and answers `result.dispatchId` plus an `effects`
 entry `{kind: worktree, id: "<repo>::<path>"}`; Orca marks a task `completed` when its worker reports success
 (`result.provenance == "worker_report"`). `task-update` is not measured. `ok: false` in an answer is an error.
+
+Measured on Orca CLI 1.4.206 (Windows, 2026-10-07): `worker-start` can answer `ok: true` and still exit 1, with
+`result.stage == "turn_start_unobserved"` and `result.turnStart == "unobserved"`, when the worktree and the terminal were
+created but the agent's first turn was not seen. The answer may then carry no `effects`. Such an answer is returned, with
+the exit code in `_exit`; only `ok: false` or no JSON is an error. The worker's terminal is then at an empty prompt, so
+`kick_worker` sends it the kick-off text through `orca terminal send`. The preamble a worker reads with `dispatch-show`
+carries no capability token, so Orca rejects its `worker_done`; `settle` abandons the dispatch and completes the task
+once the coordinator has checked the result.
 """
 
 from __future__ import annotations
@@ -20,6 +28,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +39,7 @@ from coding_agent import events, orca
 BIN_ENV = "CODING_AGENT_ORCA"
 RUN_ENV = "CODING_AGENT_ORCA_RUN"
 TIMEOUT_S = 60
+EXIT_KEY = "_exit"
 
 
 class OrcaError(RuntimeError):
@@ -100,11 +111,23 @@ def _call_tool(*args: str) -> Any:
     return _run_orca(*args)
 
 
+def _command(*words: str) -> list[str]:
+    """The argv for `orca <words> --json`. A `.py` binary (the test fake) runs under this interpreter, which Windows needs."""
+    exe = binary()
+    prefix = [sys.executable, exe] if exe.lower().endswith(".py") else [exe]
+    return [*prefix, *words, "--json"]
+
+
 def _run_orca(*words: str) -> Any:
+    """Run one Orca command and return its parsed answer.
+
+    An `ok: true` answer is returned even when the process exits non-zero: Orca uses the exit code for an
+    unverified outcome (a worker whose turn start was not observed), not for failure. The exit code is kept in
+    `answer["_exit"]` for callers that care. `ok: false`, no JSON, or a failure to run the binary raise `OrcaError`.
+    """
     args = words[1:] if words[0] == "orchestration" else words
-    command = [binary(), *words, "--json"]
     try:
-        run = subprocess.run(command, capture_output=True, text=True, timeout=TIMEOUT_S, check=False)
+        run = subprocess.run(_command(*words), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         raise OrcaError(f"cannot run {binary()}: {error}") from error
     try:
@@ -116,6 +139,9 @@ def _run_orca(*words: str) -> Any:
     if isinstance(answer, dict) and answer.get("ok") is False:
         raise OrcaError(f"orca {args[0]} answered ok:false: {_error_message(answer)}")
     if run.returncode != 0:
+        if isinstance(answer, dict) and answer.get("ok") is True:
+            answer[EXIT_KEY] = run.returncode
+            return answer
         raise OrcaError(f"orca {args[0]} exited {run.returncode}: {(run.stderr or run.stdout).strip()[:400]}")
     return answer
 
@@ -409,12 +435,200 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
     name = worktree_name(title, task_id)
     answer = _start_in_new_worktree(root, task_id, agent, name, (title or name)[:DISPLAY_LIMIT], run)
     dispatch = dispatch_id_of(answer)
-    worktree = worktree_of(answer)
+    worktree = worktree_of(answer) or find_worktree(root, name)
     if worktree is not None:
         record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch)
     events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
-                  detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree, "name": name})
+                  detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree, "name": name,
+                          "turn_start": "unobserved" if turn_unobserved(answer) else "observed"})
+    if turn_unobserved(answer):
+        kick_worker(root, task_id=task_id, dispatch=dispatch, session=session)
     return dispatch
+
+
+def turn_unobserved(answer: Any) -> bool:
+    """True when a worker-start answer says the worker was placed but its first turn was not seen (or the CLI exited non-zero)."""
+    result = answer.get("result") if isinstance(answer, dict) else None
+    result = result if isinstance(result, dict) else {}
+    return (result.get("turnStart") == "unobserved" or result.get("stage") == "turn_start_unobserved"
+            or (isinstance(answer, dict) and answer.get(EXIT_KEY) not in (None, 0)))
+
+
+def find_worktree(root: Path, name: str) -> str | None:
+    """The path of the linked worktree on branch `name` (or in a directory named `name`), from `git worktree list`, or None.
+
+    Used when a worker-start answer carries no `effects`: Orca has created the worktree, but did not say where.
+    """
+    try:
+        run = subprocess.run(["git", "-C", str(root), "worktree", "list", "--porcelain"], capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if run.returncode != 0:
+        return None
+    by_branch: dict[str, str] = {}
+    by_dirname: dict[str, str] = {}
+    path: str | None = None
+    for line in run.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+            by_dirname.setdefault(Path(path).name, path)
+        elif line.startswith("branch ") and path is not None:
+            by_branch.setdefault(line[len("branch "):].strip().removeprefix("refs/heads/"), path)
+    return by_branch.get(name) or by_dirname.get(name)
+
+
+# --- kicking a worker whose first turn Orca did not see ---------------------------------------------------------------
+
+KICK_WAIT_S = 30.0       # how long to wait for the worker's TUI to show a prompt before sending the kick-off
+KICK_POLL_S = 2.0        # pause between screen reads while waiting
+KICK_SETTLE_S = 5.0      # pause after a send before checking that the text landed
+KICK_ATTEMPTS = 3        # one send plus at most two resends
+KICK_MARK = "Ban la worker"
+PROMPT_MARKS = ("❯", "›", ">", "$")
+
+
+def kickoff_text(task_id: str, dispatch: str) -> str:
+    """The one-line kick-off sent to a worker at an empty prompt. No `>` and no newline: it goes through `terminal send --text`."""
+    return (f"Ban la worker Orca cho task {task_id} (dispatch {dispatch}). "
+            f"Chay `orca orchestration dispatch-show --task {task_id} --preamble --json` de doc preamble + TASK, roi thuc hien dung TASK. "
+            "Heartbeat/worker_done co the bi tu choi vi thieu token: van gui worker_done DUNG MOT LAN cuoi cung, "
+            f"va ghi bao cao REPORT-{task_id}.md trong worktree roi commit. Khong dung AskUserQuestion.")
+
+
+def dispatch_of(task_id: str) -> dict[str, Any]:
+    """The dispatch record of a task from `dispatch-show`: `{id, status, assignee_handle}` with both key spellings read.
+
+    `dispatch-show` takes no `--run`; it reads the dispatch by task id alone.
+    """
+    answer = _call("dispatch-show", "--task", task_id)
+    result = answer.get("result") if isinstance(answer, dict) else None
+    record = result.get("dispatch") if isinstance(result, dict) else None
+    if not isinstance(record, dict):
+        raise OrcaError(f"dispatch-show has no dispatch for {task_id}")
+    return {
+        "id": str(record.get("id") or ""),
+        "status": str(record.get("status") or ""),
+        "assignee_handle": str(record.get("assignee_handle") or record.get("assigneeHandle") or ""),
+    }
+
+
+def screen_of(handle: str) -> str:
+    """What the worker's terminal shows, as one string, or an empty string when it cannot be read."""
+    try:
+        answer = _call_tool("terminal", "read", "--terminal", handle, "--screen")
+    except OrcaError:
+        return ""
+    result = answer.get("result") if isinstance(answer, dict) else None
+    terminal = result.get("terminal") if isinstance(result, dict) else None
+    tail = terminal.get("tail") if isinstance(terminal, dict) else None
+    return "\n".join(str(line) for line in tail) if isinstance(tail, list) else ""
+
+
+def _at_prompt(screen: str) -> bool:
+    return any(line.strip().startswith(PROMPT_MARKS) for line in screen.splitlines())
+
+
+def _manual_kick(handle: str, task_id: str, dispatch: str) -> str:
+    return f'orca terminal send --terminal {handle} --enter --wait-submit 20 --text "{kickoff_text(task_id, dispatch)}"'
+
+
+def kick_worker(root: Path, *, task_id: str, dispatch: str, session: str = "cli") -> bool:
+    """Send the kick-off to a worker whose first turn Orca did not observe. Returns True when the text was seen on its screen.
+
+    Waits up to `KICK_WAIT_S` for the terminal to show a prompt, sends the kick-off with Enter, and checks the screen
+    after `KICK_SETTLE_S`; a screen without the text gets the kick-off again, `KICK_ATTEMPTS` sends in all. Nothing is
+    raised: a failed kick is recorded, and the command to run by hand is printed on stderr.
+    """
+    handle = ""
+    attempts = 0
+    seen = False
+    error: str | None = None
+    try:
+        handle = dispatch_of(task_id)["assignee_handle"]
+        if not handle:
+            raise OrcaError(f"dispatch-show names no terminal for {task_id}")
+        deadline = time.monotonic() + KICK_WAIT_S
+        while not _at_prompt(screen_of(handle)) and time.monotonic() < deadline:
+            time.sleep(KICK_POLL_S)
+        text = kickoff_text(task_id, dispatch)
+        while attempts < KICK_ATTEMPTS and not seen:
+            _call_tool("terminal", "send", "--terminal", handle, "--enter", "--wait-submit", "20", "--text", text)
+            attempts += 1
+            time.sleep(KICK_SETTLE_S)
+            seen = KICK_MARK in screen_of(handle)
+    except OrcaError as failure:
+        error = str(failure)[:300]
+    events.record(root, guard="coordinator", kind="kicked", mode="enforce", applied=seen, session=session,
+                  detail={"task_id": task_id, "dispatch": dispatch, "terminal": handle, "attempts": attempts, "seen": seen, "error": error})
+    if not seen:
+        why = error or f"the kick-off was not seen on the worker's screen after {attempts} send(s)"
+        print(f"worker-start: worker {task_id} may not have received its task ({why}). Send it by hand:\n  "
+              + (_manual_kick(handle, task_id, dispatch) if handle else f"orca orchestration dispatch-show --task {task_id} --json  # then orca terminal send --terminal <assignee_handle> ..."),
+              file=sys.stderr)
+    return seen
+
+
+# --- settling a task whose worker_done Orca rejected -----------------------------------------------------------------
+
+SETTLED_WORKER_STATES = frozenset({"succeeded", "failed", "abandoned", "stopped", "released", "completed", "cancelled"})
+
+
+def worker_state(dispatch: str) -> tuple[str, str]:
+    """(worker state, dispatch status) from `worker-show`. Assumption: a dispatch is active until one of them is in `SETTLED_WORKER_STATES`."""
+    answer = _call("worker-show", "--dispatch", dispatch)
+    result = answer.get("result") if isinstance(answer, dict) else None
+    result = result if isinstance(result, dict) else {}
+    worker = result.get("worker") if isinstance(result.get("worker"), dict) else {}
+    record = result.get("dispatch") if isinstance(result.get("dispatch"), dict) else {}
+    return str(worker.get("state") or ""), str(record.get("status") or "")
+
+
+def dispatch_active(dispatch: str) -> bool:
+    state, status = worker_state(dispatch)
+    return state not in SETTLED_WORKER_STATES and status not in SETTLED_WORKER_STATES
+
+
+def settle(root: Path, *, task_id: str, basis: str, artifacts: tuple[str, ...] = (), run: str | None = None, session: str = "cli") -> dict[str, Any]:
+    """Complete a task whose worker reported but whose report Orca rejected (no capability token).
+
+    While the supervised dispatch is active, Orca refuses `completed` (`task_not_startable`), so the dispatch is
+    abandoned first; an already settled dispatch is left alone. The completion rule still applies: `basis` must be proof.
+    """
+    dispatch: str | None = None
+    abandoned = False
+    try:
+        dispatch = dispatch_of(task_id)["id"] or None
+    except OrcaError:
+        dispatch = None
+    if dispatch and dispatch_active(dispatch):
+        _call("worker-abandon", "--dispatch", dispatch)
+        abandoned = True
+    outcome = set_status(root, task_id=task_id, requested="completed", basis=basis, artifacts=artifacts, session=session, run=run)
+    events.record(root, guard="coordinator", kind="settled", mode="enforce", applied=outcome.sent, session=session,
+                  detail={"task_id": task_id, "dispatch": dispatch, "abandoned": abandoned, "decision": outcome.decision, "basis": basis})
+    return {"task_id": task_id, "dispatch": dispatch, "abandoned": abandoned, "decision": outcome.decision, "sent": outcome.sent, "reason": outcome.reason}
+
+
+def worktree_for_task(root: Path, task_id: str, run: str | None = None) -> str | None:
+    """The worker worktree of `task_id`: the recorded one, else the one git lists under the name read from the task title."""
+    for record in worker_records(root):
+        if record["task_id"] == task_id:
+            return record["worktree"]
+    title = _title_of(task_id, run)
+    return find_worktree(root, worktree_name(title, task_id))
+
+
+def kick_by_hand(root: Path, *, task_id: str, run: str | None = None, session: str = "cli") -> dict[str, Any]:
+    """`worker-kick`: record the task's worktree as a worker's (if not yet) and send the kick-off to its terminal."""
+    dispatch = dispatch_of(task_id)["id"]
+    worktree = worktree_for_task(root, task_id, run)
+    recorded = False
+    if worktree is not None and Path(worktree).resolve() not in {Path(w) for w in worker_worktrees(root)}:
+        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch)
+        recorded = True
+    seen = kick_worker(root, task_id=task_id, dispatch=dispatch, session=session)
+    return {"task_id": task_id, "dispatch": dispatch, "worktree": worktree, "recorded": recorded, "kicked": seen}
 
 
 def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: str | None = None, session: str = "cli") -> tuple[str, str]:

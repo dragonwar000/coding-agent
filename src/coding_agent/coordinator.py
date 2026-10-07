@@ -119,6 +119,12 @@ HOW = (
     "(3) `python3 -m coding_agent.cli plan-apply .coding-agent/plan.yaml`; "
     "(4) `python3 -m coding_agent.cli plan-next .coding-agent/plan.yaml`. Xem graph: `plan-status`."
 )
+RECOVER = (
+    "Worker không nhận đề bài (Orca báo turn_start_unobserved): `plan-next` tự gửi kick-off; nếu worker vẫn im, chạy "
+    "`python3 -m coding_agent.cli worker-kick --task-id <id>`. Báo cáo 'Rejected worker_done' là worker thiếu token: kiểm kết quả rồi "
+    "`python3 -m coding_agent.cli worker-settle --task-id <id> --basis verifier [--artifact FILE]` để chốt task."
+)
+REJECTED_PREFIX = "Rejected worker_done"
 
 
 def is_plan_file(root: Path, file_path: Any) -> bool:
@@ -204,6 +210,7 @@ def contract(python_src: str) -> str:
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",
+        "- " + RECOVER,
         "- Khi bảng việc ghi 'worktree chờ dọn': hỏi người dùng có xoá không, rồi chạy `worktree-clean --task-id <id> --yes`. Host sẽ hỏi người dùng xác nhận lệnh đó. Worktree còn việc chưa gộp thì gộp trước; lệnh từ chối xoá nó.",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
@@ -286,6 +293,8 @@ def report_lines(reports: list[dict[str, Any]], plan_ids: dict[str, str]) -> lis
         node = plan_ids.get(task_id)
         name = f"node {node} ({task_id})" if node else task_id
         lines.append(f"  - {name}: {report.get('outcome') or report.get('type')} — {report.get('subject', '')[:80]}")
+        if str(report.get("subject", "")).startswith(REJECTED_PREFIX):
+            lines.append(f"    worker_done bị Orca từ chối (thiếu token); kiểm kết quả rồi `worker-settle --task-id {task_id} --basis verifier`")
     lines.append("  việc cần làm: kiểm kết quả của worker, gộp nhánh nếu đạt, chạy `plan-next` để giao node kế, rồi `inbox --ack`.")
     return lines
 
