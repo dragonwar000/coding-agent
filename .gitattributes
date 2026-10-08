@@ -1,0 +1,7 @@
+# Git for Windows checks text out with CRLF by default. bash cannot run a script with CRLF line ends,
+# and the package digest and the template comparison read bytes, so these stay LF on every platform.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.ps1 text eol=lf

@@ -137,7 +137,7 @@ def _verify(commands: tuple[str, ...], cwd: str, timeout: int) -> list[dict[str,
     checks: list[dict[str, Any]] = []
     for command in commands:
         try:
-            run = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+            run = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
             output = (run.stdout + run.stderr)[-TAIL_CHARS:]
             checks.append({"command": command, "exit": run.returncode, "output": output})
         except subprocess.TimeoutExpired as error:

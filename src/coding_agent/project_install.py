@@ -44,11 +44,28 @@ class InstallError(RuntimeError):
     """The project cannot take the install as requested; nothing after the failing step is changed."""
 
 
-def default_python() -> str:
-    """The interpreter command hooks should call on this machine: `python3` where it exists, else `python`."""
+PYTHON_NAMES = ("python3", "python", "py")
+
+
+def is_python(command: str) -> bool:
+    """Whether `command` on PATH is a Python this package runs on (3.11 or later).
+
+    Being on PATH is not enough on Windows: the Microsoft Store alias answers `python3` and `python` without being Python.
+    """
     import shutil
 
-    return "python3" if shutil.which("python3") else "python"
+    path = shutil.which(command)
+    if path is None:
+        return False
+    try:
+        return subprocess.run([path, "-c", "import sys; sys.exit(sys.version_info < (3, 11))"], capture_output=True, timeout=30, check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def default_python() -> str:
+    """The interpreter command hooks should call on this machine: the first of `python3`, `python`, `py` that runs, else `python`."""
+    return next((name for name in PYTHON_NAMES if is_python(name)), "python")
 
 
 def manifest_text(python_src: str, verify: str, python: str = "python3") -> str:
@@ -118,7 +135,7 @@ def ensure_pyyaml(report: list[str]) -> None:
         return
     except ImportError:
         pass
-    result = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pyyaml"], capture_output=True, text=True, check=False)
+    result = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pyyaml"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     try:
         import importlib
 
@@ -173,10 +190,39 @@ def _hook_command(document: dict[str, Any] | None, hook_id: str) -> str | None:
     return None
 
 
-def posix_shell() -> str | None:
-    """A POSIX shell to run a generated hook command with: `sh`, else `bash` (Git Bash on Windows), else None."""
+def _git_bash() -> str | None:
+    """Git Bash on Windows, found the way Claude Code finds it: its own setting, then next to `git`, then the usual folders.
+
+    Git for Windows puts only `git` on PATH by default, so `bash` is rarely there. A `bash.exe` under System32 is the
+    WSL launcher: it runs commands in another system and is never used.
+    """
+    import os
     import shutil
 
+    candidates = [os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")]
+    git = shutil.which("git")
+    if git:
+        # git.exe sits in <Git>\cmd, <Git>\bin, or <Git>\mingw64\bin.
+        candidates += [str(parent / "bin" / "bash.exe") for parent in list(Path(git).resolve().parents)[:3]]
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        base = os.environ.get(variable)
+        if base:
+            candidates.append(str(Path(base) / ("Programs" if variable == "LOCALAPPDATA" else "") / "Git" / "bin" / "bash.exe"))
+    candidates += [shutil.which("sh"), shutil.which("bash")]
+    system32 = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32").lower()
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and not str(Path(candidate).parent).lower().startswith(system32):
+            return candidate
+    return None
+
+
+def posix_shell() -> str | None:
+    """A POSIX shell to run a generated hook command with: `sh`, else `bash`; on Windows, Git Bash. None when there is none."""
+    import os
+    import shutil
+
+    if os.name == "nt":
+        return _git_bash()
     return shutil.which("sh") or shutil.which("bash")
 
 
@@ -186,7 +232,7 @@ def _run_hook(command: str, project: Path, payload: dict[str, Any], role: str | 
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project), "PYTHONDONTWRITEBYTECODE": "1"}
     if role is not None:
         env["CODING_AGENT_ROLE"] = role
-    return subprocess.run([str(posix_shell()), "-c", command], input=json.dumps(payload), capture_output=True, text=True, cwd=project, env=env, timeout=PAYLOAD_TIMEOUT_S, check=False)
+    return subprocess.run([str(posix_shell()), "-c", command], input=json.dumps(payload), capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=project, env=env, timeout=PAYLOAD_TIMEOUT_S, check=False)
 
 
 def verify_wiring(project: Path, manifest_path: Path, hosts: list[str]) -> list[str]:
@@ -200,8 +246,11 @@ def verify_wiring(project: Path, manifest_path: Path, hosts: list[str]) -> list[
     if "claude_code" not in hosts:
         return report
     if posix_shell() is None:
-        report.append("verify: hook commands not run: no sh or bash on PATH. On Windows, install Git for Windows and run the installer from Git Bash")
+        report.append("verify: hook commands not run: no sh or bash on PATH. On Windows, install Git for Windows (Claude Code runs hooks with its Git Bash), then run the installer again")
         return report
+    if not is_python(manifest.python):
+        raise InstallError(f"integration.yaml sets `python: {manifest.python}`, which is not a Python 3.11 or later on this machine's PATH, so no hook can run. "
+                           f"Set `python: {default_python()}` in integration.yaml, then run the installer again")
     document = gen._read(project / gen.CLAUDE_FILE)
     guard_command = _hook_command(document, "orca-guard")
     reset_command = _hook_command(document, "prompt-reset")
@@ -416,7 +465,11 @@ def main(argv: list[str] | None = None) -> int:
     for line in lines:
         print(line)
     if not args.uninstall:
-        print("next: start a session in the project; `python3 -m coding_agent.cli status --run <run_id>` reads Orca tasks")
+        try:
+            python = load((project / "integration.yaml").resolve()).python
+        except (ManifestError, OSError):
+            python = "python3"
+        print(f"next: start a session in the project; `{python} -m coding_agent.cli status --run <run_id>` reads Orca tasks")
     return 0
 
 

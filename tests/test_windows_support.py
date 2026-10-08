@@ -53,12 +53,55 @@ def test_the_installer_writes_the_chosen_interpreter_and_a_matching_verify_comma
 
 
 def test_the_default_interpreter_follows_what_the_machine_has(monkeypatch):
+    monkeypatch.setattr(project_install, "is_python", lambda name: True)
+    assert project_install.default_python() == "python3"
+    monkeypatch.setattr(project_install, "is_python", lambda name: name == "py")
+    assert project_install.default_python() == "py"
+    monkeypatch.setattr(project_install, "is_python", lambda name: False)
+    assert project_install.default_python() == "python"
+
+
+def test_a_command_on_path_that_is_not_python_is_not_taken_for_the_interpreter(tmp_path, monkeypatch):
+    """The Microsoft Store alias: `python3` is on PATH, prints a hint, and exits non-zero."""
     import shutil
 
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/python3" if name == "python3" else None)
-    assert project_install.default_python() == "python3"
+    monkeypatch.setattr(shutil, "which", lambda name: sys.executable)
+    assert project_install.is_python("python3")
+    monkeypatch.setattr(project_install.subprocess, "run", lambda *args, **kwargs: project_install.subprocess.CompletedProcess(args, 9009))
+    assert not project_install.is_python("python3")
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    assert project_install.default_python() == "python"
+    assert not project_install.is_python("python3")
+
+
+def test_verify_names_the_fix_when_the_manifest_interpreter_does_not_run_here(tmp_path, monkeypatch):
+    """A manifest written on macOS says `python3`; on Windows that is the Store alias, and every hook would fail."""
+    project = tmp_path / "project"
+    project.mkdir()
+    project_install.install(project, python="python3", run_verify=False, ci=False)
+    monkeypatch.setattr(project_install, "posix_shell", lambda: sys.executable)
+    monkeypatch.setattr(project_install, "is_python", lambda name: name == "py")
+    with pytest.raises(project_install.InstallError, match="python: python3.*Set `python: py`"):
+        project_install.verify_wiring(project, project / "integration.yaml", ["claude_code"])
+
+
+def test_git_bash_is_found_next_to_git_when_bash_is_not_on_path(tmp_path, monkeypatch):
+    import shutil
+
+    git = tmp_path / "Git" / "cmd" / "git.exe"
+    bash = tmp_path / "Git" / "bin" / "bash.exe"
+    wsl = tmp_path / "Windows" / "System32" / "bash.exe"
+    for path in (git, bash, wsl):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"")
+    for name in ("CLAUDE_CODE_GIT_BASH_PATH", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
+    monkeypatch.setattr(shutil, "which", lambda name: {"git": str(git), "bash": str(wsl)}.get(name))
+    assert Path(project_install._git_bash()) == bash.resolve()
+    bash.unlink()
+    assert project_install._git_bash() is None, "the WSL launcher under System32 is not a shell for hook commands"
+    monkeypatch.setenv("CLAUDE_CODE_GIT_BASH_PATH", str(git))
+    assert project_install._git_bash() == str(git)
 
 
 def test_verify_says_so_when_no_posix_shell_can_run_the_hooks(tmp_path, monkeypatch):
@@ -102,6 +145,15 @@ def test_a_hook_writes_utf8_on_a_cp1252_console(tmp_path, monkeypatch):
     assert hooks.main(["utf8-probe"]) == 0
     assert out.getvalue().decode("utf-8") == VIETNAMESE + "\n"
     assert err.getvalue().decode("utf-8") == VIETNAMESE + "\n"
+
+
+def test_a_hook_reads_a_utf8_payload_on_a_cp1252_console(monkeypatch):
+    """Hosts send raw UTF-8, not \\u escapes. "ở" holds byte 0x9d, which cp1252 cannot decode at all."""
+    raw = ('{"session_id": "x", "prompt": "%s ở đây"}' % VIETNAMESE).encode("utf-8")
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw), encoding="cp1252"))
+    assert hooks._read_payload()["prompt"] == VIETNAMESE + " ở đây"
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"\xff\xfe not utf-8"), encoding="cp1252"))
+    assert hooks._read_payload() == {}
 
 
 def test_the_cli_writes_utf8_on_a_cp1252_console(tmp_path, monkeypatch):

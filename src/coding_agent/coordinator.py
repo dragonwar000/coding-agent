@@ -86,7 +86,7 @@ def code_only(command: str) -> str:
 
 def _git(cwd: Path, *args: str) -> str | None:
     try:
-        run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=10, check=False)
+        run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     return run.stdout.strip() if run.returncode == 0 and run.stdout.strip() else None
@@ -309,7 +309,7 @@ def dirty_paths(root: Path) -> list[str] | None:
 
 def _git_raw(cwd: Path, *args: str) -> str | None:
     try:
-        run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=15, check=False)
+        run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     return run.stdout if run.returncode == 0 else None

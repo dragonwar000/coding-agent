@@ -103,9 +103,12 @@ def run(hook_id: str, payload: dict[str, Any], handler: Callable[[Context], Hook
 
 
 def _read_payload() -> dict[str, Any]:
+    # The hosts write UTF-8. Text-mode stdin would decode it with the console's code page on Windows (cp1252, say):
+    # a Vietnamese prompt then turns into mojibake, or raises on a byte the code page has no character for.
     try:
-        data = json.load(sys.stdin)
-    except (json.JSONDecodeError, OSError):
+        raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read()
+        data = json.loads(raw.decode("utf-8-sig") if isinstance(raw, bytes) else raw)
+    except (ValueError, OSError):
         return {}
     return data if isinstance(data, dict) else {}
 
