@@ -105,7 +105,7 @@ def call(store: Store, tool: str, arguments: dict[str, Any], *, timeout: int = D
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool, "arguments": arguments}},
     ])
     try:
-        proc = subprocess.run(argv, input=requests, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(argv, input=requests, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         raise ZeromemError(f"cannot run {store.zm}: {error}") from error
     answer = None

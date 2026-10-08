@@ -56,7 +56,7 @@ class Candidate:
 
 def _git(cwd: Path, *args: str) -> str | None:
     try:
-        run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=20, check=False)
+        run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     return run.stdout if run.returncode == 0 else None

@@ -9,12 +9,16 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# python3 where it exists; Git Bash on Windows usually has only `python`.
-if [ -n "${PYTHON:-}" ]; then PY="$PYTHON"
-elif command -v python3 >/dev/null 2>&1; then PY=python3
-elif command -v python >/dev/null 2>&1; then PY=python
-else echo "[install] cần Python 3.11 trở lên (python3 hoặc python) trong PATH" >&2; exit 1
+# python3 where it runs; Git Bash on Windows usually has only `python` or `py`. The command must run, not just exist:
+# the Microsoft Store alias on Windows answers `python3` and `python` without being Python.
+is_python(){ "$1" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; }
+PY="${PYTHON:-}"
+if [ -z "$PY" ]; then
+  for name in python3 python py; do
+    if is_python "$name"; then PY="$name"; break; fi
+  done
 fi
+[ -n "$PY" ] || { echo "[install] cần Python 3.11 trở lên (python3, python hoặc py) trong PATH" >&2; exit 1; }
 PROJECT="${1:-.}"
 [ $# -gt 0 ] && shift
 

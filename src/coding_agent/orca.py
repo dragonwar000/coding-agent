@@ -29,7 +29,7 @@ class ClaimRefused(RuntimeError):
 def project_name(root: Path) -> str:
     """The repository's name: the git top-level directory name, or the directory itself outside git."""
     try:
-        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=10, check=False)
+        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
         if top.returncode == 0 and top.stdout.strip():
             return Path(top.stdout.strip()).name
     except (OSError, subprocess.SubprocessError):

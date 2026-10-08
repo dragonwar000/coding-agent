@@ -115,8 +115,9 @@ PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.gate --manifest inte
 
 ## Windows
 
-Trạng thái: script cài và gỡ bằng PowerShell đã chạy được với PowerShell 7 trên macOS. **Chưa chạy trên máy Windows thật**,
-nên coi các bước dưới là hướng dẫn cần kiểm lại lần đầu dùng.
+Trạng thái: đã chạy trên Windows 11 (2026-10-08) với Windows PowerShell 5.1, Python 3.12 cài bằng winget, và Git for Windows
+ở cấu hình mặc định (chỉ `git` trong PATH, không có `bash`): cài, cài lại, gate, verify hook qua Git Bash, gỡ, và bộ test.
+Chưa kiểm trên Windows: phiên Claude Code thật chạy hook, `zm`, và PowerShell 7.
 
 ### Cần có
 
@@ -124,8 +125,10 @@ nên coi các bước dưới là hướng dẫn cần kiểm lại lần đầu
   coding-agent viết theo cú pháp shell POSIX. Không có Git Bash thì Claude Code chạy hook bằng PowerShell, lệnh hook lỗi, và
   các guard ngừng chặn mà không báo. Nếu Claude Code không tìm thấy Git Bash, đặt trong `settings.json`:
   `"env": { "CLAUDE_CODE_GIT_BASH_PATH": "C:\\Program Files\\Git\\bin\\bash.exe" }`.
-- **Python 3.11 trở lên** từ python.org, có trong PATH. Trên Windows lệnh thường là `python`, không phải `python3`.
-  Installer tự chọn và ghi vào `integration.yaml` (`python: python`).
+- **Python 3.11 trở lên** từ python.org hoặc `winget install Python.Python.3.12`, có trong PATH. Mở terminal mới sau khi cài.
+  Trên Windows lệnh thường là `python`, không phải `python3`: `python3.exe` và `python.exe` trong `WindowsApps` là alias của
+  Microsoft Store, có trong PATH nhưng không phải Python. Installer chạy thử từng lệnh (`python3`, `python`, `py`), chọn lệnh
+  đầu tiên là Python thật, và ghi vào `integration.yaml` (`python: python`).
 - **PyYAML** cho đúng Python đó. Installer tự cài nếu thiếu.
 
 ### Cài
@@ -167,10 +170,18 @@ Git Bash: `curl -fsSL https://raw.githubusercontent.com/dragonwar000/coding-agen
 $env:PYTHONPATH = "harness\coding-agent\src"; python -m coding_agent.gate --manifest integration.yaml
 ```
 
-Thoát 0 là file hook khớp manifest. Bước verify của installer chạy thử lệnh hook bằng `sh` hoặc `bash`; nếu không có cả hai
-trong PATH (chạy từ PowerShell mà Git Bash không nằm trong PATH), installer báo bỏ qua bước đó và nhắc cài Git for Windows.
+Thoát 0 là file hook khớp manifest. Bước verify của installer chạy thử lệnh hook bằng Git Bash. Git Bash không cần nằm trong
+PATH: installer tìm theo `CLAUDE_CODE_GIT_BASH_PATH`, rồi `bin\bash.exe` cạnh `git.exe`, rồi các thư mục cài mặc định.
+`bash.exe` trong `System32` là trình khởi động WSL và không được dùng. Không tìm thấy thì installer báo bỏ qua bước đó và
+nhắc cài Git for Windows.
 
 ### Khác biệt và giới hạn
+
+- Manifest có sẵn ghi `python: python3` (ví dụ commit từ macOS): trên Windows lệnh đó là alias của Store, nên mọi hook lỗi.
+  Bước verify dừng lại và nêu giá trị cần đặt. Sửa `python:` trong `integration.yaml` rồi chạy lại lệnh cài.
+- Clone repo này trên Windows: `.gitattributes` giữ `*.sh`, `*.py`, `*.yaml` ở LF, vì bash không chạy được script có CRLF.
+- Đường dẫn dài: thư mục dự án nằm quá sâu (gần 260 ký tự) làm bước chép package lỗi `WinError 206`. Dùng thư mục ngắn hơn
+  hoặc bật long paths của Windows.
 
 - Đổi lệnh Python sau khi cài: sửa `python:` trong `integration.yaml` rồi chạy lại lệnh cài. Giá trị chỉ là tên lệnh
   (`python`, `python3`, `py`), không nhận đường dẫn có dấu cách hay tham số.

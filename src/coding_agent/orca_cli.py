@@ -267,7 +267,7 @@ def worktree_of(answer: Any) -> str | None:
 
 def _git_common_dir(root: Path) -> Path | None:
     try:
-        run = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-common-dir"], capture_output=True, text=True, timeout=10, check=False)
+        run = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-common-dir"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     return (root / run.stdout.strip()).resolve() if run.returncode == 0 and run.stdout.strip() else None
@@ -383,7 +383,7 @@ def _title_of(task_id: str, run: str | None) -> str:
 def _head(cwd: Path) -> str | None:
     """The commit `cwd` has checked out, or None outside git."""
     try:
-        run = subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, check=False)
+        run = subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     return run.stdout.strip() if run.returncode == 0 and run.stdout.strip() else None

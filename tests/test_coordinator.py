@@ -173,7 +173,7 @@ def test_delegate_creates_a_task_and_starts_a_worker_in_its_own_worktree(repo, f
     committed_repo(repo)
     task_id, dispatch = orca_cli.delegate(repo, title="Refactor", spec="split the module", t_id="T-31", agent="codex")
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
-    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=True).stdout.strip()
     # The worker starts from the coordinator's commit, not from the repository's default base.
     assert state["dispatches"][dispatch] == {"task": task_id, "agent": "codex", "worktree": "new-child", "name": "refactor", "display": "Refactor", "base": head}
     assert len(orca_cli.worker_worktrees(repo)) == 1

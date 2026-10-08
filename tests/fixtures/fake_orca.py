@@ -53,7 +53,7 @@ def main(argv: list[str]) -> int:
         if os.path.isdir(path):
             import subprocess
             # Run the removal from the main worktree: on Windows, git cannot delete the directory it was started in.
-            common = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True).stdout.strip()
+            common = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
             main_tree = os.path.dirname(common) if common else path
             subprocess.run(["git", "-C", main_tree, "worktree", "remove", "--force", path], capture_output=True)
         print(json.dumps({"ok": True, "result": {"removed": True}}))

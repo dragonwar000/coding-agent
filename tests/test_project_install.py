@@ -228,8 +228,9 @@ def test_gitignore_gets_the_state_directory_once(tmp_path: Path):
 
 
 def old_manifest(project: Path) -> None:
-    """A manifest from before the coordinator hooks existed."""
+    """A manifest from before the coordinator hooks existed, naming an interpreter this machine has (Windows may lack `python3`)."""
     text = (ROOT / "integration.yaml").read_text(encoding="utf-8").replace("python_src: src", "python_src: harness/coding-agent/src")
+    text = text.replace("python: python3\n", f"python: {project_install.default_python()}\n")
     (project / "integration.yaml").write_text(text[:text.index("  - id: coordinator-guard")], encoding="utf-8")
 
 

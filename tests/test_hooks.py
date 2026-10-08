@@ -44,7 +44,7 @@ def call(repo: Path, hook: str, payload: dict, *, mode: str = "enforce", zm_base
     env = {**os.environ, "PYTHONPATH": str(SRC), "CLAUDE_PROJECT_DIR": str(repo), f"CODING_AGENT_MODE_{hook.upper().replace('-', '_')}": mode}
     if zm_base is not None:
         env["CODING_AGENT_ZEROMEM_HOME"] = str(zm_base)
-    return subprocess.run([sys.executable, "-m", "coding_agent.hooks", hook], input=json.dumps(payload), capture_output=True, text=True, env=env, check=False, timeout=120)
+    return subprocess.run([sys.executable, "-m", "coding_agent.hooks", hook], input=json.dumps(payload), capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, check=False, timeout=120)
 
 
 def transcript(path: Path, *, prompt: str, edited: str, answer: str) -> Path:
@@ -84,7 +84,7 @@ def test_orca_guard_hints_about_result_task_id_after_create(repo):
 
 def test_a_malformed_payload_never_breaks_the_session(repo):
     manifest(repo, verify=[])
-    result = subprocess.run([sys.executable, "-m", "coding_agent.hooks", "orca-guard"], input="{not json", capture_output=True, text=True,
+    result = subprocess.run([sys.executable, "-m", "coding_agent.hooks", "orca-guard"], input="{not json", capture_output=True, text=True, encoding="utf-8", errors="replace",
                             env={**os.environ, "PYTHONPATH": str(SRC), "CLAUDE_PROJECT_DIR": str(repo)}, check=False)
     assert result.returncode == 0
 
