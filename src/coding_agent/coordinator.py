@@ -167,9 +167,10 @@ def is_plan_file(root: Path, file_path: Any) -> bool:
 
 # The coordinator's own delegation command, run alone. A chained or substituted command is not allowed through.
 DELEGATE_CALL = re.compile(r"^\s*(PYTHONPATH=\S+\s+)?python3?\s+-m\s+coding_agent\.cli\s")
-# Removing a worker's worktree deletes its directory and branch, so the host asks the user before this command runs
-# (unless the session bypasses permissions).
-CLEAN_CALL = re.compile(r"coding_agent\.cli\s+(--root\s+\S+\s+)?worktree-clean\b")
+# `worktree-clean --discard` deletes a worker's worktree and branch with work that is merged nowhere, so the host asks
+# the user before this command runs (unless the session bypasses permissions). Removing a merged, clean worktree loses
+# nothing and is not asked.
+CLEAN_CALL = re.compile(r"coding_agent\.cli\s+(--root\s+\S+\s+)?worktree-clean\b[^\n]*\s--discard\b")
 
 
 # The files that set the hooks' modes. Writing them directly is how a person lifts a guard, so the host asks
@@ -199,7 +200,7 @@ def needs_user_confirmation(tool: str, tool_input: Any, root: Path | None = None
         return None
     command = str(tool_input.get("command") or "")
     if CLEAN_CALL.search(command):
-        return "coding-agent sắp xoá worktree và nhánh của worker đã xong. Lệnh: " + command.strip()[:300]
+        return "coding-agent sắp xoá worktree và nhánh của worker, kể cả việc chưa gộp (mất code). Lệnh: " + command.strip()[:300]
     return None
 
 
@@ -247,7 +248,7 @@ def contract(python_src: str) -> str:
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",
         "- " + RECOVER,
-        "- Khi bảng việc ghi 'worktree chờ dọn': hỏi người dùng có xoá không, rồi chạy `worktree-clean --task-id <id> --yes`. Host hỏi người dùng xác nhận lệnh đó, trừ khi phiên đang bypass permissions; dù vậy bạn vẫn phải hỏi người dùng trong hội thoại trước khi chạy với `--yes`. Worktree còn việc chưa gộp thì gộp trước; lệnh từ chối xoá nó.",
+        "- Worktree của worker đã xong, đã gộp và sạch thì tự được xoá (khi dựng bảng việc và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`), không cần hỏi người dùng. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit: kiểm rồi gộp nhánh vào HEAD, lượt sau nó tự được dọn. Muốn bỏ việc đó thì hỏi người dùng trong hội thoại trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp; host cũng hỏi xác nhận, trừ khi phiên đang bypass permissions).",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",
@@ -292,8 +293,12 @@ def board_context(board: list[str], error: str | None) -> str:
     return "[coordinator] bảng việc hiện tại:\n" + "\n".join(board)
 
 
-def read_board(root: Path, run: str | None = None) -> tuple[list[str], str | None]:
-    """The board lines for this repository, or the reason Orca could not be read."""
+def read_board(root: Path, run: str | None = None, session: str = "board") -> tuple[list[str], str | None]:
+    """The board lines for this repository, or the reason Orca could not be read.
+
+    Settled worker worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists
+    only the ones that still hold work.
+    """
     orca_cli.use_stored_run(root)
     try:
         tasks = orca_cli.list_tasks(run)
@@ -308,7 +313,9 @@ def read_board(root: Path, run: str | None = None) -> tuple[list[str], str | Non
     try:
         from coding_agent import cleanup
 
-        lines = lines + cleanup.board_lines(cleanup.candidates(root, run))
+        found = cleanup.candidates(root, run)
+        removed = {item.worktree for item, outcome in cleanup.auto_clean(root, run, session=session, found=found) if outcome == "removed"}
+        lines = lines + cleanup.board_lines([item for item in found if item.worktree not in removed])
     except orca_cli.OrcaError as error:
         lines.append(f"danh sách worktree chờ dọn không đọc được: {str(error)[:160]}")
     return lines, None

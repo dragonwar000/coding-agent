@@ -115,42 +115,56 @@ def test_a_worktree_already_gone_is_forgotten_without_calling_remove(ready_repo,
     assert "removed_worktrees" not in json.loads(fake_orca.read_text(encoding="utf-8"))
 
 
-def test_the_cli_refuses_without_yes_and_names_what_it_did(ready_repo, tmp_path, fake_orca, capsys):
+def test_the_cli_removes_a_clean_worktree_without_yes_and_names_what_it_did(ready_repo, tmp_path, fake_orca, capsys, monkeypatch):
+    monkeypatch.setenv(cleanup.AUTO_ENV, "off")  # so worktree-list shows it instead of removing it
     task_id, path = worker(ready_repo, tmp_path, "by-cli")
     assert cli.main(["--root", str(ready_repo), "worktree-list"]) == 0
     assert f"by-cli ({task_id}, completed): sạch, đã gộp" in capsys.readouterr().out
-    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--task-id", task_id]) == 2
-    assert "Ask the user to confirm" in capsys.readouterr().err and path.exists()
-    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--yes"]) == 2
+    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--task-id", task_id, "--discard"]) == 2
+    assert "ask the user to confirm" in capsys.readouterr().err and path.exists()
+    assert cli.main(["--root", str(ready_repo), "worktree-clean"]) == 2
     assert "--task-id, or pass --all" in capsys.readouterr().err
-    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--task-id", "task_nope", "--yes"]) == 1
+    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--task-id", "task_nope"]) == 1
     assert "has no settled worker worktree" in capsys.readouterr().err
-    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--task-id", task_id, "--yes"]) == 0
+    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--task-id", task_id]) == 0
     assert f"removed: by-cli ({task_id})" in capsys.readouterr().out and not path.exists()
     assert cli.main(["--root", str(ready_repo), "worktree-list"]) == 0
     assert "no settled worker worktree" in capsys.readouterr().out
 
 
-def test_clean_all_reports_kept_worktrees_with_a_failing_exit(ready_repo, tmp_path, fake_orca, capsys):
+def test_worktree_list_removes_a_merged_clean_worktree_on_its_own(ready_repo, tmp_path, fake_orca, capsys):
+    task_id, path = worker(ready_repo, tmp_path, "auto")
+    assert cli.main(["--root", str(ready_repo), "worktree-list"]) == 0
+    out = capsys.readouterr().out
+    assert f"auto-clean: removed auto ({task_id})" in out and "no settled worker worktree left" in out
+    assert not path.exists() and orca_cli.worker_records(ready_repo) == []
+
+
+def test_clean_all_keeps_unsafe_worktrees_and_a_named_one_kept_fails(ready_repo, tmp_path, fake_orca, capsys):
     worker(ready_repo, tmp_path, "ok-one")
-    _task, dirty = worker(ready_repo, tmp_path, "dirty-one")
+    dirty_task, dirty = worker(ready_repo, tmp_path, "dirty-one")
     (dirty / "wip.py").write_text("x\n", encoding="utf-8")
-    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--all", "--yes"]) == 1
+    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--all"]) == 0
     out = capsys.readouterr().out
     assert "removed: ok-one" in out and "kept: 1 file chưa commit: dirty-one" in out
+    assert cli.main(["--root", str(ready_repo), "worktree-clean", "--task-id", dirty_task]) == 1
+    assert dirty.exists()
 
 
-def test_the_board_lists_worktrees_waiting_for_removal(ready_repo, tmp_path, fake_orca):
-    task_id, _path = worker(ready_repo, tmp_path, "on-board")
+def test_the_board_lists_only_worktrees_that_still_hold_work(ready_repo, tmp_path, fake_orca):
+    _clean_task, clean_path = worker(ready_repo, tmp_path, "merged")
+    task_id, path = worker(ready_repo, tmp_path, "on-board")
+    (path / "wip.py").write_text("x\n", encoding="utf-8")
     lines, error = coordinator.read_board(ready_repo)
     text = "\n".join(lines)
-    assert error is None and "worktree của worker đã xong, chờ dọn (1):" in text
-    assert f"on-board ({task_id}, completed): sạch, đã gộp" in text and "worktree-clean --task-id <id> --yes" in text
+    assert error is None and "worktree của worker đã xong, còn việc chưa gộp hoặc chưa commit (1):" in text
+    assert f"on-board ({task_id}, completed): 1 file chưa commit" in text and "worktree-clean --task-id <id> --discard --yes" in text
+    assert "merged (" not in text and not clean_path.exists()
 
 
-def test_the_hook_makes_the_host_ask_the_user_before_a_removal(ready_repo, fake_orca):
+def test_the_hook_makes_the_host_ask_the_user_before_a_discard(ready_repo, fake_orca):
     manifest(ready_repo, verify=[])
-    command = "PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.cli worktree-clean --task-id task_0001 --yes"
+    command = "PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.cli worktree-clean --task-id task_0001 --discard --yes"
     for mode in ("enforce", "shadow"):
         result = call(ready_repo, "coordinator-guard", {"session_id": "w1", "cwd": str(ready_repo), "tool_name": "Bash", "tool_input": {"command": command}}, mode=mode)
         decision = json.loads(result.stdout)["hookSpecificOutput"]
@@ -164,7 +178,8 @@ def test_other_commands_need_no_confirmation():
     assert coordinator.needs_user_confirmation("Bash", {"command": "python3 -m coding_agent.cli worktree-list"}) is None
     assert coordinator.needs_user_confirmation("Bash", {"command": "python3 -m coding_agent.cli plan-next plan.yaml"}) is None
     assert coordinator.needs_user_confirmation("Write", {"file_path": "a.py"}) is None
-    assert coordinator.needs_user_confirmation("Bash", {"command": "python3 -m coding_agent.cli --root /r worktree-clean --all --yes"}) is not None
+    assert coordinator.needs_user_confirmation("Bash", {"command": "python3 -m coding_agent.cli --root /r worktree-clean --all"}) is None
+    assert coordinator.needs_user_confirmation("Bash", {"command": "python3 -m coding_agent.cli --root /r worktree-clean --all --discard --yes"}) is not None
 
 
 def test_a_worktree_git_cannot_compare_is_kept(ready_repo, tmp_path, fake_orca):

@@ -1,21 +1,25 @@
-"""Remove a worker's worktree after its task settled, once the user has confirmed.
+"""Remove a worker's worktree after its task settled.
 
-A worktree is a candidate when coding-agent started a worker in it (the workers ledger), its Orca task is
-`completed` or `failed`, and the directory still exists. `clean` releases the worker's terminal and removes the
-worktree through Orca, which also deletes its branch.
+A worktree is a candidate when coding-agent started a worker in it (the workers ledger) and its Orca task is
+`completed` or `failed`. `clean` releases the worker's terminal and removes the worktree through Orca, which also
+deletes its branch.
 
-Nothing is removed while the worktree holds work that exists nowhere else: uncommitted files, or commits that
-the coordinator's current branch does not contain. For a worker of another repository than the root (a child
-repository of a folder project), that branch is the one the worker's own repository has checked out. `discard=True` overrides that and loses the work.
+A worktree is safe to remove when it holds no work that exists nowhere else: no uncommitted files, and no commits
+that the coordinator's current branch does not contain. For a worker of another repository than the root (a child
+repository of a folder project), that branch is the one the worker's own repository has checked out. Safe
+worktrees, and records whose directory is already gone, are removed without asking anyone: `auto_clean` runs on the
+coordinator's board and after the CLI commands the coordinator runs each turn (`CODING_AGENT_AUTO_CLEAN=off` turns
+that off). A worker that reported but whose branch the coordinator has not merged yet keeps its worktree, so the
+coordinator can still check it; once the branch is merged into the coordinator's HEAD, the next run removes it.
 
-The confirmation is not taken here. The coordinator asks the user in the conversation first, and the
-coordinator-guard hook answers `ask` for the `worktree-clean` command so the host asks again before it runs,
-except when the session's `permission_mode` is `bypassPermissions`: then the hook stays silent, because the user
-turned prompts off. The CLI always refuses to run without `--yes`.
+Only `discard=True` removes a worktree that is not safe, and that loses the work. The user confirms that: the
+coordinator asks in the conversation, the coordinator-guard hook answers `ask` for `worktree-clean --discard`
+(except when the session's `permission_mode` is `bypassPermissions`), and the CLI refuses `--discard` without `--yes`.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +28,7 @@ from typing import Any
 from coding_agent import events, orca_cli
 
 SETTLED = ("completed", "failed")
+AUTO_ENV = "CODING_AGENT_AUTO_CLEAN"
 
 
 @dataclass(frozen=True)
@@ -110,7 +115,8 @@ def candidates(root: Path, run: str | None = None) -> list[Candidate]:
     return found
 
 
-def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session: str = "cli") -> list[tuple[Candidate, str]]:
+def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session: str = "cli",
+          kind: str = "worktree-removed") -> list[tuple[Candidate, str]]:
     """Remove each chosen worktree. Returns (candidate, outcome) with outcome `removed`, `kept: <why>`, or `failed: <why>`."""
     results: list[tuple[Candidate, str]] = []
     for item in chosen:
@@ -129,18 +135,53 @@ def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session
             results.append((item, f"failed: {str(error)[:200]}"))
             continue
         orca_cli.mark_removed(root, item.worktree)
-        events.record(root, guard="coordinator", kind="worktree-removed", mode="enforce", applied=True, session=session,
+        events.record(root, guard="coordinator", kind=kind, mode="enforce", applied=True, session=session,
                       detail={"task_id": item.task_id, "worktree": item.worktree, "discarded": discard and not item.safe})
         results.append((item, "removed"))
     return results
 
 
+def auto_enabled() -> bool:
+    """False when `CODING_AGENT_AUTO_CLEAN` is `off` (or `0`, `false`, `no`); on by default."""
+    return os.environ.get(AUTO_ENV, "on").strip().lower() not in ("off", "0", "false", "no")
+
+
+def auto_clean(root: Path, run: str | None = None, *, session: str = "cli",
+               found: list[Candidate] | None = None) -> list[tuple[Candidate, str]]:
+    """Remove every settled worker worktree that loses no work, without asking. Returns `clean`'s (candidate, outcome).
+
+    Removed: safe candidates, and records whose directory no longer exists (only marked removed). Never touched:
+    worktrees with unmerged commits, uncommitted files, or a state git cannot report. Never forced. An Orca error on
+    one worktree is reported as its `failed:` outcome and does not stop the others; an error listing the tasks raises
+    `orca_cli.OrcaError`. `found` reuses candidates the caller already listed.
+
+    Limits: only tasks Orca lists for `run` are seen. With `run` None that is the Run the CLI is bound to
+    (`CODING_AGENT_ORCA_RUN`, or the stored or bound Run); `orca orchestration task-list` has no option to list
+    every Run, so a worker worktree whose task belongs to an older Run is never a candidate here and stays until
+    it is removed by hand. A worktree recorded by `worker-adopt` without a real task id has no task and is not seen either.
+    """
+    if not auto_enabled():
+        return []
+    if found is None:
+        if not orca_cli.worker_records(root):
+            return []
+        found = candidates(root, run)
+    chosen = [item for item in found if item.safe or not item.exists]
+    return clean(root, chosen, session=session, kind="worktree-auto-removed") if chosen else []
+
+
 def board_lines(found: list[Candidate]) -> list[str]:
-    """Lines for the coordinator's board. Empty when no worktree waits for removal."""
+    """Lines for the coordinator's board. Empty when no worktree is left.
+
+    Merged, clean worktrees are removed by `auto_clean` before the board is built, so what is listed here normally
+    holds work that is not merged or not committed.
+    """
     if not found:
         return []
-    lines = [f"worktree của worker đã xong, chờ dọn ({len(found)}):"]
+    lines = [f"worktree của worker đã xong, còn việc chưa gộp hoặc chưa commit ({len(found)}):"]
     for item in found[:10]:
         lines.append(f"  - {Path(item.worktree).name} ({item.task_id}, {item.status}): {item.describe()}")
-    lines.append("  việc cần làm: gộp phần chưa gộp nếu cần giữ, hỏi người dùng có xoá không, rồi chạy `worktree-clean --task-id <id> --yes`. Host hỏi xác nhận lệnh đó trừ khi phiên đang bypass permissions; vẫn phải hỏi người dùng trong hội thoại trước khi chạy với `--yes`.")
+    lines.append("  việc cần làm: worktree đã gộp và sạch tự được xoá, không cần hỏi ai. Với các worktree trên: kiểm rồi gộp nhánh vào HEAD (lượt sau nó tự được dọn); "
+                 "nếu muốn bỏ việc đó thì hỏi người dùng trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp). "
+                 "Worktree ghi 'sạch, đã gộp' chỉ còn khi tự dọn bị tắt (CODING_AGENT_AUTO_CLEAN=off): xoá bằng `worktree-clean --task-id <id>`, không cần --yes.")
     return lines

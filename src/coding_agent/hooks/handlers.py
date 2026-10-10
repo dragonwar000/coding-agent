@@ -387,7 +387,7 @@ def coordinator_context(ctx: Context) -> HookResult:
     else:
         # prompt-reset owns the session state on UserPromptSubmit; both hooks may run at once, so only the mode file is written here.
         _remember_permission_mode(ctx, None)
-    board, error = coordinator.read_board(ctx.root)
+    board, error = coordinator.read_board(ctx.root, session=ctx.session)
     text = coordinator.board_context(board, error)
     if event == "SessionStart":
         text = coordinator.contract(ctx.manifest.python_src) + "\n" + text

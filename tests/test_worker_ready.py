@@ -144,7 +144,7 @@ def test_a_worktree_without_an_agent_terminal_falls_back_to_worker_start_agent(f
 
 # --- coordinator-guard: worktree-clean under each permission mode -----------------------------------------------------
 
-CLEAN = "python3 -m coding_agent.cli worktree-clean --task-id t1 --yes"
+CLEAN = "python3 -m coding_agent.cli worktree-clean --task-id t1 --discard --yes"
 
 
 def guard(repo: Path, extra: dict) -> tuple[object, dict]:

@@ -185,13 +185,14 @@ def test_the_folder_root_board_and_cleanup_see_a_worker_of_a_child_repository(fo
     found = cleanup.candidates(folder)
     assert found[0].unmerged == 1 and found[0].describe() == "1 commit chưa gộp"
     lines, error = coordinator.read_board(folder)
-    assert error is None and any("chờ dọn" in line for line in lines) and any("fix-login" in line for line in lines)
-    assert cli.main(["--root", str(folder), "worktree-clean", "--task-id", task_id, "--yes"]) == 1
+    assert error is None and any("chưa gộp" in line for line in lines) and any("fix-login" in line for line in lines)
+    assert cli.main(["--root", str(folder), "worktree-clean", "--task-id", task_id]) == 1
     assert worktree.is_dir()
     git(app, "merge", "-q", "fix-login")
     capsys.readouterr()
-    assert cli.main(["--root", str(folder), "worktree-clean", "--task-id", task_id, "--yes"]) == 0
-    assert "removed: fix-login" in capsys.readouterr().out
+    # Once merged, the next command the coordinator runs removes it without being asked.
+    assert cli.main(["--root", str(folder), "worktree-list"]) == 0
+    assert "auto-clean: removed fix-login" in capsys.readouterr().out
     assert not worktree.exists()
     assert orca_cli.worker_records(folder) == [] and orca_cli.worker_worktrees(app) == set()
 

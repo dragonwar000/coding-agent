@@ -23,9 +23,13 @@
 - `worker-kick --task-id ID`: record the task's worktree as a worker's and send the kick-off to its terminal, for a worker that never received its task.
 - `worker-settle --task-id ID --basis B [--artifact PATH ...]`: abandon the task's active dispatch and mark it completed, once the coordinator
   has checked the result; for a worker whose `worker_done` Orca rejected.
-- `worktree-list`: worker worktrees whose task settled, and what removing each would lose.
-- `worktree-clean (--task-id ID ... | --all) --yes [--discard]`: remove them after the user confirmed. Without `--discard`,
-  a worktree with uncommitted files or unmerged commits is kept.
+- `worktree-list`: worker worktrees whose task settled and that still hold work, and what removing each would lose.
+- `worktree-clean (--task-id ID ... | --all) [--discard --yes]`: remove them. Without `--discard` only merged, clean
+  worktrees go and nothing needs confirming; `--discard` also removes unmerged or uncommitted work, so it needs `--yes`
+  after the user confirmed.
+- After `plan-next`, `plan-status`, `inbox`, `delegate` and `worktree-list`, merged, clean worktrees of settled workers
+  are removed without asking (`cleanup.auto_clean`), one `auto-clean: removed <name> (<task>)` line each.
+  `CODING_AGENT_AUTO_CLEAN=off` turns that off. An auto-clean error is a warning and does not change the exit code.
 - `inbox [--ack]`: worker reports the coordinator has not handled; `--ack` acknowledges them.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
 - `plan-apply FILE`, `plan-next FILE [--max N] [--permission-mode M]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
@@ -94,6 +98,23 @@ def _permission_option(command: argparse.ArgumentParser) -> None:
     command.add_argument("--permission-mode", help="worker permission mode: default, acceptEdits, plan, bypassPermissions (default: CODING_AGENT_WORKER_PERMISSION_MODE, else the mode the hooks recorded for the coordinator's session)")
 
 
+AUTO_CLEAN_AFTER = frozenset({"plan-next", "plan-status", "inbox", "delegate"})
+
+
+def _auto_clean(root: Path, run: str | None) -> None:
+    """Remove merged, clean worktrees of settled workers and say so. Never fails the command it follows."""
+    try:
+        results = cleanup.auto_clean(root, run)
+    except (orca_cli.OrcaError, OSError) as error:
+        print(f"auto-clean: warning: {str(error)[:200]}", file=sys.stderr)
+        return
+    for item, outcome in results:
+        if outcome == "removed":
+            print(f"auto-clean: removed {Path(item.worktree).name} ({item.task_id})")
+        else:
+            print(f"auto-clean: warning: {Path(item.worktree).name} ({item.task_id}) {outcome}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     utf8_output()
     parser = argparse.ArgumentParser(prog="coding_agent.cli")
@@ -153,11 +174,11 @@ def main(argv: list[str] | None = None) -> int:
     settle.add_argument("--run")
     wt_list = sub.add_parser("worktree-list", help="worker worktrees waiting for removal")
     wt_list.add_argument("--run")
-    wt_clean = sub.add_parser("worktree-clean", help="remove settled workers' worktrees after the user confirmed")
+    wt_clean = sub.add_parser("worktree-clean", help="remove settled workers' worktrees (only merged, clean ones unless --discard)")
     wt_clean.add_argument("--task-id", action="append", default=[])
     wt_clean.add_argument("--all", action="store_true", help="every settled worker worktree")
-    wt_clean.add_argument("--yes", action="store_true", help="the user confirmed the removal")
-    wt_clean.add_argument("--discard", action="store_true", help="also remove worktrees with uncommitted files or unmerged commits; that work is lost")
+    wt_clean.add_argument("--yes", action="store_true", help="the user confirmed --discard")
+    wt_clean.add_argument("--discard", action="store_true", help="also remove worktrees with uncommitted files or unmerged commits; that work is lost (needs --yes)")
     wt_clean.add_argument("--run")
     inbox = sub.add_parser("inbox", help="unhandled worker reports")
     inbox.add_argument("--ack", action="store_true", help="acknowledge the reports after printing them")
@@ -189,7 +210,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = _root(args.root)
     orca_cli.use_stored_run(root)
+    code = _command(args, root)
+    if args.command in AUTO_CLEAN_AFTER:
+        _auto_clean(root, args.run)
+    return code
 
+
+def _command(args: argparse.Namespace, root: Path) -> int:
     try:
         if args.command == "report":
             print(json.dumps(events.summarize(root), indent=2, ensure_ascii=False))
@@ -218,14 +245,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(outcome, ensure_ascii=False))
             return 0 if outcome["sent"] else 1
         if args.command in ("worktree-list", "worktree-clean"):
-            found = cleanup.candidates(root, args.run)
             if args.command == "worktree-list":
-                lines = cleanup.board_lines(found)
-                print("\n".join(lines[:-1]) if lines else "worktree-list: no settled worker worktree")
+                _auto_clean(root, args.run)
+                lines = cleanup.board_lines(cleanup.candidates(root, args.run))
+                print("\n".join(lines[:-1]) if lines else "worktree-list: no settled worker worktree left")
                 return 0
-            if not args.yes:
-                print("worktree-clean: refused. Ask the user to confirm the removal, then pass --yes.", file=sys.stderr)
+            if args.discard and not args.yes:
+                print("worktree-clean: refused. --discard loses unmerged work: ask the user to confirm, then pass --yes.", file=sys.stderr)
                 return 2
+            found = cleanup.candidates(root, args.run)
             if not args.all and not args.task_id:
                 print("worktree-clean: name the worktrees with --task-id, or pass --all.", file=sys.stderr)
                 return 2
@@ -236,7 +264,9 @@ def main(argv: list[str] | None = None) -> int:
             results = cleanup.clean(root, chosen, discard=args.discard)
             for item, outcome in results:
                 print(f"{outcome}: {Path(item.worktree).name} ({item.task_id})")
-            return 1 if unknown or any(not outcome.startswith("removed") for _item, outcome in results) else 0
+            # `--all` keeps unsafe worktrees by design; a named one that was kept, or any Orca failure, is an error.
+            missed = [outcome for _item, outcome in results if outcome.startswith("failed") or (outcome.startswith("kept") and not args.all)]
+            return 1 if unknown or missed else 0
         if args.command == "inbox":
             reports = orca_cli.ack_reports(args.run) if args.ack else orca_cli.unread_reports(args.run)
             lines = coordinator.report_lines(reports, coordinator._plan_ids(root))

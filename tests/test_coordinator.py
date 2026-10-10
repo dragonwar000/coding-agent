@@ -444,6 +444,6 @@ def test_a_maintainer_session_is_let_through_and_logged(repo, monkeypatch):
 def test_a_maintainer_is_still_asked_before_a_worktree_is_removed(repo, monkeypatch):
     monkeypatch.setenv("CODING_AGENT_ROLE", "maintainer")
     manifest(repo, verify=[])
-    command = "python3 -m coding_agent.cli worktree-clean --task-id t1 --yes"
+    command = "python3 -m coding_agent.cli worktree-clean --task-id t1 --discard --yes"
     result = call(repo, "coordinator-guard", {"session_id": "c33", "cwd": str(repo), "tool_name": "Bash", "tool_input": {"command": command}}, mode="enforce")
     assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask"
