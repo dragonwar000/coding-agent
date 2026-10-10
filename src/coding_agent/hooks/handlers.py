@@ -338,7 +338,8 @@ def coordinator_guard(ctx: Context) -> HookResult:
         return HookResult(stdout=json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": question,
         }}, ensure_ascii=False))
-    reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"), ctx.root)
+    python_src = ctx.manifest.python_src if ctx.manifest is not None else None
+    reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"), ctx.root, python_src=python_src)
     if reason is None:
         return HookResult()
     if role == "maintainer":

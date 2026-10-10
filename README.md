@@ -197,6 +197,10 @@ Nó không tự sửa file.
   không bị chặn mà host hỏi người dùng xác nhận, để guard luôn tắt được từ trong phiên.
 - **Coordinator vẫn được:** đọc file, lệnh đọc, ghi `.coding-agent/plan.yaml`, chạy một lệnh `coding_agent.cli` đơn lẻ,
   và `git add` / `git commit` / `git merge` để gộp nhánh của worker.
+- **Tự giao việc:** chỉ worker được ghi. Khi việc cần ghi hoặc khi guard chặn một lệnh, coordinator giao ngay trong cùng
+  lượt (`delegate` cho một việc nhỏ, graph cho nhiều việc), không xin phép người dùng và không viết lại lệnh để lách guard.
+  Chưa có Orca Run thì nó tự chạy `run-init`. Lời từ chối của guard kèm sẵn lệnh `delegate`. Nó chỉ hỏi người dùng về
+  quyết định thật sự của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài).
 - **Ai là worker:** chỉ session chạy trong worktree mà `worker-start` của coding-agent tạo ra. Danh sách nằm ở
   `<git-common-dir>/coding-agent-workers.jsonl`, dùng chung cho mọi worktree. Session ở worktree khác (kể cả workspace
   Orca) là coordinator. `CODING_AGENT_ROLE=coordinator|worker|maintainer` ghi đè.

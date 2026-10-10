@@ -211,8 +211,14 @@ def test_the_board_is_capped_so_it_cannot_flood_a_prompt():
 
 
 def test_the_context_error_text_tells_the_coordinator_not_to_guess():
-    text = coordinator.board_context([], "run_required")
-    assert "Hỏi người dùng" in text
+    text = coordinator.board_context([], "daemon not running")
+    assert "Không bịa trạng thái task" in text and "hỏi người dùng" in text
+
+
+def test_without_a_run_the_coordinator_is_told_to_run_run_init_itself():
+    text = coordinator.board_context([], "run_required: No Run is bound.")
+    assert "tự chạy" in text and "run-init" in text and "không nhờ người dùng chạy" in text
+    assert "Không bịa trạng thái task" in text and "hỏi người dùng" not in text.lower()
 
 
 def test_the_coordinator_may_write_only_the_plan_file(repo, monkeypatch):
@@ -326,6 +332,38 @@ def test_a_worker_started_by_task_id_gets_its_name_from_the_title_orca_stores(re
     record = json.loads(fake_orca.read_text(encoding="utf-8"))["dispatches"][dispatch]
     assert record["name"] == "vat-the-tuong-tac-anh-sang" and record["display"] == "Vật thể tương tác, ánh sáng"
     assert not record["name"].startswith("ca-")
+
+
+def test_the_contract_tells_the_coordinator_to_delegate_without_asking():
+    text = coordinator.contract("harness/coding-agent/src")
+    assert "Chỉ worker được ghi" in text and "không viết lại lệnh bị chặn" in text
+    assert "giao ngay trong cùng lượt" in text and "Không xin phép người dùng" in text and "không kết thúc lượt" in text
+    assert "Chưa có Orca Run: tự chạy `run-init" in text and "Không nhờ người dùng chạy" in text
+    assert "PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.cli delegate" in text
+
+
+@pytest.mark.parametrize("tool, tool_input", [
+    ("Write", {"file_path": "a.py"}),
+    ("Agent", {"description": "do it all"}),
+    ("Bash", {"command": "rm -rf build"}),
+])
+def test_every_refusal_says_to_delegate_now(tool, tool_input):
+    generic = coordinator.guard_reason(tool, tool_input)
+    assert "không hỏi người dùng" in generic and "không viết lại lệnh" in generic and "giao việc này ngay" in generic
+    assert "`python3 -m coding_agent.cli delegate --title" in generic and coordinator.HOW in generic
+    located = coordinator.guard_reason(tool, tool_input, python_src="harness/coding-agent/src")
+    assert "`PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.cli delegate --title" in located
+
+
+def test_the_coordinator_guard_names_the_delegate_command_with_the_manifest_path(repo, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
+    manifest(repo, verify=[])
+    committed_repo(repo)
+    payload = {"session_id": "c40", "cwd": str(repo), "tool_name": "Bash", "tool_input": {"command": "rm -rf build"}}
+    blocked = call(repo, "coordinator-guard", payload, mode="enforce")
+    python_src = context_for("coordinator-guard", payload).manifest.python_src
+    assert blocked.returncode == 2 and "giao việc này ngay" in blocked.stderr
+    assert f"PYTHONPATH={python_src} python3 -m coding_agent.cli delegate" in blocked.stderr
 
 
 def test_the_contract_asks_for_short_summary_titles():

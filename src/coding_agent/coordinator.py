@@ -141,6 +141,20 @@ RECOVER = (
 REJECTED_PREFIX = "Rejected worker_done"
 
 
+def delegate_command(python_src: str | None = None) -> str:
+    """The command that hands one job to a worker. Without `python_src` it is the generic form."""
+    prefix = f"PYTHONPATH={python_src} " if python_src else ""
+    return f'{prefix}python3 -m coding_agent.cli delegate --title "..." --spec "..."'
+
+
+def delegate_now(python_src: str | None = None) -> str:
+    """The instruction closing every refusal: the refused work goes to a worker in this turn."""
+    return (
+        "Không dừng lượt, không hỏi người dùng, không viết lại lệnh để lách guard: giao việc này ngay bằng "
+        f"`{delegate_command(python_src)}`."
+    )
+
+
 def is_plan_file(root: Path, file_path: Any) -> bool:
     """True when `file_path` is the coordinator's plan file, the one file it writes itself."""
     if not isinstance(file_path, str) or not file_path:
@@ -190,26 +204,28 @@ def needs_user_confirmation(tool: str, tool_input: Any, root: Path | None = None
 CHAINING = re.compile(r"(&&|\|\||;|\||`|\$\()")
 
 
-def guard_reason(tool: str, tool_input: Any, root: Path | None = None) -> str | None:
+def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python_src: str | None = None) -> str | None:
     """Why the coordinator must not do this call itself, or None when the call is allowed.
 
     Allowed: read-only shell, a single `coding_agent.cli` command, and writing the plan file.
     Refused: any other file write, a mutating shell command, and an in-process subagent, which would bypass the graph.
+    Every refusal ends with the delegate command, with `python_src` in it when the caller knows the path.
     """
     data = tool_input if isinstance(tool_input, dict) else {}
+    how = f"{HOW} {delegate_now(python_src)}"
     if tool in WRITE_TOOLS:
         if root is not None and is_plan_file(root, data.get("file_path") or data.get("notebook_path")):
             return None
-        return f"[coordinator] {tool} là sửa trực tiếp. {HOW}"
+        return f"[coordinator] {tool} là sửa trực tiếp. {how}"
     if tool in DELEGATING_TOOLS:
-        return f"[coordinator] subagent nội bộ không qua graph, nên bảng việc không thấy nó. {HOW}"
+        return f"[coordinator] subagent nội bộ không qua graph, nên bảng việc không thấy nó. {how}"
     if tool == "Bash":
         command = str(data.get("command") or "")
         shell = checked_shell(command)
         if DELEGATE_CALL.search(command) and not CHAINING.search(shell):
             return None
         if MUTATING_BASH.search(shell):
-            return f"[coordinator] lệnh shell này làm thay đổi file hoặc trạng thái repo. {HOW}"
+            return f"[coordinator] lệnh shell này làm thay đổi file hoặc trạng thái repo. {how}"
     return None
 
 
@@ -220,7 +236,10 @@ def contract(python_src: str) -> str:
         "- Mọi thay đổi file đi qua graph: bạn viết plan, worker Orca làm từng node trong worktree riêng. Ở mode enforce, hook chặn sửa trực tiếp, lệnh shell ghi file, và subagent nội bộ.",
         "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và gộp kết quả: `git add`, `git commit`, `git merge <nhánh worker>`.",
         "- Worker tách nhánh từ commit hiện tại: commit việc đang dở trước khi `plan-next`, nếu không worker sẽ không thấy nó.",
-        f"- Giao việc bằng: PYTHONPATH={python_src} python3 -m coding_agent.cli delegate --title \"...\" --spec \"...\" [--agent claude|codex]",
+        "- Chỉ worker được ghi: mọi lần ghi file, script tạm, hay lệnh shell đổi trạng thái là việc của worker. Bạn không tự làm, và không viết lại lệnh bị chặn để lách guard.",
+        "- Khi việc cần ghi, hoặc khi hook chặn một lệnh: giao ngay trong cùng lượt, bằng lệnh delegate (một việc nhỏ) hoặc graph (nhiều việc). Không xin phép người dùng, không kết thúc lượt để chờ. Chỉ hỏi người dùng khi quyết định thật sự là của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài), không hỏi \"có giao việc không\".",
+        "- Chưa có Orca Run: tự chạy `run-init --objective \"...\"` với mục tiêu một dòng, rồi giao việc. Không nhờ người dùng chạy.",
+        f"- Giao việc bằng: {delegate_command(python_src)} [--agent claude|codex]",
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",
@@ -260,8 +279,13 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
 def board_context(board: list[str], error: str | None) -> str:
     """The board block injected on each prompt. An unavailable Orca is reported, never hidden."""
     if error is not None:
-        hint = " Chưa có Orca Run: chạy `python3 -m coding_agent.cli run-init --objective \"...\"` một lần trong terminal này." if "run_required" in error else ""
-        return f"[coordinator] bảng việc không đọc được từ Orca: {error}.{hint} Hỏi người dùng trước khi nói về tiến độ."
+        if "run_required" in error:
+            return (
+                f"[coordinator] bảng việc không đọc được từ Orca: {error}. Chưa có Orca Run: tự chạy "
+                "`python3 -m coding_agent.cli run-init --objective \"...\"` với mục tiêu một dòng rồi giao việc; không nhờ người dùng chạy. "
+                "Không bịa trạng thái task."
+            )
+        return f"[coordinator] bảng việc không đọc được từ Orca: {error}. Không bịa trạng thái task; hỏi người dùng trước khi nói về tiến độ."
     return "[coordinator] bảng việc hiện tại:\n" + "\n".join(board)
 
 
