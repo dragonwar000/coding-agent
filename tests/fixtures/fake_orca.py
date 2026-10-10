@@ -7,10 +7,11 @@ task commands without `--run` (and no bound run) answer `run_required` with exit
 `FAKE_ORCA_EXIT=<n>` makes every answer exit `n` after printing it, like the real CLI's `ok: true` with exit 1.
 `FAKE_ORCA_TURN_UNOBSERVED=1` makes `worker-start` answer the measured "turn start unobserved" shape (no `effects`,
 exit 1) and `terminal send` exit 1 with `ok: true`. `FAKE_ORCA_DEAF=1` makes the fake terminal's screen never show
-what was sent to it. `terminal read` shows a prompt line plus the texts sent so far; `dispatch-show`, `worker-show`,
+what was sent to it. `worktree create --agent` answers an `agentTerminalHandle` unless `FAKE_ORCA_NO_AGENT_TERMINAL=1`,
+and `worker-start` takes `--terminal` in place of `--agent`. `terminal read` shows a prompt line plus the texts sent so far; `dispatch-show`, `worker-show`,
 and `worker-abandon` read and change the dispatch records that `worker-start` creates.
 `FAKE_ORCA_FOLDER_PROJECT=1` makes `worker-start --worktree new-child` answer the refusal Orca gives a terminal of a
-folder project. `FAKE_ORCA_UNKNOWN_REPO=1` makes `worktree create` answer `repo_not_found` until `repo add` registered
+folder project (the harness no longer asks for `new-child`). `FAKE_ORCA_UNKNOWN_REPO=1` makes `worktree create` answer `repo_not_found` until `repo add` registered
 the repository. `FAKE_ORCA_REAL_WORKTREE=1` makes `worktree create` add a real git worktree of the named repository.
 """
 
@@ -47,14 +48,17 @@ def main(argv: list[str]) -> int:
             state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             print(json.dumps({"ok": False, "error": {"code": "repo_not_found", "message": f"No repo matches path:{repo}"}}))
             return 1
-        data.setdefault("created_worktrees", []).append({"name": options["--name"], "repo": options.get("--repo")})
+        data.setdefault("created_worktrees", []).append({"name": options["--name"], "repo": options.get("--repo"), "agent": options.get("--agent")})
         data.setdefault("create_calls", []).append({"base": options.get("--base-branch"), "no_parent": "--no-parent" in argv})
         state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         if os.environ.get("FAKE_ORCA_REAL_WORKTREE") == "1":
             import subprocess
             subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", options["--name"], path, *([options["--base-branch"]] if "--base-branch" in options else [])],
                            check=True, capture_output=True)
-        print(json.dumps({"ok": True, "result": {"worktree": {"id": f"repo::{path}", "path": path}}}))
+        result = {"worktree": {"id": f"repo::{path}", "path": path}}
+        if "--agent" in options and os.environ.get("FAKE_ORCA_NO_AGENT_TERMINAL") != "1":
+            result["agentTerminalHandle"] = f"term_wt_{options['--name']}"
+        print(json.dumps({"ok": True, "result": result}))
         return 0
     if argv[:2] == ["repo", "add"]:
         data.setdefault("repos", []).append(_options(argv[2:])["--path"])
@@ -170,13 +174,15 @@ def main(argv: list[str]) -> int:
             answer = {"ok": False, "error": {"code": "invalid_argument", "message": "Folder projects cannot create orchestration worktrees; use current or an exact existing folder workspace."}}
         elif options.get("--worktree") == "new-child" and "--name" not in options:
             answer = {"ok": False, "error": {"code": "invalid_argument", "message": "New worktrees require --name."}}
-        elif task is None or options.get("--agent") is None:
+        elif task is None or (options.get("--agent") is None and options.get("--terminal") is None):
             answer = {"ok": False, "error": {"code": "unknown_task", "message": "no such task or agent"}}
         else:
             dispatch_id = f"dsp_{len(data.setdefault('dispatches', {})) + 1:04d}"
             selector = options.get("--worktree", "")
             worktree = selector[5:] if selector.startswith("path:") else os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
-            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": options["--agent"], "worktree": selector, "name": options.get("--name", os.path.basename(worktree)),
+            # A dispatch to an agent terminal runs the agent its worktree was created with.
+            agent = options.get("--agent") or next((w["agent"] for w in data.get("created_worktrees", []) if f"term_wt_{w['name']}" == options.get("--terminal")), None)
+            data["dispatches"][dispatch_id] = {"task": task["id"], "agent": agent, "terminal": options.get("--terminal"), "worktree": selector, "name": options.get("--name", os.path.basename(worktree)),
                                                "display": options.get("--display-name"), "base": options.get("--base-branch")}
             task["status"] = "dispatched"
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"runId": options["--run"], "taskId": task["id"], "dispatchId": dispatch_id,

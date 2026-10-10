@@ -8,8 +8,10 @@ Nothing is removed while the worktree holds work that exists nowhere else: uncom
 the coordinator's current branch does not contain. For a worker of another repository than the root (a child
 repository of a folder project), that branch is the one the worker's own repository has checked out. `discard=True` overrides that and loses the work.
 
-The confirmation is not taken here. The coordinator-guard hook answers `ask` for the `worktree-clean` command,
-so the host asks the user before the command runs; the CLI also refuses to run without `--yes`.
+The confirmation is not taken here. The coordinator asks the user in the conversation first, and the
+coordinator-guard hook answers `ask` for the `worktree-clean` command so the host asks again before it runs,
+except when the session's `permission_mode` is `bypassPermissions`: then the hook stays silent, because the user
+turned prompts off. The CLI always refuses to run without `--yes`.
 """
 
 from __future__ import annotations
@@ -140,5 +142,5 @@ def board_lines(found: list[Candidate]) -> list[str]:
     lines = [f"worktree của worker đã xong, chờ dọn ({len(found)}):"]
     for item in found[:10]:
         lines.append(f"  - {Path(item.worktree).name} ({item.task_id}, {item.status}): {item.describe()}")
-    lines.append("  việc cần làm: gộp phần chưa gộp nếu cần giữ, hỏi người dùng có xoá không, rồi chạy `worktree-clean --task-id <id> --yes`. Host sẽ hỏi người dùng xác nhận lệnh đó.")
+    lines.append("  việc cần làm: gộp phần chưa gộp nếu cần giữ, hỏi người dùng có xoá không, rồi chạy `worktree-clean --task-id <id> --yes`. Host hỏi xác nhận lệnh đó trừ khi phiên đang bypass permissions; vẫn phải hỏi người dùng trong hội thoại trước khi chạy với `--yes`.")
     return lines

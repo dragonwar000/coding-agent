@@ -167,7 +167,8 @@ def is_plan_file(root: Path, file_path: Any) -> bool:
 
 # The coordinator's own delegation command, run alone. A chained or substituted command is not allowed through.
 DELEGATE_CALL = re.compile(r"^\s*(PYTHONPATH=\S+\s+)?python3?\s+-m\s+coding_agent\.cli\s")
-# Removing a worker's worktree deletes its directory and branch, so the host asks the user before this command runs.
+# Removing a worker's worktree deletes its directory and branch, so the host asks the user before this command runs
+# (unless the session bypasses permissions).
 CLEAN_CALL = re.compile(r"coding_agent\.cli\s+(--root\s+\S+\s+)?worktree-clean\b")
 
 
@@ -246,7 +247,7 @@ def contract(python_src: str) -> str:
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",
         "- " + RECOVER,
-        "- Khi bảng việc ghi 'worktree chờ dọn': hỏi người dùng có xoá không, rồi chạy `worktree-clean --task-id <id> --yes`. Host sẽ hỏi người dùng xác nhận lệnh đó. Worktree còn việc chưa gộp thì gộp trước; lệnh từ chối xoá nó.",
+        "- Khi bảng việc ghi 'worktree chờ dọn': hỏi người dùng có xoá không, rồi chạy `worktree-clean --task-id <id> --yes`. Host hỏi người dùng xác nhận lệnh đó, trừ khi phiên đang bypass permissions; dù vậy bạn vẫn phải hỏi người dùng trong hội thoại trước khi chạy với `--yes`. Worktree còn việc chưa gộp thì gộp trước; lệnh từ chối xoá nó.",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",

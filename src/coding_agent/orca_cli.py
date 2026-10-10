@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -433,7 +434,6 @@ def _base_args(root: Path, base: str | None = None) -> list[str]:
     return ["--base-branch", ref] if ref is not None else []
 
 
-FOLDER_REFUSAL = "Folder projects cannot create orchestration worktrees"
 SCAN_DEPTH = 3
 SCAN_LIMIT = 20
 SCAN_SKIP = frozenset({"node_modules", "venv", "build", "dist", "target", "__pycache__"})
@@ -483,9 +483,13 @@ def target_repo(root: Path, repo: str | Path | None) -> Path | None:
     return named
 
 
-def _create_worktree(repo: Path, name: str, base: list[str]) -> str:
-    """Create a worktree of `repo` through Orca and return its path. A repository Orca does not know is registered, then the creation is tried once more."""
-    create = ("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent", *base)
+def _create_worktree(repo: Path, name: str, base: list[str], agent: str | None = None) -> tuple[str, str | None]:
+    """Create a worktree of `repo` through Orca, with `agent` already running in it when given.
+
+    Returns the worktree's path and the agent's terminal handle (None when the answer names none). A repository Orca
+    does not know is registered, then the creation is tried once more.
+    """
+    create = ("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent", *(("--agent", agent) if agent else ()), *base)
     try:
         created = _call_tool(*create)
     except OrcaError as error:
@@ -498,35 +502,91 @@ def _create_worktree(repo: Path, name: str, base: list[str]) -> str:
     path = worktree.get("path") if isinstance(worktree, dict) else None
     if not isinstance(path, str) or not path:
         raise OrcaError("the worktree create answer has no worktree path")
-    return path
+    terminal = result.get("agentTerminalHandle") if isinstance(result, dict) else None
+    return path, terminal if isinstance(terminal, str) and terminal else None
+
+
+AGENT_READY_TIMEOUT_S = 90.0  # how long to wait for a new worktree's agent to show an empty prompt
+AGENT_READY_POLL_S = 1.0      # pause between screen reads while waiting
+
+
+def _wait_agent_ready(terminal: str, worktree: str, timeout_s: float | None = None) -> None:
+    """Poll an agent terminal until its prompt is empty and idle, so the dispatch is typed into a ready prompt.
+
+    Raises OrcaError, without dispatching, when the agent shows the folder trust dialog or is not ready in time: text
+    typed into the trust dialog ends in Enter, which picks `No, exit`, and the agent quits (`outcome_unknown`).
+    Answering the dialog is the user's decision, so the harness never picks `Yes` itself.
+    """
+    timeout_s = AGENT_READY_TIMEOUT_S if timeout_s is None else timeout_s
+    lines: list[str] = []
+    deadline = time.monotonic() + timeout_s
+    while True:
+        screen = screen_of(terminal)
+        lines = screen.splitlines()
+        if _trust_dialog(screen):
+            raise OrcaError(
+                f"the agent in worktree {worktree} is asking whether to trust this folder, so no task was dispatched. "
+                "Open Claude Code once in the original repository folder (or a parent folder), choose "
+                "'Yes, I trust this folder', then start the worker again")
+        if _composer_idle(screen):
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(AGENT_READY_POLL_S)
+    tail = "\n".join(lines[-20:])
+    raise OrcaError(f"the agent in worktree {worktree} was not ready for input after {timeout_s:g}s, so no task was dispatched. "
+                    f"Last screen lines:\n{tail}")
+
+
+def _trust_dialog(screen: str) -> bool:
+    """True when the agent shows Claude Code's folder trust dialog (`Quick safety check: ... one you trust?`)."""
+    screen = screen.replace("\xa0", " ")
+    return "Yes, I trust this folder" in screen or "one you trust" in screen
+
+
+def _composer_idle(screen: str) -> bool:
+    """True when the agent shows an empty prompt and is not working, so it is ready for the dispatch.
+
+    Measured on Claude Code 2.1 under Orca on Windows: a ready prompt line is `❯` alone or the `❯ Try "..."`
+    placeholder. A working agent shows a spinner line such as `✶ Ideating… (21s · ...)` or
+    `(running UserPromptSubmit hooks… 3/4 · 0s)`, sometimes with `esc to interrupt`.
+    """
+    if "esc to interrupt" in screen or re.search(r"…\s*\(\d+s|\(running ", screen):
+        return False
+    # The prompt line separates `❯` from the placeholder with a no-break space (U+00A0).
+    lines = [line.replace("\xa0", " ").strip() for line in screen.splitlines()]
+    prompts = [line for line in lines if line.startswith("❯")]
+    return bool(prompts) and all(line == "❯" or line.startswith('❯ Try "') for line in prompts)
 
 
 def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None, *,
-                           repo: Path | None = None, base: str | None = None) -> tuple[Any, str | None]:
-    """Start a worker in a new worktree. Returns the worker-start answer, and the worktree's path when it was created here.
+                           repo: Path | None = None, base: str | None = None) -> tuple[Any, str]:
+    """Start a worker in a new worktree, dispatching only once the agent is ready for input. Returns the worker-start
+    answer and the worktree's path.
 
-    `new-child` makes the worktree a child of the calling terminal's worktree. Orca answers `selector_not_found`
-    when that terminal's workspace is no longer in its catalog (seen when a folder project became a git repository
-    after the terminal opened), and refuses outright when the terminal belongs to a folder project. Then, and whenever
-    `repo` names the repository, the worktree is created from the repository path and the worker is started on it.
-    The worktree is recorded before the worker starts, so the worker's session already finds itself in the ledger.
+    `worker-start --agent` launches the agent and types the dispatch at once. Measured on Orca with Claude Code 2.1 on
+    Windows: the text lands while the agent is still starting and is lost (empty prompt, `outcome_unknown`), and the
+    worker cannot report, because the dispatch capability exists only in that text. So the worktree is created from
+    the repository path with its agent first (`worktree create --agent`), the agent terminal is polled until its
+    prompt is ready, and the task is then dispatched to that terminal (`worker-start --terminal`), which Orca answers
+    with `ready`. If the agent shows the folder trust dialog or never becomes ready, nothing is dispatched and
+    OrcaError is raised. An answer without an agent terminal falls back to `worker-start --agent` on the new worktree.
+    `repo` names the repository; by default it is the one `root` is in. The worktree is recorded before the worker
+    starts, so the worker's session already finds itself in the ledger.
     """
     if repo is None:
-        try:
-            return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, "--display-name", display,
-                         *_base_args(root, base), *_run_args(run)), None
-        except OrcaError as error:
-            if "selector_not_found" not in str(error) and FOLDER_REFUSAL not in str(error):
-                raise
         repo = _repo_path(root)
         if repo is None:
             raise OrcaError("worker-start could not place a new worktree, and this directory is not a git repository Orca can create one from")
         base_args = _base_args(root, base)
     else:
         base_args = _base_args(repo, base)
-    path = _create_worktree(repo, name, base_args)
+    path, terminal = _create_worktree(repo, name, base_args, agent)
     record_worker(root, worktree=path, task_id=task_id, dispatch="")
-    return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", *_run_args(run)), path
+    if terminal is None:
+        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
+    _wait_agent_ready(terminal, path)
+    return _call("worker-start", "--task", task_id, "--terminal", terminal, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
 
 
 def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli", title: str | None = None,
