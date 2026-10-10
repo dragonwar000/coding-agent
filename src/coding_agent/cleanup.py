@@ -29,6 +29,7 @@ from coding_agent import events, orca_cli
 
 SETTLED = ("completed", "failed")
 AUTO_ENV = "CODING_AGENT_AUTO_CLEAN"
+WINDOWS = os.name == "nt"
 
 
 @dataclass(frozen=True)
@@ -73,10 +74,59 @@ def _git(cwd: Path, *args: str) -> str | None:
 UNKNOWN = -1
 
 
+# Files the harness itself writes into a worktree (hooks and CLI runtime state), relative to the worktree root. They
+# are not the worker's work, so they never make a worktree dirty. A trailing `/` marks a directory. `.coding-agent/`
+# as a whole is not listed: `.coding-agent/plan.yaml` is written by the coordinator and is real work.
+HARNESS_RUNTIME = (
+    ".coding-agent/events.jsonl",    # events.LOG_FILE
+    ".coding-agent/state/",          # state.py: per-session state, permission-mode
+    ".coding-agent/orca-run",        # orca_cli.RUN_FILE
+    ".coding-agent/links.jsonl",     # orca_cli / orca.py link log
+    ".coding-agent/workers.jsonl",   # orca_cli.FOLDER_LEDGER
+    ".coding-agent/plan.json",       # plan.LEDGER: plan id -> Orca task id
+    ".coding-agent/installed.json",  # gate.INSTALLED / project_install record
+    ".coding-agent/backups/",        # project_install package backups
+)
+
+
+def _harness_owned(path: str) -> bool:
+    return any(path.startswith(item) if item.endswith("/") else path == item for item in HARNESS_RUNTIME)
+
+
+def _status_args(windows: bool) -> list[str]:
+    """`git status` arguments for `_dirty`.
+
+    On Windows, mode-only changes are ignored (`core.fileMode=false`): a repo cloned by WSL/Linux git keeps
+    `core.fileMode=true` and files stored as 100755, NTFS has no executable bit, so Git for Windows reads them as
+    100644 and reports every such file modified with no content change. On Linux/macOS a `chmod +x` that is not
+    committed is real work, so the repo's setting stands. `-uall` lists untracked files one by one (not a collapsed
+    `.coding-agent/` directory) so harness runtime files can be told apart; `-z` keeps names with spaces exact.
+    """
+    return [*(["-c", "core.fileMode=false"] if windows else []), "status", "--porcelain", "-z", "--untracked-files=all"]
+
+
 def _dirty(worktree: Path) -> int:
-    """Changed or untracked files in the worktree, or UNKNOWN when git cannot say."""
-    out = _git(worktree, "status", "--porcelain")
-    return UNKNOWN if out is None else len([line for line in out.splitlines() if line.strip()])
+    """Changed or untracked files in the worktree, or UNKNOWN when git cannot say.
+
+    Not counted: mode-only changes on Windows (see `_status_args`) and the harness's own runtime files
+    (`HARNESS_RUNTIME`), which hooks write into every worker's worktree whether or not the worker did anything.
+    """
+    out = _git(worktree, *_status_args(WINDOWS))
+    if out is None:
+        return UNKNOWN
+    fields = out.split("\0")
+    count = 0
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        if entry[0] in "RC":
+            index += 1  # the next field is the rename/copy source
+        if not _harness_owned(entry[3:]):
+            count += 1
+    return count
 
 
 def _unmerged(root: Path, worktree: Path, base: str) -> int:

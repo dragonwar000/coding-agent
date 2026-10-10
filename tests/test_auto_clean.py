@@ -99,6 +99,59 @@ def test_uncommitted_file_is_kept(repo: Path, orca: dict) -> None:
     assert orca["removed"] == []
 
 
+def _executable_on_disk_lost(repo: Path, tree: Path) -> None:
+    """A file committed as 100755 whose checkout has no executable bit, as NTFS shows it to Git for Windows."""
+    _git(repo, "config", "core.fileMode", "true")
+    (tree / "run.sh").write_text("echo hi\n", encoding="utf-8")
+    _git(tree, "add", "run.sh")
+    _git(tree, "update-index", "--chmod=+x", "run.sh")
+    _git(tree, "commit", "-q", "-m", "run.sh")
+    _git(repo, "merge", "-q", tree.name)
+    (tree / "run.sh").chmod(0o644)  # no-op on Windows, where the bit never reaches the disk
+
+
+@pytest.mark.parametrize("windows", [True, False])
+def test_mode_only_change_counts_only_off_windows(repo: Path, orca: dict, monkeypatch: pytest.MonkeyPatch, windows: bool) -> None:
+    tree = _worker(repo, "w1", "task_1", orca)
+    _executable_on_disk_lost(repo, tree)
+    monkeypatch.setattr(cleanup, "WINDOWS", windows)
+
+    if windows:
+        assert cleanup._dirty(tree) == 0
+        assert [outcome for _item, outcome in cleanup.auto_clean(repo)] == ["removed"]
+    else:
+        assert cleanup._dirty(tree) == 1
+        assert cleanup.auto_clean(repo) == []
+
+
+def test_status_args_ignore_file_mode_only_on_windows() -> None:
+    assert cleanup._status_args(True)[:2] == ["-c", "core.fileMode=false"]
+    assert "core.fileMode=false" not in cleanup._status_args(False)
+
+
+def test_harness_runtime_files_are_not_work(repo: Path, orca: dict) -> None:
+    tree = _worker(repo, "w1", "task_1", orca)
+    (tree / ".coding-agent" / "state").mkdir(parents=True)
+    (tree / ".coding-agent" / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    (tree / ".coding-agent" / "state" / "x").write_text("{}\n", encoding="utf-8")
+    (tree / ".coding-agent" / "state" / "a session.json").write_text("{}\n", encoding="utf-8")
+
+    assert cleanup._dirty(tree) == 0
+    assert [outcome for _item, outcome in cleanup.auto_clean(repo)] == ["removed"]
+
+
+@pytest.mark.parametrize("path", [".coding-agent/plan.yaml", "notes.txt", "with space.txt"])
+def test_other_uncommitted_files_beside_runtime_files_are_work(repo: Path, orca: dict, path: str) -> None:
+    tree = _worker(repo, "w1", "task_1", orca)
+    (tree / ".coding-agent").mkdir()
+    (tree / ".coding-agent" / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    (tree / path).write_text("tasks: []\n", encoding="utf-8")
+
+    assert cleanup._dirty(tree) == 1
+    assert cleanup.auto_clean(repo) == []
+    assert orca["removed"] == []
+
+
 def test_running_task_is_not_a_candidate(repo: Path, orca: dict) -> None:
     _worker(repo, "w1", "task_1", orca, status="running")
     assert cleanup.auto_clean(repo) == []
