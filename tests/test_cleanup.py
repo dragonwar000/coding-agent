@@ -60,7 +60,7 @@ def test_a_clean_merged_worktree_is_removed_and_stops_being_a_worker(ready_repo,
     assert [(item.task_id, outcome) for item, outcome in results] == [(task_id, "removed")]
     assert not path.exists()
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
-    assert state["released"] == ["ctx_tidy"] and state["removed_worktrees"] == [{"path": str(path.resolve()), "force": False}]
+    assert state["released"] == ["ctx_tidy"] and state["removed_worktrees"] == [{"path": str(path.resolve()), "force": True}]
     assert cleanup.candidates(ready_repo) == [] and orca_cli.worker_worktrees(ready_repo) == set()
     log = [json.loads(line) for line in events.log_path(ready_repo).read_text(encoding="utf-8").splitlines()]
     assert log[-1]["kind"] == "worktree-removed" and log[-1]["detail"]["discarded"] is False

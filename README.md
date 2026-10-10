@@ -339,6 +339,11 @@ coordinator) và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-
 `auto-clean: removed <tên> (<task>)` và ghi event `worktree-auto-removed`. Lỗi khi tự dọn chỉ là cảnh báo, không đổi mã thoát
 của lệnh. Đặt `CODING_AGENT_AUTO_CLEAN=off` để tắt.
 
+Worktree đã kiểm là an toàn được xoá với force: file runtime của harness (`.coding-agent/`) và nhiễu bit thực thi trên Windows
+làm `git worktree remove` từ chối dù không còn việc gì trong đó. Thư mục rỗng không còn là worktree git (sót lại khi Orca dừng
+giữa chừng sau khi git đã xoá worktree) coi như đã mất: bản ghi được đánh dấu đã xoá và thư mục rỗng bị xoá; thư mục còn file
+thì để nguyên.
+
 Worker đã báo xong mà nhánh chưa gộp thì worktree được giữ để coordinator còn kiểm; gộp nhánh vào HEAD xong thì lần chạy sau
 tự xoá nó. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit.
 

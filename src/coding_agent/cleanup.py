@@ -142,6 +142,15 @@ def _unmerged(root: Path, worktree: Path, base: str) -> int:
     return int(out.strip()) if out and out.strip().isdigit() else UNKNOWN
 
 
+def _empty_dir(path: Path) -> bool:
+    """True for a directory with nothing in it. It is not a git worktree (that holds at least its `.git` file): it is
+    what is left when Orca stopped after git removed the worktree, and counts as already gone."""
+    try:
+        return not any(path.iterdir())
+    except OSError:
+        return False
+
+
 def candidates(root: Path, run: str | None = None) -> list[Candidate]:
     """Worker worktrees whose task settled, oldest first, with what removing each one would lose."""
     tasks = {str(task.get("id")): task for task in orca_cli.list_tasks(run)}
@@ -151,7 +160,7 @@ def candidates(root: Path, run: str | None = None) -> list[Candidate]:
         if task is None or task.get("status") not in SETTLED:
             continue
         path = Path(record["worktree"])
-        exists = path.is_dir()
+        exists = path.is_dir() and not _empty_dir(path)
         found.append(Candidate(
             task_id=record["task_id"],
             dispatch=record["dispatch"],
@@ -180,7 +189,11 @@ def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session
                 except orca_cli.OrcaError:
                     pass  # already released, or Orca no longer tracks it; the worktree removal below is what matters
             if item.exists:
-                orca_cli.remove_worktree(item.worktree, force=discard and not item.safe)
+                # A safe worktree is removed with force too: `_dirty`/`_unmerged` already found no work in it, and
+                # what is left (harness runtime files, Windows mode-only noise) makes `git worktree remove` refuse.
+                orca_cli.remove_worktree(item.worktree, force=item.safe or discard)
+            else:
+                _remove_empty_dir(Path(item.worktree))
         except orca_cli.OrcaError as error:
             results.append((item, f"failed: {str(error)[:200]}"))
             continue
@@ -189,6 +202,14 @@ def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session
                       detail={"task_id": item.task_id, "worktree": item.worktree, "discarded": discard and not item.safe})
         results.append((item, "removed"))
     return results
+
+
+def _remove_empty_dir(path: Path) -> None:
+    """Delete the empty directory a half-finished removal left behind; anything else is left alone."""
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass  # gone already, or not empty
 
 
 def auto_enabled() -> bool:
@@ -200,10 +221,11 @@ def auto_clean(root: Path, run: str | None = None, *, session: str = "cli",
                found: list[Candidate] | None = None) -> list[tuple[Candidate, str]]:
     """Remove every settled worker worktree that loses no work, without asking. Returns `clean`'s (candidate, outcome).
 
-    Removed: safe candidates, and records whose directory no longer exists (only marked removed). Never touched:
-    worktrees with unmerged commits, uncommitted files, or a state git cannot report. Never forced. An Orca error on
-    one worktree is reported as its `failed:` outcome and does not stop the others; an error listing the tasks raises
-    `orca_cli.OrcaError`. `found` reuses candidates the caller already listed.
+    Removed: safe candidates (with force, see `clean`), and records whose directory no longer exists or is empty
+    (only marked removed, the empty directory deleted). Never touched: worktrees with unmerged commits, uncommitted
+    files, or a state git cannot report. An Orca error on one worktree is reported as its `failed:` outcome and does
+    not stop the others; an error listing the tasks raises `orca_cli.OrcaError`. `found` reuses candidates the caller
+    already listed.
 
     Limits: only tasks Orca lists for `run` are seen. With `run` None that is the Run the CLI is bound to
     (`CODING_AGENT_ORCA_RUN`, or the stored or bound Run); `orca orchestration task-list` has no option to list

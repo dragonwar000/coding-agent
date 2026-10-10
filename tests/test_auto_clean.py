@@ -75,7 +75,7 @@ def test_merged_clean_worktree_is_removed(repo: Path, orca: dict) -> None:
     results = cleanup.auto_clean(repo)
 
     assert [(item.task_id, outcome) for item, outcome in results] == [("task_1", "removed")]
-    assert orca["removed"] == [(str(tree.resolve()), False)]
+    assert orca["removed"] == [(str(tree.resolve()), True)]
     assert orca_cli.worker_records(repo) == []
     assert [e["kind"] for e in _events(repo)] == ["worktree-auto-removed"]
 
@@ -165,6 +165,44 @@ def test_missing_directory_is_only_marked_removed(repo: Path, orca: dict) -> Non
     assert orca["removed"] == [] and orca_cli.worker_records(repo) == []
 
 
+def test_safe_worktree_with_runtime_files_is_removed_with_force(repo: Path, orca: dict) -> None:
+    tree = _worker(repo, "w1", "task_1", orca)
+    (tree / ".coding-agent").mkdir()
+    (tree / ".coding-agent" / "events.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert [outcome for _item, outcome in cleanup.auto_clean(repo)] == ["removed"]
+    assert orca["removed"] == [(str(tree.resolve()), True)]
+
+
+def test_worktree_that_is_not_safe_is_not_removed(repo: Path, orca: dict) -> None:
+    tree = _worker(repo, "w1", "task_1", orca)
+    (tree / "draft.txt").write_text("wip\n", encoding="utf-8")
+
+    assert [outcome for _item, outcome in cleanup.clean(repo, cleanup.candidates(repo))] == ["kept: 1 file chưa commit"]
+    assert orca["removed"] == []
+
+
+def test_empty_leftover_directory_is_marked_removed_and_deleted(repo: Path, orca: dict) -> None:
+    tree = _worker(repo, "w1", "task_1", orca)
+    _git(repo, "worktree", "remove", str(tree))
+    tree.mkdir()
+
+    assert [outcome for _item, outcome in cleanup.auto_clean(repo)] == ["removed"]
+    assert orca["removed"] == [] and orca_cli.worker_records(repo) == []
+    assert not tree.exists()
+
+
+def test_leftover_directory_with_files_is_kept(repo: Path, orca: dict) -> None:
+    tree = _worker(repo, "w1", "task_1", orca)
+    _git(repo, "worktree", "remove", str(tree))
+    tree.mkdir()
+    (tree / "notes.txt").write_text("x\n", encoding="utf-8")
+
+    assert cleanup.auto_clean(repo) == []
+    assert orca["removed"] == [] and len(orca_cli.worker_records(repo)) == 1
+    assert (tree / "notes.txt").exists()
+
+
 def test_orca_error_on_one_worktree_does_not_stop_the_others(repo: Path, orca: dict, monkeypatch: pytest.MonkeyPatch) -> None:
     first, second = _worker(repo, "w1", "task_1", orca), _worker(repo, "w2", "task_2", orca)
 
@@ -176,7 +214,7 @@ def test_orca_error_on_one_worktree_does_not_stop_the_others(repo: Path, orca: d
     monkeypatch.setattr(orca_cli, "remove_worktree", remove)
     outcomes = {item.task_id: outcome for item, outcome in cleanup.auto_clean(repo)}
     assert outcomes["task_1"].startswith("failed") and outcomes["task_2"] == "removed"
-    assert orca["removed"] == [(str(second.resolve()), False)]
+    assert orca["removed"] == [(str(second.resolve()), True)]
 
 
 def test_auto_clean_off(repo: Path, orca: dict, monkeypatch: pytest.MonkeyPatch) -> None:
