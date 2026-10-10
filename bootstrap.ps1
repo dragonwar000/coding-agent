@@ -20,7 +20,7 @@ param([Parameter(ValueFromRemainingArguments = $true)][string[]]$InstallArgs)
 $ErrorActionPreference = 'Stop'
 
 # The code commit this script installs. Kept equal to PINNED_REF in bootstrap.sh.
-$PinnedRef = '1fb4b257f054a6ee744a477909d5e7f7979bc465'
+$PinnedRef = 'af1d024f430237e4a870e4420a6d6e30d3825124'
 $Owner = if ($env:CODING_AGENT_OWNER) { $env:CODING_AGENT_OWNER } else { 'dragonwar000' }
 $Repo = if ($env:CODING_AGENT_REPO) { $env:CODING_AGENT_REPO } else { 'coding-agent' }
 $Ref = if ($env:CODING_AGENT_REF) { $env:CODING_AGENT_REF } else { $PinnedRef }
