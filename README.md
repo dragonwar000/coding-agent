@@ -281,10 +281,10 @@ tasks:
     base: develop       # tuỳ chọn; mặc định là HEAD hiện tại của repo đó
 ```
 
-- `--repo` / `repo:` bỏ qua `new-child`: coding-agent chạy `orca worktree create --repo path:<repo> --no-parent`, rồi
-  `worker-start --worktree path:<worktree>`. Orca chưa biết repo (`repo_not_found`) thì nó chạy `orca repo add` và thử lại một lần.
-- Root là repo git và không có `--repo`: như cũ (`new-child`). Nếu Orca từ chối vì terminal gọi thuộc folder project, worktree
-  được tạo từ chính repo của root theo cách trên.
+- Worktree luôn được tạo bằng `orca worktree create --repo path:<repo> --no-parent` (không dùng `new-child`), rồi giao việc bằng
+  `worker-start` vào terminal của agent trong worktree đó (xem "Khởi động worker"). Orca chưa biết repo (`repo_not_found`) thì
+  coding-agent chạy `orca repo add` và thử lại một lần.
+- Root là repo git và không có `--repo`: repo đích là chính repo của root.
 - Root không phải repo git mà thiếu `--repo`: lệnh dừng **trước khi tạo task** và liệt kê các repo git tìm thấy dưới root
   (sâu tối đa 3 cấp, bỏ thư mục ẩn, `node_modules`, `venv`, `build`, `dist`). `plan-apply` kiểm mọi node trước khi tạo task nào.
 - Worker được ghi ở hai nơi: danh sách của repo đích (để session trong worktree là worker) và danh sách của root (để bảng việc,
@@ -315,22 +315,49 @@ dispatch còn active. coding-agent xử lý như sau:
   bị từ chối. Coordinator kiểm kết quả trước; lệnh `worker-abandon` dispatch còn active rồi gửi `completed` theo quy tắc bằng chứng
   (FR-007). Dispatch đã settled thì không abandon. Bảng việc và `inbox` in gợi ý lệnh này ngay dưới báo cáo `Rejected worker_done`.
 
+## Khởi động worker
+
+- **Chờ agent sẵn sàng:** `worker-start --agent` gõ đề bài ngay khi agent còn đang khởi động, và đề bài bị mất. Vì vậy
+  coding-agent tạo worktree kèm agent trước, đọc màn hình terminal của agent tới khi prompt trống (tối đa 90 giây), rồi mới
+  giao việc vào đúng terminal đó (`worker-start --terminal`). Thấy hộp thoại folder trust hoặc hộp xác nhận Bypass Permissions,
+  hay hết giờ, thì không giao gì và báo lỗi; harness không bao giờ tự trả lời các hộp thoại đó trên màn hình.
+- **Chung folder trust với coordinator:** worker Claude không dừng ở hộp `Quick safety check`. Worktree được tạo không kèm
+  agent, thư mục repo chính và worktree được đánh dấu tin cậy trong config của Claude Code (`~/.claude.json`, hoặc theo
+  `CLAUDE_CONFIG_DIR`), rồi agent mới được mở trong terminal riêng. Chỉ ghi khi thư mục của coordinator đã được tin cậy; config
+  không đọc được thì không ghi gì. Event `folder-trust` (`shared` / `skipped`). Tắt bằng `CODING_AGENT_SHARE_TRUST=off`.
+- **Cùng permission mode với coordinator:** hook ghi `permission_mode` của phiên coordinator vào
+  `.coding-agent/state/permission-mode`. Worker Claude chạy `claude --permission-mode <mode>` theo thứ tự: `--permission-mode`
+  của `worker-start` / `delegate` / `plan-next`, rồi `CODING_AGENT_WORKER_PERMISSION_MODE`, rồi mode đã ghi (tìm ở `--root`,
+  `$CLAUDE_PROJECT_DIR`, thư mục làm việc, rồi các thư mục cha của `--root`). Agent khác (codex) giữ cách khởi động của nó và
+  việc bỏ qua được ghi event `permission-mode`.
+
 ## Dọn worktree của worker
 
-Khi task của worker đã `completed` hoặc `failed`, bảng việc của coordinator liệt kê worktree đó ở mục "chờ dọn". Coordinator
-hỏi người dùng, rồi chạy lệnh xoá. Hook `coordinator-guard` trả quyết định `ask` cho lệnh này, nên **Claude Code tự hỏi
-người dùng xác nhận** trước khi lệnh chạy, ở mọi mode trừ `off`.
+Khi task của worker đã `completed` hoặc `failed` và worktree **sạch, đã gộp** (không file chưa commit, không commit nào mà HEAD
+của coordinator chưa có), coding-agent **tự xoá** nó, không hỏi ai. Việc tự dọn chạy khi dựng bảng việc (mỗi prompt của
+coordinator) và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`; mỗi worktree xoá được in một dòng
+`auto-clean: removed <tên> (<task>)` và ghi event `worktree-auto-removed`. Lỗi khi tự dọn chỉ là cảnh báo, không đổi mã thoát
+của lệnh. Đặt `CODING_AGENT_AUTO_CLEAN=off` để tắt.
+
+Worker đã báo xong mà nhánh chưa gộp thì worktree được giữ để coordinator còn kiểm; gộp nhánh vào HEAD xong thì lần chạy sau
+tự xoá nó. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit.
 
 ```sh
-python3 -m coding_agent.cli worktree-list                          # worktree chờ dọn và thứ sẽ mất nếu xoá
-python3 -m coding_agent.cli worktree-clean --task-id <id> --yes    # xoá một worktree
-python3 -m coding_agent.cli worktree-clean --all --yes             # xoá mọi worktree đã xong
+python3 -m coding_agent.cli worktree-list                                   # tự dọn trước, rồi liệt kê worktree còn việc
+python3 -m coding_agent.cli worktree-clean --task-id <id>                   # xoá một worktree sạch, đã gộp (khi tự dọn bị tắt)
+python3 -m coding_agent.cli worktree-clean --all                            # xoá mọi worktree sạch, đã gộp; giữ phần còn lại
+python3 -m coding_agent.cli worktree-clean --task-id <id> --discard --yes   # bỏ cả việc chưa gộp (mất code)
 ```
 
-- Thiếu `--yes` thì lệnh từ chối. Cờ này là lớp chặn dự phòng khi hook chưa được cài.
-- Worktree còn file chưa commit, hoặc còn commit của worker mà nhánh của coordinator chưa có, được **giữ lại**. Gộp trước
-  rồi chạy lại. `--discard` xoá cả những worktree đó và làm mất phần việc ấy.
-- Nếu git không so sánh được, worktree cũng được giữ.
+- Không cần `--yes` để xoá worktree sạch, đã gộp. Chỉ `--discard` mới cần `--yes`: thiếu thì lệnh từ chối. Hook
+  `coordinator-guard` trả `ask` cho `worktree-clean --discard`, nên Claude Code hỏi người dùng xác nhận trước khi lệnh chạy, ở
+  mọi mode trừ `off` và trừ khi phiên đang `bypassPermissions`. Coordinator vẫn phải hỏi người dùng trong hội thoại trước.
+- Worktree còn file chưa commit, hoặc còn commit của worker mà nhánh của coordinator chưa có, được **giữ lại**. Với
+  `--task-id` thì lệnh thoát 1; với `--all` thì đó là chủ ý và lệnh thoát 0. Nếu git không so sánh được, worktree cũng được giữ.
+- File harness tự ghi vào worktree (`.coding-agent/events.jsonl`, `.coding-agent/state/`, `orca-run`, `links.jsonl`,
+  `workers.jsonl`, `plan.json`, `installed.json`, `backups/`) không tính là việc; `.coding-agent/plan.yaml` thì có. Trên Windows,
+  thay đổi chỉ ở bit thực thi (repo clone bằng git của WSL/Linux) cũng không tính.
+- Tự dọn chỉ thấy task của Run đang dùng (`CODING_AGENT_ORCA_RUN`, hoặc Run đã lưu); worktree của task thuộc Run cũ phải xoá tay.
 - Xoá gồm: nhả terminal của worker, `orca worktree rm` (xoá cả nhánh), và ghi `removed` vào sổ worker.
 
 Worker bắt đầu từ commit hiện tại của coordinator (`--base-branch`). Không truyền thì Orca tạo worktree từ nhánh gốc mặc định
