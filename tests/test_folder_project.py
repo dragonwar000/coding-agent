@@ -19,6 +19,8 @@ def fake_orca(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CODING_AGENT_ORCA_RUN", "run_test")
     monkeypatch.setenv("FAKE_ORCA_REAL_WORKTREE", "1")
     monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
+    # A Claude worker that shares folder trust gets a terminal of its own; these tests follow `worktree create --agent`.
+    monkeypatch.setenv("CODING_AGENT_SHARE_TRUST", "off")
     return state
 
 

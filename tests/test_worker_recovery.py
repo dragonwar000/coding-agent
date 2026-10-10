@@ -46,9 +46,9 @@ def placed_worktree(repo: Path, tmp_path: Path, name: str) -> Path:
 
 
 def event_kinds(repo: Path) -> list[dict]:
-    # The permission mode each worker started in is logged too; these tests follow the delegation itself.
+    # The permission mode each worker started in and its folder trust are logged too; these tests follow the delegation itself.
     logged = [json.loads(line) for line in events.log_path(repo).read_text(encoding="utf-8").splitlines()]
-    return [entry for entry in logged if entry["guard"] != "permission-mode"]
+    return [entry for entry in logged if entry["guard"] not in ("permission-mode", "folder-trust")]
 
 
 # --- _run_orca --------------------------------------------------------------------------------------------------------

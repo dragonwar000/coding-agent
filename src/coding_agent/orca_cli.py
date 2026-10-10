@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from coding_agent import events, orca, state
+from coding_agent import events, orca, state, trust
 
 BIN_ENV = "CODING_AGENT_ORCA"
 RUN_ENV = "CODING_AGENT_ORCA_RUN"
@@ -511,6 +511,19 @@ AGENT_READY_TIMEOUT_S = 90.0  # how long to wait for a new worktree's agent to s
 AGENT_READY_POLL_S = 1.0      # pause between screen reads while waiting
 
 
+def _share_trust(root: Path, paths: list[Path], session: str) -> str | None:
+    """Share the coordinator's folder trust with `paths`: None when they are trusted now, otherwise why they are not."""
+    try:
+        trust.share_trust(root, paths, session)
+    except trust.TrustError as error:
+        return str(error)
+    if not trust.sharing_enabled():
+        return f"{trust.SHARE_ENV}=off"
+    if all(trust.is_trusted(path) for path in paths):
+        return None
+    return f"the coordinator folder {trust.config_key(root)} is not trusted in Claude Code"
+
+
 def terminal_handle_of(answer: Any) -> str | None:
     """The handle in a `terminal create` answer (`result.terminal.handle`), or None."""
     result = answer.get("result") if isinstance(answer, dict) else None
@@ -519,12 +532,17 @@ def terminal_handle_of(answer: Any) -> str | None:
     return handle if isinstance(handle, str) and handle else None
 
 
-def _wait_agent_ready(terminal: str, worktree: str, timeout_s: float | None = None) -> None:
+def _wait_agent_ready(terminal: str, worktree: str, timeout_s: float | None = None, trust_note: str | None = None) -> None:
     """Poll an agent terminal until its prompt is empty and idle, so the dispatch is typed into a ready prompt.
 
     Raises OrcaError, without dispatching, when the agent shows the folder trust dialog or is not ready in time: text
     typed into the trust dialog ends in Enter, which picks `No, exit`, and the agent quits (`outcome_unknown`).
-    Answering the dialog is the user's decision, so the harness never picks `Yes` itself.
+    The harness never answers the dialog on screen. The user decided on 2026-10-10 that a worker shares the folder
+    trust of the coordinator session instead: `_start_in_new_worktree` writes it into Claude Code's config before the
+    agent starts, and only while the coordinator's folder is trusted, so a worker is never trusted where the
+    coordinator is not. The dialog can still appear when sharing is off (`CODING_AGENT_SHARE_TRUST=off`), the
+    coordinator's folder is not trusted, or the config could not be written; `trust_note` says which, and is added to
+    the error.
     """
     timeout_s = AGENT_READY_TIMEOUT_S if timeout_s is None else timeout_s
     lines: list[str] = []
@@ -536,7 +554,8 @@ def _wait_agent_ready(terminal: str, worktree: str, timeout_s: float | None = No
             raise OrcaError(
                 f"the agent in worktree {worktree} is asking whether to trust this folder, so no task was dispatched. "
                 "Open Claude Code once in the original repository folder (or a parent folder), choose "
-                "'Yes, I trust this folder', then start the worker again")
+                "'Yes, I trust this folder', then start the worker again"
+                + (f" (folder trust was not shared: {trust_note})" if trust_note else ""))
         if _bypass_dialog(screen):
             raise OrcaError(
                 f"the agent in worktree {worktree} is asking to confirm Bypass Permissions mode, so no task was dispatched. "
@@ -598,7 +617,8 @@ def worker_permission_mode(root: Path, explicit: str | None = None, session: str
 
 
 def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None, *,
-                           repo: Path | None = None, base: str | None = None, permission_mode: str | None = None) -> tuple[Any, str]:
+                           repo: Path | None = None, base: str | None = None, permission_mode: str | None = None,
+                           session: str = "cli") -> tuple[Any, str]:
     """Start a worker in a new worktree, dispatching only once the agent is ready for input. Returns the worker-start
     answer and the worktree's path.
 
@@ -612,11 +632,15 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     `repo` names the repository; by default it is the one `root` is in. The worktree is recorded before the worker
     starts, so the worker's session already finds itself in the ledger.
 
-    With a `permission_mode` (the caller passes one only for Claude and only when it is not `default`),
-    `worktree create --agent` cannot pass the flag, so the worktree is created without an agent and the agent runs in
-    a terminal of its own (`terminal create --command "claude --permission-mode MODE"`, handle at
-    `result.terminal.handle`); readiness and dispatch are the same. Orca still opens its plain startup shell in that
-    worktree, which stays idle.
+    A Claude worker shares the coordinator's folder trust (`trust.share_trust`) so it never stops at the `Quick safety
+    check` dialog: the worktree is created without an agent (`worktree create` with no `--agent`) to learn its path,
+    the main repository folder and the worktree are marked trusted in Claude Code's config, and only then is the agent
+    started in a terminal of its own (`terminal create --command "claude"`, or `"claude --permission-mode MODE"` with a
+    `permission_mode`, which the caller passes only for Claude and only when it is not `default`; handle at
+    `result.terminal.handle`). Orca still opens its plain startup shell in that worktree, which stays idle. Trust is
+    written only while the coordinator's folder is trusted itself; when it is not, nothing is written and the dialog is
+    detected and reported as before. Another agent, or `CODING_AGENT_SHARE_TRUST=off` without a `permission_mode`,
+    keeps `worktree create --agent`; the skipped trust step is logged (`guard=folder-trust kind=skipped`).
 
     Measured on 2026-10-10 with Orca and Claude Code 2.1.296 on Windows: `claude --permission-mode bypassPermissions`
     in a new worktree still shows the folder trust dialog when that folder is not trusted yet; the trust prompt is per
@@ -624,6 +648,11 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     the prompt came up ready with `bypass permissions on` in the footer (this user had accepted bypass mode before).
     A host that does show the bypass confirmation is detected like the trust dialog and nothing is dispatched; the
     harness never accepts it for the user.
+
+    Measured again on 2026-10-10 after trust sharing, same setup, with no task dispatched: the coordinator folder was
+    trusted, the harness wrote only the new worktree's entry into `~/.claude.json` (the repository entry was already
+    `true`; every other project entry was left as it was), logged `guard=folder-trust kind=shared`, and `claude` came
+    up at a ready prompt with no `Quick safety check` dialog.
     """
     if repo is None:
         repo = _repo_path(root)
@@ -632,16 +661,19 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
         base_args = _base_args(root, base)
     else:
         base_args = _base_args(repo, base)
-    path, terminal = _create_worktree(repo, name, base_args, None if permission_mode else agent)
+    claude = agent == "claude"
+    separate = bool(permission_mode) or (claude and trust.sharing_enabled())
+    path, terminal = _create_worktree(repo, name, base_args, None if separate else agent)
     record_worker(root, worktree=path, task_id=task_id, dispatch="")
-    if permission_mode:
-        terminal = terminal_handle_of(_call_tool("terminal", "create", "--worktree", f"path:{path}", "--title", display,
-                                                 "--command", f"{agent} --permission-mode {permission_mode}"))
+    trust_note = _share_trust(root, [repo, Path(path)], session) if claude else None
+    if separate:
+        command = f"{agent} --permission-mode {permission_mode}" if permission_mode else agent
+        terminal = terminal_handle_of(_call_tool("terminal", "create", "--worktree", f"path:{path}", "--title", display, "--command", command))
         if terminal is None:
             raise OrcaError(f"the terminal create answer for worktree {path} has no terminal handle, so no task was dispatched")
     if terminal is None:
         return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
-    _wait_agent_ready(terminal, path)
+    _wait_agent_ready(terminal, path, trust_note=trust_note)
     return _call("worker-start", "--task", task_id, "--terminal", terminal, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
 
 
@@ -666,7 +698,7 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
                       detail={"task_id": task_id, "agent": agent, "permission_mode": mode, "source": source,
                               "reason": "--permission-mode is a Claude Code flag; this agent starts with its own default"})
     answer, created = _start_in_new_worktree(root, task_id, agent, name, (title or name)[:DISPLAY_LIMIT], run, repo=target, base=base,
-                                             permission_mode=applied)
+                                             permission_mode=applied, session=session)
     dispatch = dispatch_id_of(answer)
     worktree = created or worktree_of(answer) or find_worktree(target or root, name)
     if worktree is not None:

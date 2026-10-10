@@ -14,7 +14,9 @@ and `worker-abandon` read and change the dispatch records that `worker-start` cr
 folder project (the harness no longer asks for `new-child`). `FAKE_ORCA_UNKNOWN_REPO=1` makes `worktree create` answer `repo_not_found` until `repo add` registered
 the repository. `FAKE_ORCA_REAL_WORKTREE=1` makes `worktree create` add a real git worktree of the named repository.
 `terminal create` records `--worktree`, `--title`, and `--command` and answers `result.terminal.handle`.
-`FAKE_ORCA_SCREEN` replaces what `terminal read` shows (lines separated by `\n`).
+`FAKE_ORCA_SCREEN` replaces what `terminal read` shows (lines separated by `\\n`). With `$CLAUDE_CONFIG_DIR` set,
+`worktree create` and `terminal create` copy `.claude.json` as it is at that moment to `$FAKE_ORCA_STATE.<word>-create.json`,
+so a test can see what was trusted when each call came.
 """
 
 import json
@@ -40,6 +42,9 @@ def main(argv: list[str]) -> int:
         return 3
     state_path = Path(os.environ["FAKE_ORCA_STATE"])
     data = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {"tasks": {}}
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", "")) / ".claude.json"
+    if argv[1:2] == ["create"] and os.environ.get("CLAUDE_CONFIG_DIR") and config.exists():
+        Path(f"{state_path}.{argv[0]}-create.json").write_text(config.read_text(encoding="utf-8"), encoding="utf-8")
     tasks = data["tasks"]
     if argv[:2] == ["worktree", "create"]:
         options = _options(argv[2:])

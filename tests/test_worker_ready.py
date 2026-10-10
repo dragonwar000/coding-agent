@@ -97,6 +97,7 @@ def fake(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         monkeypatch.setattr(orca_cli, "_repo_path", lambda root: tmp_path)
         monkeypatch.setattr(orca_cli, "_base_args", lambda root, base=None: [])
         monkeypatch.setattr(orca_cli, "AGENT_READY_POLL_S", 0)
+        monkeypatch.setenv("CODING_AGENT_SHARE_TRUST", "off")  # a Claude worker sharing folder trust gets its own terminal
         return orca
     return install
 

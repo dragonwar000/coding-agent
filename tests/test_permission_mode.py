@@ -140,7 +140,8 @@ def test_session_mode_reaches_the_worker(repo: Path, fake_orca: Path) -> None:
 
 
 @pytest.mark.parametrize("mode", [None, "default"])
-def test_default_or_no_mode_keeps_worktree_create_agent(repo: Path, fake_orca: Path, mode: str | None) -> None:
+def test_default_or_no_mode_keeps_worktree_create_agent(repo: Path, fake_orca: Path, mode: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODING_AGENT_SHARE_TRUST", "off")  # with sharing on, a Claude worker always gets its own terminal
     dispatch = orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x", permission_mode=mode)
     orca = _orca(fake_orca)
     assert orca["created_worktrees"][0]["agent"] == "claude"
