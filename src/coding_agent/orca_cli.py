@@ -35,10 +35,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from coding_agent import events, orca
+from coding_agent import events, orca, state
 
 BIN_ENV = "CODING_AGENT_ORCA"
 RUN_ENV = "CODING_AGENT_ORCA_RUN"
+PERMISSION_ENV = "CODING_AGENT_WORKER_PERMISSION_MODE"
 TIMEOUT_S = 60
 EXIT_KEY = "_exit"
 
@@ -510,6 +511,14 @@ AGENT_READY_TIMEOUT_S = 90.0  # how long to wait for a new worktree's agent to s
 AGENT_READY_POLL_S = 1.0      # pause between screen reads while waiting
 
 
+def terminal_handle_of(answer: Any) -> str | None:
+    """The handle in a `terminal create` answer (`result.terminal.handle`), or None."""
+    result = answer.get("result") if isinstance(answer, dict) else None
+    terminal = result.get("terminal") if isinstance(result, dict) else None
+    handle = terminal.get("handle") if isinstance(terminal, dict) else None
+    return handle if isinstance(handle, str) and handle else None
+
+
 def _wait_agent_ready(terminal: str, worktree: str, timeout_s: float | None = None) -> None:
     """Poll an agent terminal until its prompt is empty and idle, so the dispatch is typed into a ready prompt.
 
@@ -528,6 +537,11 @@ def _wait_agent_ready(terminal: str, worktree: str, timeout_s: float | None = No
                 f"the agent in worktree {worktree} is asking whether to trust this folder, so no task was dispatched. "
                 "Open Claude Code once in the original repository folder (or a parent folder), choose "
                 "'Yes, I trust this folder', then start the worker again")
+        if _bypass_dialog(screen):
+            raise OrcaError(
+                f"the agent in worktree {worktree} is asking to confirm Bypass Permissions mode, so no task was dispatched. "
+                "Start Claude Code once with --permission-mode bypassPermissions and accept the warning yourself, "
+                "or start the worker with another --permission-mode")
         if _composer_idle(screen):
             return
         if time.monotonic() >= deadline:
@@ -542,6 +556,12 @@ def _trust_dialog(screen: str) -> bool:
     """True when the agent shows Claude Code's folder trust dialog (`Quick safety check: ... one you trust?`)."""
     screen = screen.replace("\xa0", " ")
     return "Yes, I trust this folder" in screen or "one you trust" in screen
+
+
+def _bypass_dialog(screen: str) -> bool:
+    """True when the agent shows Claude Code's Bypass Permissions confirmation (`... Bypass Permissions mode` with `Yes, I accept`)."""
+    screen = screen.replace("\xa0", " ")
+    return "Bypass Permissions mode" in screen and "Yes, I accept" in screen
 
 
 def _composer_idle(screen: str) -> bool:
@@ -559,8 +579,26 @@ def _composer_idle(screen: str) -> bool:
     return bool(prompts) and all(line == "❯" or line.startswith('❯ Try "') for line in prompts)
 
 
+def worker_permission_mode(root: Path, explicit: str | None = None, session: str = "cli") -> tuple[str | None, str]:
+    """The permission mode a worker should start in, and where it came from: `(mode, source)`.
+
+    In order: the `--permission-mode` argument (`cli`), `CODING_AGENT_WORKER_PERMISSION_MODE` (`env`), then the mode the
+    hooks last recorded for a session in this repository (`session`). A value outside the four Claude Code modes is
+    logged and skipped. With nothing usable the answer is `(None, "none")`, and the worker starts as before.
+    """
+    stored = state.load_permission_mode(root).get("permission_mode")
+    for source, value in (("cli", explicit), ("env", os.environ.get(PERMISSION_ENV)), ("session", stored)):
+        if not value:
+            continue
+        if value in state.PERMISSION_MODES:
+            return value, source
+        events.record(root, guard="permission-mode", kind="ignored", mode="enforce", applied=False, session=session,
+                      detail={"permission_mode": str(value)[:80], "source": source})
+    return None, "none"
+
+
 def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None, *,
-                           repo: Path | None = None, base: str | None = None) -> tuple[Any, str]:
+                           repo: Path | None = None, base: str | None = None, permission_mode: str | None = None) -> tuple[Any, str]:
     """Start a worker in a new worktree, dispatching only once the agent is ready for input. Returns the worker-start
     answer and the worktree's path.
 
@@ -573,6 +611,19 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     OrcaError is raised. An answer without an agent terminal falls back to `worker-start --agent` on the new worktree.
     `repo` names the repository; by default it is the one `root` is in. The worktree is recorded before the worker
     starts, so the worker's session already finds itself in the ledger.
+
+    With a `permission_mode` (the caller passes one only for Claude and only when it is not `default`),
+    `worktree create --agent` cannot pass the flag, so the worktree is created without an agent and the agent runs in
+    a terminal of its own (`terminal create --command "claude --permission-mode MODE"`, handle at
+    `result.terminal.handle`); readiness and dispatch are the same. Orca still opens its plain startup shell in that
+    worktree, which stays idle.
+
+    Measured on 2026-10-10 with Orca and Claude Code 2.1.296 on Windows: `claude --permission-mode bypassPermissions`
+    in a new worktree still shows the folder trust dialog when that folder is not trusted yet; the trust prompt is per
+    folder and the mode does not skip it. Once the folder was trusted there was no separate bypass confirmation dialog:
+    the prompt came up ready with `bypass permissions on` in the footer (this user had accepted bypass mode before).
+    A host that does show the bypass confirmation is detected like the trust dialog and nothing is dispatched; the
+    harness never accepts it for the user.
     """
     if repo is None:
         repo = _repo_path(root)
@@ -581,8 +632,13 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
         base_args = _base_args(root, base)
     else:
         base_args = _base_args(repo, base)
-    path, terminal = _create_worktree(repo, name, base_args, agent)
+    path, terminal = _create_worktree(repo, name, base_args, None if permission_mode else agent)
     record_worker(root, worktree=path, task_id=task_id, dispatch="")
+    if permission_mode:
+        terminal = terminal_handle_of(_call_tool("terminal", "create", "--worktree", f"path:{path}", "--title", display,
+                                                 "--command", f"{agent} --permission-mode {permission_mode}"))
+        if terminal is None:
+            raise OrcaError(f"the terminal create answer for worktree {path} has no terminal handle, so no task was dispatched")
     if terminal is None:
         return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
     _wait_agent_ready(terminal, path)
@@ -590,18 +646,27 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
 
 
 def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli", title: str | None = None,
-                 repo: str | Path | None = None, base: str | None = None) -> str:
+                 repo: str | Path | None = None, base: str | None = None, permission_mode: str | None = None) -> str:
     """Start one supervised worker on `task_id` in a new worktree, and return the dispatch id.
 
     The worktree and its branch are named from the task title, and Orca shows the title on the worker's row.
     Without `title`, the title is read from Orca. The worktree is recorded in the workers ledger, which is how a
     session in it is recognised as a worker. `repo` names the repository the worktree is created in (required when
     `root` is outside git); `base` is the ref it starts from, by default the commit that repository has checked out.
+    A Claude worker runs in the permission mode `worker_permission_mode` picks; `default`, no mode, or another agent
+    keeps the agent's own start command (another agent's skip is logged).
     """
     target = target_repo(root, repo)
     title = title if title is not None else _title_of(task_id, run)
     name = worktree_name(title, task_id)
-    answer, created = _start_in_new_worktree(root, task_id, agent, name, (title or name)[:DISPLAY_LIMIT], run, repo=target, base=base)
+    mode, source = worker_permission_mode(root, permission_mode, session)
+    applied = mode if mode is not None and mode != "default" and agent == "claude" else None
+    if mode is not None and mode != "default" and agent != "claude":
+        events.record(root, guard="permission-mode", kind="not-applied", mode="enforce", applied=False, session=session,
+                      detail={"task_id": task_id, "agent": agent, "permission_mode": mode, "source": source,
+                              "reason": "--permission-mode is a Claude Code flag; this agent starts with its own default"})
+    answer, created = _start_in_new_worktree(root, task_id, agent, name, (title or name)[:DISPLAY_LIMIT], run, repo=target, base=base,
+                                             permission_mode=applied)
     dispatch = dispatch_id_of(answer)
     worktree = created or worktree_of(answer) or find_worktree(target or root, name)
     if worktree is not None:
@@ -609,6 +674,9 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
     events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
                   detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree, "name": name,
                           "turn_start": "unobserved" if turn_unobserved(answer) else "observed"})
+    events.record(root, guard="permission-mode", kind="worker-started", mode="enforce", applied=applied is not None, session=session,
+                  detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "permission_mode": applied or "agent-default",
+                          "resolved": mode, "source": source})
     if turn_unobserved(answer):
         kick_worker(root, task_id=task_id, dispatch=dispatch, session=session)
     return dispatch
@@ -804,14 +872,15 @@ def kick_by_hand(root: Path, *, task_id: str, run: str | None = None, session: s
 
 
 def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: str | None = None, session: str = "cli",
-             repo: str | Path | None = None, base: str | None = None) -> tuple[str, str]:
+             repo: str | Path | None = None, base: str | None = None, permission_mode: str | None = None) -> tuple[str, str]:
     """Create a task for this repository and start a worker on it. Returns (task id, dispatch id).
 
     The target repository is resolved first, so a folder project without `repo` fails before any task exists.
     """
     target_repo(root, repo)
     task_id = create_task(root, project=orca.project_name(root), t_id=t_id, spec=spec, title=title, run=run)
-    return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session, title=title, repo=repo, base=base)
+    return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session, title=title, repo=repo, base=base,
+                                 permission_mode=permission_mode)
 
 
 def _reports(answer: Any) -> list[dict[str, Any]]:

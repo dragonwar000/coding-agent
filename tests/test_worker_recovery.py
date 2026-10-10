@@ -46,7 +46,9 @@ def placed_worktree(repo: Path, tmp_path: Path, name: str) -> Path:
 
 
 def event_kinds(repo: Path) -> list[dict]:
-    return [json.loads(line) for line in events.log_path(repo).read_text(encoding="utf-8").splitlines()]
+    # The permission mode each worker started in is logged too; these tests follow the delegation itself.
+    logged = [json.loads(line) for line in events.log_path(repo).read_text(encoding="utf-8").splitlines()]
+    return [entry for entry in logged if entry["guard"] != "permission-mode"]
 
 
 # --- _run_orca --------------------------------------------------------------------------------------------------------

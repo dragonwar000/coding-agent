@@ -129,8 +129,26 @@ def prompt_reset(ctx: Context) -> HookResult:
     # Taken for every role: stop-gate compares against it to tell a turn that changed nothing.
     data["dirty_at_prompt"] = coordinator.dirty_paths(ctx.root)
     data["tree_at_prompt"] = coordinator.tree_fingerprint(ctx.root)
+    _remember_permission_mode(ctx, data)
     state.save(ctx.root, ctx.session, data)
     return HookResult()
+
+
+def _remember_permission_mode(ctx: Context, data: dict[str, Any] | None) -> None:
+    """Keep the session's `permission_mode` from the payload, so the workers it starts run in the same mode.
+
+    The mode goes into `data` (the session state, when given) and into `.coding-agent/state/permission-mode`.
+    A payload without the field (older Claude Code, Codex) records nothing; a value outside the four modes is logged and ignored.
+    """
+    mode = ctx.payload.get("permission_mode")
+    if mode is None:
+        return
+    if mode not in state.PERMISSION_MODES:
+        ctx.note(guard="permission-mode", kind="ignored", applied=False, detail={"permission_mode": str(mode)[:80], "source": "hook-payload"})
+        return
+    if data is not None:
+        data["permission_mode"] = mode
+    state.save_permission_mode(ctx.root, mode, ctx.session)
 
 
 def _verify(commands: tuple[str, ...], cwd: str, timeout: int) -> list[dict[str, Any]]:
@@ -362,6 +380,13 @@ def coordinator_context(ctx: Context) -> HookResult:
     if coordinator.role_for(_cwd(ctx)) != "coordinator" or ctx.manifest is None:
         return HookResult()
     event = str(ctx.payload.get("hook_event_name") or "SessionStart")
+    if event == "SessionStart":
+        data = state.load(ctx.root, ctx.session)
+        _remember_permission_mode(ctx, data)
+        state.save(ctx.root, ctx.session, data)
+    else:
+        # prompt-reset owns the session state on UserPromptSubmit; both hooks may run at once, so only the mode file is written here.
+        _remember_permission_mode(ctx, None)
     board, error = coordinator.read_board(ctx.root)
     text = coordinator.board_context(board, error)
     if event == "SessionStart":

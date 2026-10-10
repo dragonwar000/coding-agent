@@ -10,10 +10,14 @@
 - `claim --task-id ID [--project NAME]`: refuse a task owned by another repository and log the refusal (FR-008).
 - `orca-check --tasks FILE [--strict]`: report `CLAIMED-DONE BUT ABSENT`; `--strict` exits 1 when any is found (SC-002).
 - `status`: this repository's Orca tasks by state, read from the live Orca CLI (FR-014, SC-001).
-- `delegate --title ... --spec ... [--agent claude|codex] [--t-id T-x] [--repo PATH] [--base-branch REF]`: create a task and start an Orca worker on it
+- `delegate --title ... --spec ... [--agent claude|codex] [--t-id T-x] [--repo PATH] [--base-branch REF] [--permission-mode M]`: create a task and start an Orca worker on it
   in its own worktree (coordinator). `--repo` names the git repository the worktree is created in; a root outside git requires it.
 - `board`: the task board the coordinator sees on each prompt.
-- `worker-start --task-id ID [--agent A] [--repo PATH] [--base-branch REF]`: start a worker on an existing task, recorded as a worker worktree.
+- `worker-start --task-id ID [--agent A] [--repo PATH] [--base-branch REF] [--permission-mode M]`: start a worker on an existing task, recorded as a worker worktree.
+  A Claude worker runs in the coordinator session's permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`):
+  `--permission-mode`, else `CODING_AGENT_WORKER_PERMISSION_MODE`, else the mode the hooks last recorded in
+  `.coding-agent/state/permission-mode`. Without one, or for another agent, the worker starts as the agent's default.
+  The mode a worker started in is logged in `.coding-agent/events.jsonl` (`guard: permission-mode`, `kind: worker-started`).
 - `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator.
 - `worker-kick --task-id ID`: record the task's worktree as a worker's and send the kick-off to its terminal, for a worker that never received its task.
 - `worker-settle --task-id ID --basis B [--artifact PATH ...]`: abandon the task's active dispatch and mark it completed, once the coordinator
@@ -23,7 +27,7 @@
   a worktree with uncommitted files or unmerged commits is kept.
 - `inbox [--ack]`: worker reports the coordinator has not handled; `--ack` acknowledges them.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
-- `plan-apply FILE`, `plan-next FILE [--max N]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
+- `plan-apply FILE`, `plan-next FILE [--max N] [--permission-mode M]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
 """
 
 from __future__ import annotations
@@ -85,6 +89,10 @@ def _target_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--base-branch", help="ref the worktree starts from (default: the target repository's HEAD)")
 
 
+def _permission_option(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--permission-mode", help="worker permission mode: default, acceptEdits, plan, bypassPermissions (default: CODING_AGENT_WORKER_PERMISSION_MODE, else the mode the hooks recorded for this repository's session)")
+
+
 def main(argv: list[str] | None = None) -> int:
     utf8_output()
     parser = argparse.ArgumentParser(prog="coding_agent.cli")
@@ -130,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--agent")
     start.add_argument("--run")
     _target_options(start)
+    _permission_option(start)
     adopt = sub.add_parser("worker-adopt", help="record an existing worktree as a worker's")
     adopt.add_argument("--worktree", required=True, type=Path)
     adopt.add_argument("--task-id", default="adopted")
@@ -161,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "plan-next":
             graph.add_argument("--max", type=int, default=2, help="workers to start at most (default 2)")
             graph.add_argument("--agent", help="default agent for nodes that name none")
+            _permission_option(graph)
 
     delegate = sub.add_parser("delegate", help="create a task and start an Orca worker on it")
     delegate.add_argument("--title", required=True)
@@ -169,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     delegate.add_argument("--agent", help="Orca agent id (default: CODING_AGENT_WORKER_AGENT or claude)")
     delegate.add_argument("--run", help="Orca Run id (default: CODING_AGENT_ORCA_RUN or the bound Run)")
     _target_options(delegate)
+    _permission_option(delegate)
 
     check = sub.add_parser("orca-check", help="find tasks that claim completion while an artifact is missing")
     check.add_argument("--tasks", required=True, type=Path)
@@ -187,7 +198,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "worker-start":
             agent = args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude")
             print(json.dumps({"task_id": args.task_id, "dispatch": orca_cli.worker_start(root, task_id=args.task_id, agent=agent, run=args.run,
-                                                                                              repo=args.repo, base=args.base_branch)}))
+                                                                                              repo=args.repo, base=args.base_branch,
+                                                                                              permission_mode=args.permission_mode)}))
             return 0
         if args.command == "worker-adopt":
             if not args.worktree.is_dir():
@@ -241,7 +253,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{'created' if created else 'exists '} {node_id} -> {task_id}")
             elif args.command == "plan-next":
                 agent = args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude")
-                started = plan_graph.dispatch_ready(root, nodes, default_agent=agent, run=args.run, limit=args.max)
+                started = plan_graph.dispatch_ready(root, nodes, default_agent=agent, run=args.run, limit=args.max,
+                                                    permission_mode=args.permission_mode)
                 for node_id, task_id, dispatch in started:
                     print(f"started {node_id} -> {task_id} ({dispatch})")
                 if not started:
@@ -265,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                 run=args.run,
                 repo=args.repo,
                 base=args.base_branch,
+                permission_mode=args.permission_mode,
             )
             print(json.dumps({"task_id": task_id, "dispatch": dispatch}, ensure_ascii=False))
             return 0

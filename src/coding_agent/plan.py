@@ -166,13 +166,14 @@ def ready(nodes: list[Node], state: dict[str, str]) -> list[Node]:
     return [node for node in nodes if state[node.id] in WAITING and all(state[dep] == "completed" for dep in node.deps)]
 
 
-def dispatch_ready(root: Path, nodes: list[Node], *, default_agent: str, run: str | None = None, limit: int = 2) -> list[tuple[str, str, str]]:
+def dispatch_ready(root: Path, nodes: list[Node], *, default_agent: str, run: str | None = None, limit: int = 2,
+                   permission_mode: str | None = None) -> list[tuple[str, str, str]]:
     """Start workers for up to `limit` ready nodes. Returns (plan id, Orca task id, dispatch id) per worker started."""
     mapping = ledger(root)
     started: list[tuple[str, str, str]] = []
     for node in ready(nodes, states(root, nodes, run=run))[:max(limit, 0)]:
         dispatch = orca_cli.worker_start(root, task_id=mapping[node.id], agent=node.agent or default_agent, run=run, title=node.title,
-                                         repo=node.repo, base=node.base)
+                                         repo=node.repo, base=node.base, permission_mode=permission_mode)
         started.append((node.id, mapping[node.id], dispatch))
     return started
 

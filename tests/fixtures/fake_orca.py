@@ -13,6 +13,8 @@ and `worker-abandon` read and change the dispatch records that `worker-start` cr
 `FAKE_ORCA_FOLDER_PROJECT=1` makes `worker-start --worktree new-child` answer the refusal Orca gives a terminal of a
 folder project (the harness no longer asks for `new-child`). `FAKE_ORCA_UNKNOWN_REPO=1` makes `worktree create` answer `repo_not_found` until `repo add` registered
 the repository. `FAKE_ORCA_REAL_WORKTREE=1` makes `worktree create` add a real git worktree of the named repository.
+`terminal create` records `--worktree`, `--title`, and `--command` and answers `result.terminal.handle`.
+`FAKE_ORCA_SCREEN` replaces what `terminal read` shows (lines separated by `\n`).
 """
 
 import json
@@ -87,7 +89,17 @@ def main(argv: list[str]) -> int:
         handle = options.get("--terminal", "")
         sent = [] if os.environ.get("FAKE_ORCA_DEAF") == "1" else [m["text"] for m in data.get("sent", []) if m["terminal"] == handle]
         tail = ["❯ "] + [f"❯ {text}" for text in sent]
+        if "FAKE_ORCA_SCREEN" in os.environ:
+            tail = os.environ["FAKE_ORCA_SCREEN"].split("\n")
         print(json.dumps({"ok": True, "result": {"terminal": {"handle": handle, "status": "running", "tail": tail, "source": "screen"}}}, ensure_ascii=False))
+        return exit_code
+    if argv[:2] == ["terminal", "create"]:
+        options = _options(argv[2:])
+        created = data.setdefault("created_terminals", [])
+        handle = f"term_created_{len(created) + 1}"
+        created.append({"handle": handle, "worktree": options.get("--worktree"), "title": options.get("--title"), "command": options.get("--command")})
+        state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps({"ok": True, "result": {"terminal": {"handle": handle}}}))
         return exit_code
     if argv[:2] == ["terminal", "send"]:
         options = _options(argv[2:])
@@ -181,7 +193,8 @@ def main(argv: list[str]) -> int:
             selector = options.get("--worktree", "")
             worktree = selector[5:] if selector.startswith("path:") else os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
             # A dispatch to an agent terminal runs the agent its worktree was created with.
-            agent = options.get("--agent") or next((w["agent"] for w in data.get("created_worktrees", []) if f"term_wt_{w['name']}" == options.get("--terminal")), None)
+            agent = (options.get("--agent") or next((w["agent"] for w in data.get("created_worktrees", []) if f"term_wt_{w['name']}" == options.get("--terminal")), None)
+                     or next((t["command"].split()[0] for t in data.get("created_terminals", []) if t["handle"] == options.get("--terminal")), None))
             data["dispatches"][dispatch_id] = {"task": task["id"], "agent": agent, "terminal": options.get("--terminal"), "worktree": selector, "name": options.get("--name", os.path.basename(worktree)),
                                                "display": options.get("--display-name"), "base": options.get("--base-branch")}
             task["status"] = "dispatched"
