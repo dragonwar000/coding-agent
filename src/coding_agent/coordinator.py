@@ -84,6 +84,20 @@ def code_only(command: str) -> str:
     return "".join(out)
 
 
+# A shell given its script as an argument (`sh -c '...'`, `eval "..."`) runs the quoted text, so it is checked whole.
+SHELL_STRING = re.compile(r"(?:^|[\s;&|(])(?:(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\b|eval\s)")
+
+
+def checked_shell(command: str) -> str:
+    """The text of `command` that the guard matches mutating forms against.
+
+    Quoted text is not shell, so it is removed (`code_only`), unless the command hands a quoted script to a
+    shell interpreter or to `eval`; then the whole command is checked, because the shell runs that text.
+    """
+    shell = code_only(command)
+    return command if SHELL_STRING.search(shell) else shell
+
+
 def _git(cwd: Path, *args: str) -> str | None:
     try:
         run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=10, check=False)
@@ -191,7 +205,7 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None) -> str | 
         return f"[coordinator] subagent nội bộ không qua graph, nên bảng việc không thấy nó. {HOW}"
     if tool == "Bash":
         command = str(data.get("command") or "")
-        shell = code_only(command)
+        shell = checked_shell(command)
         if DELEGATE_CALL.search(command) and not CHAINING.search(shell):
             return None
         if MUTATING_BASH.search(shell):
@@ -305,6 +319,31 @@ def dirty_paths(root: Path) -> list[str] | None:
     if out is None:
         return None
     return sorted({line[3:].split(" -> ")[-1].strip('"') for line in out.splitlines() if len(line) > 3})
+
+
+def tree_fingerprint(root: Path) -> str | None:
+    """A value that differs whenever the work tree or the checked-out commit of `root` differs, or None outside git.
+
+    It holds the commit `HEAD` names and, for every path git reports as changed or untracked, its status code,
+    size, and modification time. The set of dirty paths alone misses a change that was committed during the
+    turn and a second edit of a file that was already dirty. The harness's own `.coding-agent` state is left out.
+    """
+    status = _git_raw(root, "-c", "core.quotePath=false", "status", "--porcelain", "-uall")
+    if status is None:
+        return None
+    parts = [(_git_raw(root, "rev-parse", "HEAD") or "").strip()]
+    for line in sorted(status.splitlines()):
+        if len(line) <= 3:
+            continue
+        name = line[3:].split(" -> ")[-1].strip('"')
+        if name.startswith(".coding-agent"):
+            continue
+        try:
+            stat = (root / name).stat()
+            parts.append(f"{line[:2]}|{name}|{stat.st_size}|{stat.st_mtime_ns}")
+        except OSError:
+            parts.append(f"{line[:2]}|{name}|gone")
+    return "\n".join(parts)
 
 
 def _git_raw(cwd: Path, *args: str) -> str | None:

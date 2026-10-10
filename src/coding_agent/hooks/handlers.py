@@ -128,6 +128,7 @@ def prompt_reset(ctx: Context) -> HookResult:
     data.update({"sig_counts": {}, "calls_this_turn": 0, "continuations": 0})
     # Taken for every role: stop-gate compares against it to tell a turn that changed nothing.
     data["dirty_at_prompt"] = coordinator.dirty_paths(ctx.root)
+    data["tree_at_prompt"] = coordinator.tree_fingerprint(ctx.root)
     state.save(ctx.root, ctx.session, data)
     return HookResult()
 
@@ -151,8 +152,10 @@ def _verify(commands: tuple[str, ...], cwd: str, timeout: int) -> list[dict[str,
 def _turn_changed(ctx: Context, turn: transcript.Turn, data: dict[str, Any], has_transcript: bool) -> bool:
     """Whether the turn changed files. Unknown counts as changed, so verification is never skipped on a guess.
 
-    Evidence, in order: a successful change tool in the transcript; the git status of the root against the
-    snapshot prompt-reset took. Outside git, a readable transcript with no change is the only evidence.
+    Evidence, in order: a successful change tool in the transcript; the dirty paths of the root against the
+    snapshot prompt-reset took; the tree fingerprint against its snapshot, which also sees a change committed
+    during the turn and a second edit of an already dirty file. Outside git, a readable transcript with no
+    change is the only evidence.
     """
     if turn.changes:
         return True
@@ -162,7 +165,10 @@ def _turn_changed(ctx: Context, turn: transcript.Turn, data: dict[str, Any], has
         if not isinstance(before, list):
             return True
         # The harness writes its own state during the turn; that is not a change the turn made.
-        return {p for p in now if not p.startswith(".coding-agent")} != {p for p in before if not p.startswith(".coding-agent")}
+        if {p for p in now if not p.startswith(".coding-agent")} != {p for p in before if not p.startswith(".coding-agent")}:
+            return True
+        fingerprint = data.get("tree_at_prompt")
+        return not isinstance(fingerprint, str) or coordinator.tree_fingerprint(ctx.root) != fingerprint
     return not has_transcript
 
 

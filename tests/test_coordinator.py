@@ -339,6 +339,28 @@ def test_the_quote_aware_view_keeps_substitutions_and_drops_strings():
     assert coordinator.code_only("echo 'a > b' > out") == "echo '' > out"
 
 
+@pytest.mark.parametrize("command", [
+    'bash -c "rm -rf src"',
+    "sh -c 'rm -rf src'",
+    "/bin/sh -e -c 'echo x > out.txt'",
+    'eval "rm -rf src"',
+    "ls | xargs -I{} sh -c 'rm {}'",
+])
+def test_a_script_handed_to_a_shell_is_checked_inside_its_quotes(command):
+    assert coordinator.guard_reason("Bash", {"command": command}) is not None
+
+
+@pytest.mark.parametrize("command", [
+    'echo "a -> b"',
+    'git commit -m "rm old"',
+    "./run.sh 'a > b'",
+    'bash -c "git status"',
+    "grep -c 'rm ' notes.txt",
+])
+def test_quoted_text_that_no_shell_runs_is_not_a_write(command):
+    assert coordinator.guard_reason("Bash", {"command": command}) is None
+
+
 @pytest.mark.parametrize("file_path", [".claude/settings.json", ".claude/settings.local.json", "integration.yaml"])
 def test_editing_the_hook_config_asks_the_user_instead_of_blocking(repo, monkeypatch, file_path):
     monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)

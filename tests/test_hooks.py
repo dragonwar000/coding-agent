@@ -321,6 +321,50 @@ def test_stop_gate_verifies_a_turn_that_changed_files_through_the_shell(repo, tm
     assert result.returncode == 2
 
 
+def _commit(repo: Path, message: str) -> None:
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-q", "-m", message], check=True)
+
+
+def test_stop_gate_verifies_a_turn_that_committed_its_shell_changes(repo, tmp_path):
+    manifest(repo, verify=["false"], mode="enforce")
+    (repo / ".gitignore").write_text(".coding-agent/\nintegration.yaml\n", encoding="utf-8")
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _commit(repo, "init")
+    call(repo, "prompt-reset", {"session_id": "s23", "prompt": "merge", "cwd": str(repo)}, mode="shadow")
+    (repo / "app.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
+    _commit(repo, "made by the turn")
+    path = _read_only_turn(tmp_path / "t.jsonl")
+    result = call(repo, "stop-gate", {"session_id": "s23", "transcript_path": str(path), "cwd": str(repo)}, zm_base=tmp_path / "zm")
+    assert result.returncode == 2
+
+
+def test_stop_gate_verifies_a_second_shell_edit_of_an_already_dirty_file(repo, tmp_path):
+    manifest(repo, verify=["false"], mode="enforce")
+    (repo / ".gitignore").write_text(".coding-agent/\nintegration.yaml\n", encoding="utf-8")
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _commit(repo, "init")
+    (repo / "app.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
+    call(repo, "prompt-reset", {"session_id": "s24", "prompt": "edit", "cwd": str(repo)}, mode="shadow")
+    (repo / "app.py").write_text("x = 1\ny = 2\nz = 3\n", encoding="utf-8")
+    path = _read_only_turn(tmp_path / "t.jsonl")
+    result = call(repo, "stop-gate", {"session_id": "s24", "transcript_path": str(path), "cwd": str(repo)}, zm_base=tmp_path / "zm")
+    assert result.returncode == 2
+
+
+def test_stop_gate_skips_a_turn_that_left_a_dirty_tree_as_it_was(repo, tmp_path):
+    manifest(repo, verify=["false"], mode="enforce")
+    (repo / ".gitignore").write_text(".coding-agent/\nintegration.yaml\n", encoding="utf-8")
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _commit(repo, "init")
+    (repo / "app.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
+    call(repo, "prompt-reset", {"session_id": "s25", "prompt": "look", "cwd": str(repo)}, mode="shadow")
+    path = _read_only_turn(tmp_path / "t.jsonl")
+    result = call(repo, "stop-gate", {"session_id": "s25", "transcript_path": str(path), "cwd": str(repo)}, zm_base=tmp_path / "zm")
+    assert result.returncode == 0
+    assert [e["kind"] for e in _events(repo) if e["guard"] == "stop-gate"] == ["no-change"]
+
+
 def test_stop_gate_when_always_verifies_every_turn(repo, tmp_path):
     manifest(repo, verify=["false"], mode="enforce")
     _verify_options(repo, when="always")

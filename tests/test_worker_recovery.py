@@ -131,9 +131,11 @@ def test_find_worktree_reads_git_by_branch_then_by_directory_name(committed, tmp
     assert orca_cli.find_worktree(tmp_path / "not-git", "x") is None
 
 
-def test_the_kickoff_text_is_one_line_without_a_redirect_character():
+def test_the_kickoff_text_is_one_line_that_a_shell_leaves_as_written_inside_double_quotes():
     text = orca_cli.kickoff_text("task_1", "ctx_1")
     assert "\n" not in text and ">" not in text
+    assert not set(text) & set('`$"\\')
+    assert "dispatch-show --task task_1 --preamble --json" in text
     assert text.startswith(orca_cli.KICK_MARK) and "REPORT-task_1.md" in text and "AskUserQuestion" in text
 
 
