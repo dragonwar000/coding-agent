@@ -598,14 +598,40 @@ def _composer_idle(screen: str) -> bool:
     return bool(prompts) and all(line == "❯" or line.startswith('❯ Try "') for line in prompts)
 
 
+def recorded_permission_mode(root: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    """The mode the hooks last recorded for the coordinator's session, and where it was found: `(record, where)`.
+
+    The hooks write it in the session's project directory, which is not `root` when the CLI runs with `--root` set to
+    another repository. So when `root` has no record, look in `$CLAUDE_PROJECT_DIR`, then the CLI's working directory,
+    then each parent of `root`, and stop at the first record. `where` holds `origin` (`root`, `CLAUDE_PROJECT_DIR`,
+    `cwd` or `parent`) and the `state_dir` read; both are empty when nothing was recorded.
+    """
+    candidates: list[tuple[str, Path]] = [("root", root)]
+    if os.environ.get("CLAUDE_PROJECT_DIR"):
+        candidates.append(("CLAUDE_PROJECT_DIR", Path(os.environ["CLAUDE_PROJECT_DIR"])))
+    candidates.append(("cwd", Path.cwd()))
+    candidates.extend(("parent", parent) for parent in Path(root).resolve().parents)
+    seen: set[Path] = set()
+    for origin, directory in candidates:
+        resolved = directory.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        record = state.load_permission_mode(resolved)
+        if record.get("permission_mode"):
+            return record, {"origin": origin, "state_dir": (resolved / state.PERMISSION_FILE).parent.as_posix()}
+    return {}, {}
+
+
 def worker_permission_mode(root: Path, explicit: str | None = None, session: str = "cli") -> tuple[str | None, str]:
     """The permission mode a worker should start in, and where it came from: `(mode, source)`.
 
     In order: the `--permission-mode` argument (`cli`), `CODING_AGENT_WORKER_PERMISSION_MODE` (`env`), then the mode the
-    hooks last recorded for a session in this repository (`session`). A value outside the four Claude Code modes is
-    logged and skipped. With nothing usable the answer is `(None, "none")`, and the worker starts as before.
+    hooks last recorded for the coordinator's session (`session`, found by `recorded_permission_mode`). A value outside
+    the four Claude Code modes is logged and skipped. With nothing usable the answer is `(None, "none")`, and the worker
+    starts as before.
     """
-    stored = state.load_permission_mode(root).get("permission_mode")
+    stored = recorded_permission_mode(root)[0].get("permission_mode")
     for source, value in (("cli", explicit), ("env", os.environ.get(PERMISSION_ENV)), ("session", stored)):
         if not value:
             continue
@@ -708,10 +734,18 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
                           "turn_start": "unobserved" if turn_unobserved(answer) else "observed"})
     events.record(root, guard="permission-mode", kind="worker-started", mode="enforce", applied=applied is not None, session=session,
                   detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "permission_mode": applied or "agent-default",
-                          "resolved": mode, "source": source})
+                          "resolved": mode, "source": source, **_session_origin(root, source)})
     if turn_unobserved(answer):
         kick_worker(root, task_id=task_id, dispatch=dispatch, session=session)
     return dispatch
+
+
+def _session_origin(root: Path, source: str) -> dict[str, str]:
+    """For a mode taken from a session record: the recording session, the origin and the state directory it was read from."""
+    if source != "session":
+        return {}
+    record, where = recorded_permission_mode(root)
+    return {"recorded_by": str(record.get("session", "")), **where}
 
 
 def turn_unobserved(answer: Any) -> bool:

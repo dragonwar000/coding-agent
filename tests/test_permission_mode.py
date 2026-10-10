@@ -139,6 +139,53 @@ def test_session_mode_reaches_the_worker(repo: Path, fake_orca: Path) -> None:
     assert _orca(fake_orca)["created_terminals"][0]["command"] == "claude --permission-mode acceptEdits"
 
 
+def _child_repo(parent: Path) -> Path:
+    """A repository nested inside the coordinator's project, like `platform/services/billing`."""
+    child = parent / "platform" / "services" / "billing"
+    child.mkdir(parents=True)
+    for command in (["init", "-q"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]):
+        subprocess.run(["git", "-C", str(child), *command], check=True)
+    return child
+
+
+def test_root_inside_the_coordinator_project_reads_the_parent_record(repo: Path, fake_orca: Path) -> None:
+    state.save_permission_mode(repo, "bypassPermissions", "coord")
+    child = _child_repo(repo)
+    assert orca_cli.worker_permission_mode(child, None) == ("bypassPermissions", "session")
+    orca_cli.worker_start(child, task_id=_task(child), agent="claude", title="x")
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == "claude --permission-mode bypassPermissions"
+    detail = [e for e in _events(child, "permission-mode") if e["kind"] == "worker-started"][-1]["detail"]
+    assert detail["permission_mode"] == "bypassPermissions" and detail["source"] == "session"
+    assert detail["origin"] == "parent" and detail["recorded_by"] == "coord"
+    assert detail["state_dir"] == (repo.resolve() / ".coding-agent" / "state").as_posix()
+
+
+def test_claude_project_dir_is_read_when_root_has_no_record(tmp_path: Path, repo: Path, fake_orca: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    state.save_permission_mode(other, "acceptEdits", "coord")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))
+    orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x")
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == "claude --permission-mode acceptEdits"
+    detail = [e for e in _events(repo, "permission-mode") if e["kind"] == "worker-started"][-1]["detail"]
+    assert detail["source"] == "session" and detail["origin"] == "CLAUDE_PROJECT_DIR"
+    assert detail["state_dir"] == (other.resolve() / ".coding-agent" / "state").as_posix()
+
+
+def test_lookup_order_root_then_project_dir_then_cwd(tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project, cwd = tmp_path / "project", tmp_path / "cwd-project"
+    project.mkdir(), cwd.mkdir()
+    state.save_permission_mode(cwd, "plan", "c")
+    monkeypatch.chdir(cwd)
+    assert orca_cli.recorded_permission_mode(repo)[1]["origin"] == "cwd"
+    state.save_permission_mode(project, "acceptEdits", "p")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+    assert orca_cli.worker_permission_mode(repo, None) == ("acceptEdits", "session")
+    state.save_permission_mode(repo, "default", "r")
+    assert orca_cli.recorded_permission_mode(repo)[1]["origin"] == "root"
+
+
 @pytest.mark.parametrize("mode", [None, "default"])
 def test_default_or_no_mode_keeps_worktree_create_agent(repo: Path, fake_orca: Path, mode: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CODING_AGENT_SHARE_TRUST", "off")  # with sharing on, a Claude worker always gets its own terminal

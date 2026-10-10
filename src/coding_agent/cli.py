@@ -16,7 +16,8 @@
 - `worker-start --task-id ID [--agent A] [--repo PATH] [--base-branch REF] [--permission-mode M]`: start a worker on an existing task, recorded as a worker worktree.
   A Claude worker runs in the coordinator session's permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`):
   `--permission-mode`, else `CODING_AGENT_WORKER_PERMISSION_MODE`, else the mode the hooks last recorded in
-  `.coding-agent/state/permission-mode`. Without one, or for another agent, the worker starts as the agent's default.
+  `.coding-agent/state/permission-mode` (under `--root`, else `$CLAUDE_PROJECT_DIR`, the working directory, or a parent
+  of `--root`). Without one, or for another agent, the worker starts as the agent's default.
   The mode a worker started in is logged in `.coding-agent/events.jsonl` (`guard: permission-mode`, `kind: worker-started`).
 - `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator.
 - `worker-kick --task-id ID`: record the task's worktree as a worker's and send the kick-off to its terminal, for a worker that never received its task.
@@ -90,7 +91,7 @@ def _target_options(command: argparse.ArgumentParser) -> None:
 
 
 def _permission_option(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--permission-mode", help="worker permission mode: default, acceptEdits, plan, bypassPermissions (default: CODING_AGENT_WORKER_PERMISSION_MODE, else the mode the hooks recorded for this repository's session)")
+    command.add_argument("--permission-mode", help="worker permission mode: default, acceptEdits, plan, bypassPermissions (default: CODING_AGENT_WORKER_PERMISSION_MODE, else the mode the hooks recorded for the coordinator's session)")
 
 
 def main(argv: list[str] | None = None) -> int:

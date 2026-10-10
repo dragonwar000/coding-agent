@@ -39,3 +39,10 @@ def claude_config_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pyt
     monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
     monkeypatch.delenv("CODING_AGENT_SHARE_TRUST", raising=False)
     return config_dir
+
+
+@pytest.fixture(autouse=True)
+def no_session_project(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test sees the real session's project: no CLAUDE_PROJECT_DIR, and an empty working directory."""
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
