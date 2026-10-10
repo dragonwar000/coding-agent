@@ -176,7 +176,7 @@ trong PATH (chạy từ PowerShell mà Git Bash không nằm trong PATH), instal
   (`python`, `python3`, `py`), không nhận đường dẫn có dấu cách hay tham số.
 - Lệnh verify mặc định là `<python> -m pytest -q`. Đổi trong `integration.yaml` cho hợp dự án.
 - `verify.when: changed` (mặc định) bỏ qua verify khi lượt không sửa file: không có `Write`/`Edit` thành công trong transcript
-  và `git status` của gốc không đổi so với đầu lượt. Ngoài git, chỉ transcript làm bằng chứng. Không chắc thì vẫn verify.
+  và cây làm việc của gốc không đổi so với đầu lượt (commit của `HEAD`, cùng trạng thái, kích thước và giờ sửa của từng file bẩn). Ngoài git, chỉ transcript làm bằng chứng. Không chắc thì vẫn verify.
   Event là `no-change`. Đặt `when: always` để verify mọi lượt như trước.
 - `verify.scope: changed-repos` cho workspace nhiều repo (gốc không phải một dự án): lệnh verify chạy trong từng git repo con
   có file bị sửa thay vì ở gốc. Mặc định `root`.

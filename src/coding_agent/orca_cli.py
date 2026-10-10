@@ -489,9 +489,13 @@ PROMPT_MARKS = ("❯", "›", ">", "$")
 
 
 def kickoff_text(task_id: str, dispatch: str) -> str:
-    """The one-line kick-off sent to a worker at an empty prompt. No `>` and no newline: it goes through `terminal send --text`."""
+    """The one-line kick-off sent to a worker at an empty prompt.
+
+    It goes through `terminal send --text`, and `_manual_kick` prints it inside double quotes for a person to paste,
+    so it holds no newline, no `>`, and nothing a shell expands inside double quotes (backtick, `$`, `"`, `\\`).
+    """
     return (f"Ban la worker Orca cho task {task_id} (dispatch {dispatch}). "
-            f"Chay `orca orchestration dispatch-show --task {task_id} --preamble --json` de doc preamble + TASK, roi thuc hien dung TASK. "
+            f"Chay lenh [orca orchestration dispatch-show --task {task_id} --preamble --json] de doc preamble + TASK, roi thuc hien dung TASK. "
             "Heartbeat/worker_done co the bi tu choi vi thieu token: van gui worker_done DUNG MOT LAN cuoi cung, "
             f"va ghi bao cao REPORT-{task_id}.md trong worktree roi commit. Khong dung AskUserQuestion.")
 
