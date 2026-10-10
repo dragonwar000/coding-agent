@@ -10,9 +10,10 @@
 - `claim --task-id ID [--project NAME]`: refuse a task owned by another repository and log the refusal (FR-008).
 - `orca-check --tasks FILE [--strict]`: report `CLAIMED-DONE BUT ABSENT`; `--strict` exits 1 when any is found (SC-002).
 - `status`: this repository's Orca tasks by state, read from the live Orca CLI (FR-014, SC-001).
-- `delegate --title ... --spec ... [--agent claude|codex] [--t-id T-x]`: create a task and start an Orca worker on it in its own worktree (coordinator).
+- `delegate --title ... --spec ... [--agent claude|codex] [--t-id T-x] [--repo PATH] [--base-branch REF]`: create a task and start an Orca worker on it
+  in its own worktree (coordinator). `--repo` names the git repository the worktree is created in; a root outside git requires it.
 - `board`: the task board the coordinator sees on each prompt.
-- `worker-start --task-id ID [--agent A]`: start a worker on an existing task, recorded as a worker worktree.
+- `worker-start --task-id ID [--agent A] [--repo PATH] [--base-branch REF]`: start a worker on an existing task, recorded as a worker worktree.
 - `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator.
 - `worker-kick --task-id ID`: record the task's worktree as a worker's and send the kick-off to its terminal, for a worker that never received its task.
 - `worker-settle --task-id ID --basis B [--artifact PATH ...]`: abandon the task's active dispatch and mark it completed, once the coordinator
@@ -79,6 +80,11 @@ def _status(root: Path, run: str | None) -> int:
     return 0
 
 
+def _target_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--repo", help="git repository the worker's worktree is created in, relative to the root or absolute (required when the root is not a git repository)")
+    command.add_argument("--base-branch", help="ref the worktree starts from (default: the target repository's HEAD)")
+
+
 def main(argv: list[str] | None = None) -> int:
     utf8_output()
     parser = argparse.ArgumentParser(prog="coding_agent.cli")
@@ -123,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--task-id", required=True)
     start.add_argument("--agent")
     start.add_argument("--run")
+    _target_options(start)
     adopt = sub.add_parser("worker-adopt", help="record an existing worktree as a worker's")
     adopt.add_argument("--worktree", required=True, type=Path)
     adopt.add_argument("--task-id", default="adopted")
@@ -161,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     delegate.add_argument("--t-id", help="durable task id (default: a new one)")
     delegate.add_argument("--agent", help="Orca agent id (default: CODING_AGENT_WORKER_AGENT or claude)")
     delegate.add_argument("--run", help="Orca Run id (default: CODING_AGENT_ORCA_RUN or the bound Run)")
+    _target_options(delegate)
 
     check = sub.add_parser("orca-check", help="find tasks that claim completion while an artifact is missing")
     check.add_argument("--tasks", required=True, type=Path)
@@ -178,7 +186,8 @@ def main(argv: list[str] | None = None) -> int:
             return _status(root, args.run)
         if args.command == "worker-start":
             agent = args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude")
-            print(json.dumps({"task_id": args.task_id, "dispatch": orca_cli.worker_start(root, task_id=args.task_id, agent=agent, run=args.run)}))
+            print(json.dumps({"task_id": args.task_id, "dispatch": orca_cli.worker_start(root, task_id=args.task_id, agent=agent, run=args.run,
+                                                                                              repo=args.repo, base=args.base_branch)}))
             return 0
         if args.command == "worker-adopt":
             if not args.worktree.is_dir():
@@ -254,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
                 t_id=args.t_id or f"T-{uuid.uuid4().hex[:8]}",
                 agent=args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude"),
                 run=args.run,
+                repo=args.repo,
+                base=args.base_branch,
             )
             print(json.dumps({"task_id": task_id, "dispatch": dispatch}, ensure_ascii=False))
             return 0

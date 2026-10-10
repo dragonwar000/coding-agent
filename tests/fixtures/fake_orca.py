@@ -9,6 +9,9 @@ task commands without `--run` (and no bound run) answer `run_required` with exit
 exit 1) and `terminal send` exit 1 with `ok: true`. `FAKE_ORCA_DEAF=1` makes the fake terminal's screen never show
 what was sent to it. `terminal read` shows a prompt line plus the texts sent so far; `dispatch-show`, `worker-show`,
 and `worker-abandon` read and change the dispatch records that `worker-start` creates.
+`FAKE_ORCA_FOLDER_PROJECT=1` makes `worker-start --worktree new-child` answer the refusal Orca gives a terminal of a
+folder project. `FAKE_ORCA_UNKNOWN_REPO=1` makes `worktree create` answer `repo_not_found` until `repo add` registered
+the repository. `FAKE_ORCA_REAL_WORKTREE=1` makes `worktree create` add a real git worktree of the named repository.
 """
 
 import json
@@ -38,9 +41,25 @@ def main(argv: list[str]) -> int:
     if argv[:2] == ["worktree", "create"]:
         options = _options(argv[2:])
         path = os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
+        repo = (options.get("--repo") or "")[5:]
+        if os.environ.get("FAKE_ORCA_UNKNOWN_REPO") == "1" and repo not in data.get("repos", []):
+            data.setdefault("refused_creates", []).append(repo)
+            state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            print(json.dumps({"ok": False, "error": {"code": "repo_not_found", "message": f"No repo matches path:{repo}"}}))
+            return 1
         data.setdefault("created_worktrees", []).append({"name": options["--name"], "repo": options.get("--repo")})
+        data.setdefault("create_calls", []).append({"base": options.get("--base-branch"), "no_parent": "--no-parent" in argv})
         state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        if os.environ.get("FAKE_ORCA_REAL_WORKTREE") == "1":
+            import subprocess
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", options["--name"], path, *([options["--base-branch"]] if "--base-branch" in options else [])],
+                           check=True, capture_output=True)
         print(json.dumps({"ok": True, "result": {"worktree": {"id": f"repo::{path}", "path": path}}}))
+        return 0
+    if argv[:2] == ["repo", "add"]:
+        data.setdefault("repos", []).append(_options(argv[2:])["--path"])
+        state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps({"ok": True, "result": {"repo": {"path": data["repos"][-1]}}}))
         return 0
     if argv[:2] == ["worktree", "rm"]:
         options = _options(argv[2:])
@@ -147,6 +166,8 @@ def main(argv: list[str]) -> int:
         task = tasks.get(options.get("--task", ""))
         if options.get("--worktree") == "new-child" and os.environ.get("FAKE_ORCA_NO_NEW_CHILD") == "1":
             answer = {"ok": False, "error": {"code": "selector_not_found", "message": "selector_not_found"}}
+        elif options.get("--worktree") == "new-child" and os.environ.get("FAKE_ORCA_FOLDER_PROJECT") == "1":
+            answer = {"ok": False, "error": {"code": "invalid_argument", "message": "Folder projects cannot create orchestration worktrees; use current or an exact existing folder workspace."}}
         elif options.get("--worktree") == "new-child" and "--name" not in options:
             answer = {"ok": False, "error": {"code": "invalid_argument", "message": "New worktrees require --name."}}
         elif task is None or options.get("--agent") is None:

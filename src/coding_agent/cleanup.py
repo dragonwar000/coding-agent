@@ -5,7 +5,8 @@ A worktree is a candidate when coding-agent started a worker in it (the workers 
 worktree through Orca, which also deletes its branch.
 
 Nothing is removed while the worktree holds work that exists nowhere else: uncommitted files, or commits that
-the coordinator's current branch does not contain. `discard=True` overrides that and loses the work.
+the coordinator's current branch does not contain. For a worker of another repository than the root (a child
+repository of a folder project), that branch is the one the worker's own repository has checked out. `discard=True` overrides that and loses the work.
 
 The confirmation is not taken here. The coordinator-guard hook answers `ask` for the `worktree-clean` command,
 so the host asks the user before the command runs; the CLI also refuses to run without `--yes`.
@@ -102,7 +103,7 @@ def candidates(root: Path, run: str | None = None) -> list[Candidate]:
             title=str(task.get("task_title") or task.get("title") or ""),
             exists=exists,
             dirty=_dirty(path) if exists else 0,
-            unmerged=_unmerged(root, path, record.get("base", "")) if exists else 0,
+            unmerged=_unmerged(orca_cli.repo_of(root, record), path, record.get("base", "")) if exists else 0,
         ))
     return found
 

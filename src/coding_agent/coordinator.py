@@ -109,7 +109,8 @@ def _git(cwd: Path, *args: str) -> str | None:
 def role_for(cwd: Path | None) -> str:
     """`coordinator`, `worker`, or `maintainer` for a session working in `cwd`.
 
-    A session is a worker only in a worktree that coding-agent started a worker in (the workers ledger).
+    A session is a worker only in a worktree that coding-agent started a worker in (the workers ledger of the
+    worktree's own repository).
     Any other session, in the main worktree or in a linked one such as an Orca workspace, is the coordinator.
     `maintainer` comes only from the environment: a person starts the session that way for work that is not
     code (pulling repositories, generating docs). It is not a file the agent could write to lift the guard.
@@ -240,6 +241,7 @@ def contract(python_src: str) -> str:
         "- Khi việc cần ghi, hoặc khi hook chặn một lệnh: giao ngay trong cùng lượt, bằng lệnh delegate (một việc nhỏ) hoặc graph (nhiều việc). Không xin phép người dùng, không kết thúc lượt để chờ. Chỉ hỏi người dùng khi quyết định thật sự là của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài), không hỏi \"có giao việc không\".",
         "- Chưa có Orca Run: tự chạy `run-init --objective \"...\"` với mục tiêu một dòng, rồi giao việc. Không nhờ người dùng chạy.",
         f"- Giao việc bằng: {delegate_command(python_src)} [--agent claude|codex]",
+        "- Folder project (root không phải repo git, chứa nhiều repo con): mọi lệnh delegate phải có `--repo <đường dẫn repo>`, và mỗi node trong plan đặt `repo:`. Worker tách nhánh từ HEAD của repo đó; đổi bằng `--base-branch` / `base:`.",
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",

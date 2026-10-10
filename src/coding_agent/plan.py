@@ -11,6 +11,8 @@ Plan file (YAML):
         spec: Implement the room actor ...
         deps: [protocol]
         agent: codex        # optional; default is the delegate default
+        repo: services/api  # optional; the git repository the worker's worktree is created in (required in a folder project)
+        base: develop       # optional; the ref the worktree starts from (default: that repository's HEAD)
 
 `apply` creates one Orca task per node, in dependency order, passing Orca the ids of the tasks it depends on.
 The mapping from plan id to Orca task id is kept in `.coding-agent/plan.json`, so applying twice creates nothing new.
@@ -42,6 +44,8 @@ class Node:
     spec: str
     deps: tuple[str, ...]
     agent: str | None
+    repo: str | None = None
+    base: str | None = None
 
 
 def _text(value: Any, where: str) -> str:
@@ -65,13 +69,15 @@ def parse(raw: Any) -> list[Node]:
         deps = item.get("deps", [])
         if not isinstance(deps, list) or not all(isinstance(dep, str) and dep.strip() for dep in deps):
             raise PlanError(f"tasks[{node_id}].deps must be a list of task ids")
-        agent = item.get("agent")
+        agent, repo, base = item.get("agent"), item.get("repo"), item.get("base")
         nodes[node_id] = Node(
             id=node_id,
             title=_text(item.get("title"), f"tasks[{node_id}].title"),
             spec=_text(item.get("spec"), f"tasks[{node_id}].spec"),
             deps=tuple(dict.fromkeys(dep.strip() for dep in deps)),
             agent=_text(agent, f"tasks[{node_id}].agent") if agent is not None else None,
+            repo=_text(repo, f"tasks[{node_id}].repo") if repo is not None else None,
+            base=_text(base, f"tasks[{node_id}].base") if base is not None else None,
         )
     for node in nodes.values():
         for dep in node.deps:
@@ -124,7 +130,15 @@ def _save(root: Path, mapping: dict[str, str]) -> None:
 
 
 def apply(root: Path, nodes: list[Node], *, run: str | None = None) -> list[tuple[str, str, bool]]:
-    """Create the Orca task of every node that has none yet. Returns (plan id, Orca task id, created) per node."""
+    """Create the Orca task of every node that has none yet. Returns (plan id, Orca task id, created) per node.
+
+    Every node's target repository is resolved first, so a plan that cannot be dispatched creates no task.
+    """
+    for node in nodes:
+        try:
+            orca_cli.target_repo(root, node.repo)
+        except orca_cli.OrcaError as error:
+            raise PlanError(f"task {node.id!r}: {error}") from error
     mapping = ledger(root)
     project = orca.project_name(root)
     out: list[tuple[str, str, bool]] = []
@@ -157,7 +171,8 @@ def dispatch_ready(root: Path, nodes: list[Node], *, default_agent: str, run: st
     mapping = ledger(root)
     started: list[tuple[str, str, str]] = []
     for node in ready(nodes, states(root, nodes, run=run))[:max(limit, 0)]:
-        dispatch = orca_cli.worker_start(root, task_id=mapping[node.id], agent=node.agent or default_agent, run=run, title=node.title)
+        dispatch = orca_cli.worker_start(root, task_id=mapping[node.id], agent=node.agent or default_agent, run=run, title=node.title,
+                                         repo=node.repo, base=node.base)
         started.append((node.id, mapping[node.id], dispatch))
     return started
 

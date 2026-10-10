@@ -273,19 +273,27 @@ def _git_common_dir(root: Path) -> Path | None:
     return (root / run.stdout.strip()).resolve() if run.returncode == 0 and run.stdout.strip() else None
 
 
-def workers_ledger(root: Path) -> Path | None:
-    """The file listing worker worktrees. It lives in the git common directory, so every worktree of the repository reads the same one."""
+FOLDER_LEDGER = Path(".coding-agent") / "workers.jsonl"
+
+
+def workers_ledger(root: Path) -> Path:
+    """The file listing worker worktrees.
+
+    It lives in the git common directory, so every worktree of the repository reads the same one. A root outside git
+    (a folder project holding several repositories) keeps it under `.coding-agent` instead.
+    """
     common = _git_common_dir(root)
-    return common / "coding-agent-workers.jsonl" if common is not None else None
+    return common / "coding-agent-workers.jsonl" if common is not None else root / FOLDER_LEDGER
 
 
 def worker_records(root: Path) -> list[dict[str, str]]:
-    """The worker worktrees still in place: `{worktree, task_id, dispatch, base}`, in the order they were started.
+    """The worker worktrees still in place: `{worktree, task_id, dispatch, base, repo}`, in the order they were started.
 
+    `repo` is the repository the worktree belongs to, or an empty string in a record written before it was kept.
     A later `removed` line for a worktree drops its earlier record.
     """
     path = workers_ledger(root)
-    if path is None or not path.exists():
+    if not path.exists():
         return []
     live: dict[str, dict[str, str]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -299,7 +307,7 @@ def worker_records(root: Path) -> list[dict[str, str]]:
             live.pop(record["worktree"], None)
         else:
             live[record["worktree"]] = {"worktree": record["worktree"], "task_id": str(record.get("task_id") or ""), "dispatch": str(record.get("dispatch") or ""),
-                                        "base": str(record.get("base") or "")}
+                                        "base": str(record.get("base") or ""), "repo": str(record.get("repo") or "")}
     return list(live.values())
 
 
@@ -308,13 +316,37 @@ def worker_worktrees(root: Path) -> set[str]:
     return {record["worktree"] for record in worker_records(root)}
 
 
+def _append(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+def _ledgers(root: Path, repo: Path | None) -> list[Path]:
+    """The ledgers a worker of `repo` is kept in: the coordinator root's, and the repository's own when that is another file."""
+    paths = [workers_ledger(root)]
+    if repo is not None and _git_common_dir(repo) is not None:
+        paths.append(workers_ledger(repo))
+    return list(dict.fromkeys(paths))
+
+
+def repo_of(root: Path, record: dict[str, str]) -> Path:
+    """The repository a recorded worker's commits are compared in: `root`, or the worker's own repository when it is a different one.
+
+    A recorded directory that is the main checkout of another repository stays compared in `root`, where git cannot
+    vouch for it: nothing else holds its commits.
+    """
+    repo = Path(record["repo"]) if record.get("repo") else None
+    if repo is None or not repo.is_dir() or repo == Path(record["worktree"]) or _git_common_dir(repo) in (None, _git_common_dir(root)):
+        return root
+    return repo
+
+
 def mark_removed(root: Path, worktree: str) -> None:
     """Record that a worker worktree was removed, so it is no longer a worker's and no longer a cleanup candidate."""
-    path = workers_ledger(root)
-    if path is None:
-        return
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"worktree": worktree, "removed": True}) + "\n")
+    repo = next((Path(record["repo"]) for record in worker_records(root) if record["worktree"] == worktree and record["repo"]), None)
+    for path in _ledgers(root, repo):
+        _append(path, {"worktree": worktree, "removed": True})
 
 
 def release_worker(dispatch: str) -> None:
@@ -328,17 +360,19 @@ def remove_worktree(path: str, *, force: bool = False) -> None:
 
 
 def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str) -> None:
-    """Add a worker worktree to the ledger, with the commit it starts from. Outside git there is no ledger and nothing is recorded.
+    """Add a worker worktree to the ledger, with the commit it starts from.
 
     The start commit is what later tells the worker's own commits apart from the difference between branches.
+    A worktree of another repository than `root` (a child repository of a folder project) is recorded twice: in that
+    repository's ledger, which is what makes a session in the worktree a worker, and in the root's, which is what the
+    coordinator's board and cleanup read.
     """
-    path = workers_ledger(root)
-    if path is None:
-        return
     resolved = Path(worktree).resolve()
-    record = {"worktree": str(resolved), "task_id": task_id, "dispatch": dispatch, "base": _head(resolved) if resolved.is_dir() else None}
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record) + "\n")
+    repo = _repo_path(resolved) if resolved.is_dir() else None
+    record = {"worktree": str(resolved), "task_id": task_id, "dispatch": dispatch, "base": _head(resolved) if resolved.is_dir() else None,
+              "repo": str(repo) if repo is not None else None}
+    for path in _ledgers(root, repo):
+        _append(path, record)
 
 
 def _repo_path(root: Path) -> Path | None:
@@ -389,53 +423,127 @@ def _head(cwd: Path) -> str | None:
     return run.stdout.strip() if run.returncode == 0 and run.stdout.strip() else None
 
 
-def _base_args(root: Path) -> list[str]:
-    """`--base-branch <commit>` for the coordinator's current commit.
+def _base_args(root: Path, base: str | None = None) -> list[str]:
+    """`--base-branch <ref>`: `base` when given, else the commit `root` has checked out.
 
     Orca creates a worktree from the repository's default base unless told otherwise, so without this a worker
     starts from a commit that lacks the coordinator's latest work (measured on the installed Orca).
     """
-    head = _head(root)
-    return ["--base-branch", head] if head is not None else []
+    ref = base or _head(root)
+    return ["--base-branch", ref] if ref is not None else []
 
 
-def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None) -> Any:
-    """Start a worker in a new worktree.
+FOLDER_REFUSAL = "Folder projects cannot create orchestration worktrees"
+SCAN_DEPTH = 3
+SCAN_LIMIT = 20
+SCAN_SKIP = frozenset({"node_modules", "venv", "build", "dist", "target", "__pycache__"})
 
-    `new-child` makes the worktree a child of the calling terminal's worktree. Orca answers `selector_not_found`
-    when that terminal's workspace is no longer in its catalog (seen when a folder project became a git repository
-    after the terminal opened). Then the worktree is created from the repository path and the worker is started on it.
+
+def child_repos(root: Path, depth: int = SCAN_DEPTH) -> list[str]:
+    """Git repositories under `root`, as paths relative to it, at most `depth` levels down and `SCAN_LIMIT` of them.
+
+    Hidden directories and dependency or build directories are not entered, and neither is a repository once found.
     """
-    try:
-        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, "--display-name", display,
-                     *_base_args(root), *_run_args(run))
-    except OrcaError as error:
-        if "selector_not_found" not in str(error):
-            raise
-    repo = _repo_path(root)
+    found: list[str] = []
+    level = [root]
+    for _ in range(depth):
+        below: list[Path] = []
+        for parent in level:
+            try:
+                children = sorted(child for child in parent.iterdir() if child.is_dir() and not child.is_symlink())
+            except OSError:
+                continue
+            for child in children:
+                if child.name.startswith(".") or child.name in SCAN_SKIP:
+                    continue
+                if (child / ".git").exists():
+                    found.append(child.relative_to(root).as_posix())
+                else:
+                    below.append(child)
+        level = below
+    return sorted(found)[:SCAN_LIMIT]
+
+
+def target_repo(root: Path, repo: str | Path | None) -> Path | None:
+    """The repository named by `repo` (relative to `root`, or absolute), or None when none was named and `root` is in git.
+
+    Raises when the named path is not a repository Orca can create a worktree from, and when nothing was named while
+    `root` is outside git: a folder project has no repository of its own, so the caller must name one.
+    """
     if repo is None:
-        raise OrcaError("worker-start could not place a new worktree, and this directory is not a git repository Orca can create one from")
-    created = _call_tool("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent", *_base_args(root))
+        if _git_common_dir(root) is not None:
+            return None
+        found = child_repos(root)
+        listing = ("Git repositories found under it: " + ", ".join(found) + ".") if found else "No git repository was found under it."
+        raise OrcaError(f"{root} is not a git repository, so a worker worktree needs a target: pass --repo PATH (plan nodes: `repo:`). {listing}")
+    path = Path(repo)
+    named = _repo_path(path if path.is_absolute() else root / path)
+    if named is None:
+        raise OrcaError(f"--repo {repo}: not a git repository Orca can create a worktree from")
+    return named
+
+
+def _create_worktree(repo: Path, name: str, base: list[str]) -> str:
+    """Create a worktree of `repo` through Orca and return its path. A repository Orca does not know is registered, then the creation is tried once more."""
+    create = ("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent", *base)
+    try:
+        created = _call_tool(*create)
+    except OrcaError as error:
+        if "repo_not_found" not in str(error):
+            raise
+        _call_tool("repo", "add", "--path", str(repo))
+        created = _call_tool(*create)
     result = created.get("result") if isinstance(created, dict) else None
     worktree = result.get("worktree") if isinstance(result, dict) else None
     path = worktree.get("path") if isinstance(worktree, dict) else None
     if not isinstance(path, str) or not path:
         raise OrcaError("the worktree create answer has no worktree path")
-    return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", *_run_args(run))
+    return path
 
 
-def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli", title: str | None = None) -> str:
+def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None, *,
+                           repo: Path | None = None, base: str | None = None) -> tuple[Any, str | None]:
+    """Start a worker in a new worktree. Returns the worker-start answer, and the worktree's path when it was created here.
+
+    `new-child` makes the worktree a child of the calling terminal's worktree. Orca answers `selector_not_found`
+    when that terminal's workspace is no longer in its catalog (seen when a folder project became a git repository
+    after the terminal opened), and refuses outright when the terminal belongs to a folder project. Then, and whenever
+    `repo` names the repository, the worktree is created from the repository path and the worker is started on it.
+    The worktree is recorded before the worker starts, so the worker's session already finds itself in the ledger.
+    """
+    if repo is None:
+        try:
+            return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, "--display-name", display,
+                         *_base_args(root, base), *_run_args(run)), None
+        except OrcaError as error:
+            if "selector_not_found" not in str(error) and FOLDER_REFUSAL not in str(error):
+                raise
+        repo = _repo_path(root)
+        if repo is None:
+            raise OrcaError("worker-start could not place a new worktree, and this directory is not a git repository Orca can create one from")
+        base_args = _base_args(root, base)
+    else:
+        base_args = _base_args(repo, base)
+    path = _create_worktree(repo, name, base_args)
+    record_worker(root, worktree=path, task_id=task_id, dispatch="")
+    return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", *_run_args(run)), path
+
+
+def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli", title: str | None = None,
+                 repo: str | Path | None = None, base: str | None = None) -> str:
     """Start one supervised worker on `task_id` in a new worktree, and return the dispatch id.
 
     The worktree and its branch are named from the task title, and Orca shows the title on the worker's row.
     Without `title`, the title is read from Orca. The worktree is recorded in the workers ledger, which is how a
-    session in it is recognised as a worker.
+    session in it is recognised as a worker. `repo` names the repository the worktree is created in (required when
+    `root` is outside git); `base` is the ref it starts from, by default the commit that repository has checked out.
     """
+    target = target_repo(root, repo)
     title = title if title is not None else _title_of(task_id, run)
     name = worktree_name(title, task_id)
-    answer = _start_in_new_worktree(root, task_id, agent, name, (title or name)[:DISPLAY_LIMIT], run)
+    answer, created = _start_in_new_worktree(root, task_id, agent, name, (title or name)[:DISPLAY_LIMIT], run, repo=target, base=base)
     dispatch = dispatch_id_of(answer)
-    worktree = worktree_of(answer) or find_worktree(root, name)
+    worktree = created or worktree_of(answer) or find_worktree(target or root, name)
     if worktree is not None:
         record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch)
     events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
@@ -635,10 +743,15 @@ def kick_by_hand(root: Path, *, task_id: str, run: str | None = None, session: s
     return {"task_id": task_id, "dispatch": dispatch, "worktree": worktree, "recorded": recorded, "kicked": seen}
 
 
-def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: str | None = None, session: str = "cli") -> tuple[str, str]:
-    """Create a task for this repository and start a worker on it. Returns (task id, dispatch id)."""
+def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: str | None = None, session: str = "cli",
+             repo: str | Path | None = None, base: str | None = None) -> tuple[str, str]:
+    """Create a task for this repository and start a worker on it. Returns (task id, dispatch id).
+
+    The target repository is resolved first, so a folder project without `repo` fails before any task exists.
+    """
+    target_repo(root, repo)
     task_id = create_task(root, project=orca.project_name(root), t_id=t_id, spec=spec, title=title, run=run)
-    return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session, title=title)
+    return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session, title=title, repo=repo, base=base)
 
 
 def _reports(answer: Any) -> list[dict[str, Any]]:

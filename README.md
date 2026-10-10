@@ -203,7 +203,7 @@ Nó không tự sửa file.
   quyết định thật sự của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài).
 - **Ai là worker:** chỉ session chạy trong worktree mà `worker-start` của coding-agent tạo ra. Danh sách nằm ở
   `<git-common-dir>/coding-agent-workers.jsonl`, dùng chung cho mọi worktree. Session ở worktree khác (kể cả workspace
-  Orca) là coordinator. `CODING_AGENT_ROLE=coordinator|worker|maintainer` ghi đè.
+  Orca) là coordinator. Root không phải repo git (folder project) giữ danh sách ở `<root>/.coding-agent/workers.jsonl`. `CODING_AGENT_ROLE=coordinator|worker|maintainer` ghi đè.
 - **Maintainer:** khởi động phiên với `CODING_AGENT_ROLE=maintainer` cho việc không phải code (pull repo, sinh tài liệu).
   Guard không chặn, nhưng mỗi lệnh nó lẽ ra chặn được ghi event `maintainer-allowed`. Vai trò này chỉ đến từ biến môi
   trường do người khởi động phiên đặt, không phải file agent tự ghi được.
@@ -261,6 +261,37 @@ chưa xử lý, kèm node tương ứng và việc cần làm. Đọc bảng kh�
 python3 -m coding_agent.cli inbox          # báo cáo worker chưa xử lý
 python3 -m coding_agent.cli inbox --ack    # đánh dấu đã xử lý
 ```
+
+### Folder project: root chứa nhiều repo git
+
+Khi root là một thư mục thường (không phải repo git) chứa nhiều repo độc lập, Orca từ chối tạo worktree con
+(`Folder projects cannot create orchestration worktrees`). Khi đó phải nói worker làm trong repo nào:
+
+```sh
+python3 -m coding_agent.cli delegate --title "..." --spec "..." --repo vgps/app [--base-branch develop]
+python3 -m coding_agent.cli worker-start --task-id <id> --repo vgps/app
+```
+
+```yaml
+tasks:
+  - id: app
+    title: Màn hình đăng nhập
+    spec: ...
+    repo: vgps/app      # repo git mà worktree của worker được tạo trong đó; tương đối so với root, hoặc tuyệt đối
+    base: develop       # tuỳ chọn; mặc định là HEAD hiện tại của repo đó
+```
+
+- `--repo` / `repo:` bỏ qua `new-child`: coding-agent chạy `orca worktree create --repo path:<repo> --no-parent`, rồi
+  `worker-start --worktree path:<worktree>`. Orca chưa biết repo (`repo_not_found`) thì nó chạy `orca repo add` và thử lại một lần.
+- Root là repo git và không có `--repo`: như cũ (`new-child`). Nếu Orca từ chối vì terminal gọi thuộc folder project, worktree
+  được tạo từ chính repo của root theo cách trên.
+- Root không phải repo git mà thiếu `--repo`: lệnh dừng **trước khi tạo task** và liệt kê các repo git tìm thấy dưới root
+  (sâu tối đa 3 cấp, bỏ thư mục ẩn, `node_modules`, `venv`, `build`, `dist`). `plan-apply` kiểm mọi node trước khi tạo task nào.
+- Worker được ghi ở hai nơi: danh sách của repo đích (để session trong worktree là worker) và danh sách của root (để bảng việc,
+  `worktree-list`, `worktree-clean` của coordinator thấy nó). "Commit chưa gộp" được so với HEAD của repo đích.
+- **Giới hạn đã biết:** worktree tạo từ repo con không mang hook harness và `integration.yaml` của thư mục cha. Worker ở đó
+  chạy không có `stop-gate`, không có verify và không có guard của harness, trừ khi repo con tự cài coding-agent. Coordinator
+  phải tự kiểm kết quả (đọc diff, chạy verify trong worktree) trước khi gộp.
 
 Chưa có: tự chạy `plan-next` mà không cần coordinator (bảng việc chỉ hiện ở prompt kế tiếp của người dùng), và ratchet giữ
 bản tốt nhất như DSH.

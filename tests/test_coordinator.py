@@ -53,7 +53,8 @@ def test_the_workers_ledger_is_shared_by_every_worktree(repo, tmp_path):
     committed_repo(repo)
     worker = linked_worktree(repo, tmp_path)
     assert orca_cli.worker_worktrees(worker) == orca_cli.worker_worktrees(repo) == {str(worker.resolve())}
-    assert orca_cli.workers_ledger(tmp_path) is None and orca_cli.worker_worktrees(tmp_path) == set()
+    # Outside git (a folder project) the ledger is a file under the root's .coding-agent directory.
+    assert orca_cli.workers_ledger(tmp_path) == tmp_path / ".coding-agent" / "workers.jsonl" and orca_cli.worker_worktrees(tmp_path) == set()
 
 
 def test_a_directory_outside_git_is_the_coordinator(tmp_path, monkeypatch):
