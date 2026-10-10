@@ -174,8 +174,12 @@ def test_delegate_creates_a_task_and_starts_a_worker_in_its_own_worktree(repo, f
     task_id, dispatch = orca_cli.delegate(repo, title="Refactor", spec="split the module", t_id="T-31", agent="codex")
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
     head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-    # The worker starts from the coordinator's commit, not from the repository's default base.
-    assert state["dispatches"][dispatch] == {"task": task_id, "agent": "codex", "worktree": "new-child", "name": "refactor", "display": "Refactor", "base": head}
+    # The worktree starts from the coordinator's commit, not from the repository's default base, with its agent already
+    # running; the task is dispatched to that agent's terminal.
+    assert state["created_worktrees"][0] == {"name": "refactor", "repo": f"path:{orca_cli._repo_path(repo)}", "agent": "codex", "base": head}
+    path = os.path.join(os.path.dirname(str(fake_orca)), "worktrees", "refactor")
+    assert state["dispatches"][dispatch] == {"task": task_id, "agent": "codex", "terminal": "term_wt_refactor", "worktree": f"path:{path}", "name": "refactor",
+                                             "display": "Refactor", "base": None}
     assert len(orca_cli.worker_worktrees(repo)) == 1
     assert state["tasks"][task_id]["status"] == "dispatched"
     assert cli.main(["--root", str(repo), "delegate", "--title", "Docs", "--spec", "write docs", "--t-id", "T-32"]) == 0
@@ -272,21 +276,24 @@ def test_dirty_paths_is_none_outside_git(tmp_path):
     assert coordinator.dirty_paths(tmp_path) is None
 
 
-def test_worker_start_falls_back_to_an_explicit_worktree_when_new_child_cannot_be_placed(repo, fake_orca, monkeypatch):
+def test_worker_start_falls_back_to_worker_start_agent_when_the_worktree_has_no_agent_terminal(repo, fake_orca, monkeypatch):
     committed_repo(repo)
-    monkeypatch.setenv("FAKE_ORCA_NO_NEW_CHILD", "1")
+    monkeypatch.setenv("FAKE_ORCA_NO_AGENT_TERMINAL", "1")
     task_id, dispatch = orca_cli.delegate(repo, title="Models", spec="x", t_id="T-50", agent="claude")
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
-    assert state["created_worktrees"] == [{"name": "models", "repo": f"path:{repo.resolve()}"}]
-    assert state["dispatches"][dispatch]["worktree"].startswith("path:") and state["dispatches"][dispatch]["task"] == task_id
+    assert [(w["name"], w["repo"], w["agent"]) for w in state["created_worktrees"]] == [("models", f"path:{repo.resolve()}", "claude")]
+    record = state["dispatches"][dispatch]
+    assert record["worktree"].startswith("path:") and record["task"] == task_id and record["agent"] == "claude" and record["terminal"] is None
+    assert "sent" not in state  # nothing typed into a terminal
     assert len(orca_cli.worker_worktrees(repo)) == 1
 
 
-def test_another_worker_start_error_is_not_retried(repo, fake_orca):
+def test_a_worker_start_error_is_raised_and_not_retried(repo, fake_orca):
     committed_repo(repo)
     with pytest.raises(orca_cli.OrcaError, match="unknown_task"):
         orca_cli.worker_start(repo, task_id="task_nope", agent="claude")
-    assert "created_worktrees" not in json.loads(fake_orca.read_text(encoding="utf-8"))
+    state = json.loads(fake_orca.read_text(encoding="utf-8"))
+    assert len(state["created_worktrees"]) == 1 and "dispatches" not in state
 
 
 def test_worker_adopt_records_a_worktree_started_elsewhere(repo, tmp_path, capsys, monkeypatch):

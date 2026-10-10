@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -399,29 +400,84 @@ def _base_args(root: Path) -> list[str]:
     return ["--base-branch", head] if head is not None else []
 
 
-def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None) -> Any:
-    """Start a worker in a new worktree.
+AGENT_READY_TIMEOUT_S = 90.0  # how long to wait for a new worktree's agent to show an empty prompt
+AGENT_READY_POLL_S = 1.0      # pause between screen reads while waiting
 
-    `new-child` makes the worktree a child of the calling terminal's worktree. Orca answers `selector_not_found`
-    when that terminal's workspace is no longer in its catalog (seen when a folder project became a git repository
-    after the terminal opened). Then the worktree is created from the repository path and the worker is started on it.
+
+def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None) -> Any:
+    """Start a worker in a new worktree, dispatching only once the agent is ready for input.
+
+    `worker-start --agent` launches the agent and types the dispatch at once. Measured on Orca with Claude Code 2.1 on
+    Windows: the text lands while the agent is still starting and is lost (empty prompt, `outcome_unknown`), and the
+    worker cannot report, because the dispatch capability exists only in that text. So the worktree is created with
+    its agent first (`worktree create --agent`), the agent terminal is polled until its prompt is ready, and the task
+    is then dispatched to that terminal (`worker-start --terminal`), which Orca answers with `ready`. If the agent
+    shows the folder trust dialog or never becomes ready, nothing is dispatched and OrcaError is raised.
+    An answer without an agent terminal falls back to `worker-start --agent` on the new worktree.
     """
-    try:
-        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", "new-child", "--name", name, "--display-name", display,
-                     *_base_args(root), *_run_args(run))
-    except OrcaError as error:
-        if "selector_not_found" not in str(error):
-            raise
     repo = _repo_path(root)
     if repo is None:
         raise OrcaError("worker-start could not place a new worktree, and this directory is not a git repository Orca can create one from")
-    created = _call_tool("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent", *_base_args(root))
+    created = _call_tool("worktree", "create", "--name", name, "--repo", f"path:{repo}", "--no-parent", "--agent", agent, *_base_args(root))
     result = created.get("result") if isinstance(created, dict) else None
     worktree = result.get("worktree") if isinstance(result, dict) else None
     path = worktree.get("path") if isinstance(worktree, dict) else None
     if not isinstance(path, str) or not path:
         raise OrcaError("the worktree create answer has no worktree path")
-    return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", *_run_args(run))
+    terminal = result.get("agentTerminalHandle") if isinstance(result, dict) else None
+    if not isinstance(terminal, str) or not terminal:
+        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run))
+    _wait_agent_ready(terminal, path)
+    return _call("worker-start", "--task", task_id, "--terminal", terminal, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run))
+
+
+def _wait_agent_ready(terminal: str, worktree: str, timeout_s: float | None = None) -> None:
+    """Poll an agent terminal until its prompt is empty and idle, so the dispatch is typed into a ready prompt.
+
+    Raises OrcaError, without dispatching, when the agent shows the folder trust dialog or is not ready in time: text
+    typed into the trust dialog ends in Enter, which picks `No, exit`, and the agent quits (`outcome_unknown`).
+    Answering the dialog is the user's decision, so the harness never picks `Yes` itself.
+    """
+    timeout_s = AGENT_READY_TIMEOUT_S if timeout_s is None else timeout_s
+    lines: list[str] = []
+    deadline = time.monotonic() + timeout_s
+    while True:
+        screen = screen_of(terminal)
+        lines = screen.splitlines()
+        if _trust_dialog(screen):
+            raise OrcaError(
+                f"the agent in worktree {worktree} is asking whether to trust this folder, so no task was dispatched. "
+                "Open Claude Code once in the original repository folder (or a parent folder), choose "
+                "'Yes, I trust this folder', then start the worker again")
+        if _composer_idle(screen):
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(AGENT_READY_POLL_S)
+    tail = "\n".join(lines[-20:])
+    raise OrcaError(f"the agent in worktree {worktree} was not ready for input after {timeout_s:g}s, so no task was dispatched. "
+                    f"Last screen lines:\n{tail}")
+
+
+def _trust_dialog(screen: str) -> bool:
+    """True when the agent shows Claude Code's folder trust dialog (`Quick safety check: ... one you trust?`)."""
+    screen = screen.replace("\xa0", " ")
+    return "Yes, I trust this folder" in screen or "one you trust" in screen
+
+
+def _composer_idle(screen: str) -> bool:
+    """True when the agent shows an empty prompt and is not working, so it is ready for the dispatch.
+
+    Measured on Claude Code 2.1 under Orca on Windows: a ready prompt line is `❯` alone or the `❯ Try "..."`
+    placeholder. A working agent shows a spinner line such as `✶ Ideating… (21s · ...)` or
+    `(running UserPromptSubmit hooks… 3/4 · 0s)`, sometimes with `esc to interrupt`.
+    """
+    if "esc to interrupt" in screen or re.search(r"…\s*\(\d+s|\(running ", screen):
+        return False
+    # The prompt line separates `❯` from the placeholder with a no-break space (U+00A0).
+    lines = [line.replace("\xa0", " ").strip() for line in screen.splitlines()]
+    prompts = [line for line in lines if line.startswith("❯")]
+    return bool(prompts) and all(line == "❯" or line.startswith('❯ Try "') for line in prompts)
 
 
 def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli", title: str | None = None) -> str:

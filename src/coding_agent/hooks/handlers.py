@@ -332,8 +332,13 @@ def coordinator_guard(ctx: Context) -> HookResult:
         return HookResult()
     tool = str(ctx.payload.get("tool_name") or "")
     question = coordinator.needs_user_confirmation(tool, ctx.payload.get("tool_input"), ctx.root)
+    if question is not None and ctx.payload.get("permission_mode") == "bypassPermissions":
+        # The user turned prompts off for this session; `ask` would override that. The CLI still needs --yes.
+        ctx.note(guard="coordinator-guard", kind="confirm-skipped-bypass", applied=False, detail={"tool": tool})
+        return HookResult()
     if question is not None:
-        # Asked in every mode but `off`: this is the user's confirmation of a deletion, not a guard decision.
+        # Asked in every mode but `off` unless the session bypasses permissions: this is the user's confirmation
+        # of a deletion, not a guard decision. A host that sends no `permission_mode` (older Claude Code, Codex) is asked.
         ctx.note(guard="coordinator-guard", kind="confirm-requested", applied=True, detail={"tool": tool})
         return HookResult(stdout=json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": question,
