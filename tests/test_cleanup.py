@@ -157,7 +157,7 @@ def test_the_board_lists_only_worktrees_that_still_hold_work(ready_repo, tmp_pat
     (path / "wip.py").write_text("x\n", encoding="utf-8")
     lines, error = coordinator.read_board(ready_repo)
     text = "\n".join(lines)
-    assert error is None and "worktree của worker đã xong, còn việc chưa gộp hoặc chưa commit (1):" in text
+    assert error is None and "xong, worktree còn việc chưa gộp hoặc chưa commit (1):" in text
     assert f"on-board ({task_id}, completed): 1 file chưa commit" in text and "worktree-clean --task-id <id> --discard --yes" in text
     assert "merged (" not in text and not clean_path.exists()
 

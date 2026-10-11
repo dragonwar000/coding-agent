@@ -30,7 +30,12 @@
 - After `plan-next`, `plan-status`, `inbox`, `delegate` and `worktree-list`, merged, clean worktrees of settled workers
   are removed without asking (`cleanup.auto_clean`), one `auto-clean: removed <name> (<task>)` line each.
   `CODING_AGENT_AUTO_CLEAN=off` turns that off. An auto-clean error is a warning and does not change the exit code.
-- `inbox [--ack]`: worker reports the coordinator has not handled; `--ack` acknowledges them.
+- `inbox [--ack [--task-id ID ...]]`: worker reports the coordinator has not handled; `--ack` acknowledges them and prints
+  each one (task, repository, subject). With `--task-id` (repeatable) only those tasks' reports are acknowledged.
+  Without `--run`, the inbox follows the Run Orca has bound to this terminal (`orca_cli.sync_bound_run`).
+- `delegate` and `plan-next` with a `--root` other than the coordinator's directory (`$CLAUDE_PROJECT_DIR`, else the
+  working directory) add that root to the coordinator's `.coding-agent/roots.json`, so its board and auto-clean see
+  the tasks and worktrees recorded there.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
 - `plan-apply FILE`, `plan-next FILE [--max N] [--permission-mode M]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
 """
@@ -99,6 +104,7 @@ def _permission_option(command: argparse.ArgumentParser) -> None:
 
 
 AUTO_CLEAN_AFTER = frozenset({"plan-next", "plan-status", "inbox", "delegate"})
+ROOT_REGISTERED = frozenset({"delegate", "plan-next"})
 
 
 def _auto_clean(root: Path, run: str | None) -> None:
@@ -113,6 +119,45 @@ def _auto_clean(root: Path, run: str | None) -> None:
             print(f"auto-clean: removed {Path(item.worktree).name} ({item.task_id})")
         else:
             print(f"auto-clean: warning: {Path(item.worktree).name} ({item.task_id}) {outcome}", file=sys.stderr)
+
+
+def _inbox(args: argparse.Namespace, root: Path) -> int:
+    if args.task_id and not args.ack:
+        print("inbox: --task-id only goes with --ack", file=sys.stderr)
+        return 2
+    if args.run is None:
+        note = orca_cli.sync_bound_run(root)
+        if note:
+            print(f"inbox: {note}")
+    try:
+        reports = _read_inbox(args, root)
+    except orca_cli.OrcaError as error:
+        bound = orca_cli.fenced_run(error) if args.run is None else None
+        note = orca_cli.switch_run(root, bound) if bound else None
+        if not note:
+            raise
+        print(f"inbox: {note}")
+        reports = _read_inbox(args, root)
+    roots = orca_cli.all_roots(root)
+    owners, plans, home = coordinator.repo_owners(roots), coordinator.plan_ids(roots), orca.project_name(root)
+    if not args.ack:
+        lines = coordinator.report_lines(reports, plans, owners, home)
+        print("\n".join(lines[:-1]) if lines else "inbox: no worker reports")
+        return 0
+    for report in reports:
+        name = coordinator.report_name(report, plans, owners, home, always_repo=True)
+        print(f"  - {name}: {report.get('outcome') or report.get('type')} — {report.get('subject', '')}")
+    scope = f" of {', '.join(args.task_id)}" if args.task_id else ""
+    print(f"inbox: acknowledged {len(reports)} report(s){scope}" if reports else f"inbox: no worker reports{scope} to acknowledge")
+    return 0
+
+
+def _read_inbox(args: argparse.Namespace, root: Path) -> list[dict]:
+    if args.ack and args.task_id:
+        return orca_cli.ack_task_reports(root, set(args.task_id), args.run)
+    if args.ack:
+        return orca_cli.drop_acked(root, orca_cli.ack_reports(args.run))
+    return orca_cli.drop_acked(root, orca_cli.unread_reports(args.run))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -182,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     wt_clean.add_argument("--run")
     inbox = sub.add_parser("inbox", help="unhandled worker reports")
     inbox.add_argument("--ack", action="store_true", help="acknowledge the reports after printing them")
+    inbox.add_argument("--task-id", action="append", default=[], help="with --ack: acknowledge only this task's reports (repeatable)")
     inbox.add_argument("--run")
     run_init = sub.add_parser("run-init", help="create an Orca Run from this terminal and store it")
     run_init.add_argument("--objective", required=True)
@@ -210,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = _root(args.root)
     orca_cli.use_stored_run(root)
+    if args.command in ROOT_REGISTERED and orca_cli.register_root(orca_cli.coordinator_root(), root):
+        print(f"roots: {root} ghi vào {orca_cli.coordinator_root() / orca_cli.ROOTS_FILE}", file=sys.stderr)
     code = _command(args, root)
     if args.command in AUTO_CLEAN_AFTER:
         _auto_clean(root, args.run)
@@ -268,12 +316,7 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             missed = [outcome for _item, outcome in results if outcome.startswith("failed") or (outcome.startswith("kept") and not args.all)]
             return 1 if unknown or missed else 0
         if args.command == "inbox":
-            reports = orca_cli.ack_reports(args.run) if args.ack else orca_cli.unread_reports(args.run)
-            lines = coordinator.report_lines(reports, coordinator._plan_ids(root))
-            print("\n".join(lines[:-1]) if lines else "inbox: no worker reports")
-            if args.ack and reports:
-                print(f"inbox: acknowledged {len(reports)} report(s)")
-            return 0
+            return _inbox(args, root)
         if args.command == "run-init":
             print(json.dumps({"run": orca_cli.run_init(root, args.objective)}))
             return 0

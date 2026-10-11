@@ -79,6 +79,119 @@ def use_stored_run(root: Path) -> None:
         os.environ[RUN_ENV] = stored
 
 
+def stored_run(root: Path) -> str:
+    """The Run id in `root`'s `.coding-agent/orca-run`, or "" when none is stored."""
+    try:
+        return (root / RUN_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+# `check` from a coordinator terminal bound to another Run answers
+# `consumer_fenced: This coordinator terminal is bound to run_X, not run_Y`.
+FENCED = re.compile(r"bound to (run_[A-Za-z0-9_-]+)")
+
+
+def fenced_run(error: object) -> str | None:
+    """The Run a `consumer_fenced` error says this terminal is bound to, or None for any other error."""
+    match = FENCED.search(str(error))
+    return match.group(1) if match else None
+
+
+def bound_run() -> str | None:
+    """The Run Orca has bound to this terminal (`run-current`), or None when there is none or Orca cannot say."""
+    try:
+        answer = _call("run-current")
+    except OrcaError:
+        return None
+    result = answer.get("result") if isinstance(answer, dict) else None
+    run = result.get("run") if isinstance(result, dict) else None
+    if isinstance(run, dict):
+        run = run.get("id") or run.get("runId")
+    return run if isinstance(run, str) and run else None
+
+
+def switch_run(root: Path, new: str, session: str = "cli") -> str | None:
+    """Store `new` as `root`'s Run and make it this process's default, with an event. Returns the line saying so,
+    or None when `new` was already the stored and current Run."""
+    old = stored_run(root)
+    if old == new and os.environ.get(RUN_ENV) == new:
+        return None
+    path = root / RUN_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new + "\n", encoding="utf-8")
+    os.environ[RUN_ENV] = new
+    events.record(root, guard="orca-run", kind="run-switched", mode="enforce", applied=True, session=session,
+                  detail={"from": old or None, "to": new})
+    return f"đã chuyển Run từ {old or '(chưa lưu)'} sang {new} (Run mà terminal coordinator đang gắn)"
+
+
+def sync_bound_run(root: Path, session: str = "cli") -> str | None:
+    """Follow the Run Orca has bound to this terminal when `root` stores another one. Returns `switch_run`'s line or None.
+
+    A `CODING_AGENT_ORCA_RUN` that differs from the stored Run was set by the user and is kept.
+    """
+    stored = stored_run(root)
+    env = os.environ.get(RUN_ENV)
+    if env and env != stored:
+        return None
+    bound = bound_run()
+    if not bound or (bound == stored and env == stored):
+        return None
+    return switch_run(root, bound, session)
+
+
+# Repositories the coordinator delegated into with `--root`. Their links, plan ledger and worker records live under
+# their own `.coding-agent`, so the coordinator's board and auto-clean read them through this list.
+ROOTS_FILE = Path(".coding-agent") / "roots.json"
+
+
+def coordinator_root() -> Path:
+    """The coordinator's own directory: `$CLAUDE_PROJECT_DIR`, else the working directory."""
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    return Path(env).resolve() if env else Path.cwd().resolve()
+
+
+def registered_roots(root: Path) -> list[Path]:
+    """The other repositories `root` delegated into, from `roots.json`, existing ones only, without `root` itself."""
+    try:
+        data = json.loads((root / ROOTS_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    own = root.resolve()
+    out: list[Path] = []
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, str):
+            continue
+        path = Path(item).resolve()
+        if path != own and path not in out and path.is_dir():
+            out.append(path)
+    return out
+
+
+def all_roots(root: Path) -> list[Path]:
+    """`root` first, then every repository it delegated into."""
+    return [root.resolve(), *registered_roots(root)]
+
+
+def register_root(coordinator: Path, root: Path) -> bool:
+    """Add `root` to the coordinator's `roots.json`. Returns False when it is the coordinator or already listed."""
+    coordinator, root = coordinator.resolve(), root.resolve()
+    if root == coordinator:
+        return False
+    path = coordinator / ROOTS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = []
+    listed = [item for item in data if isinstance(item, str)] if isinstance(data, list) else []
+    if any(Path(item).resolve() == root for item in listed):
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([*listed, str(root)], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return True
+
+
 def run_init(root: Path, objective: str) -> str:
     """Create an Orca Run from this terminal and store its id for later commands and hooks. Returns the Run id.
 
@@ -967,6 +1080,7 @@ def _reports(answer: Any) -> list[dict[str, Any]]:
                 payload = {}
         payload = payload if isinstance(payload, dict) else {}
         out.append({
+            "id": message.get("id"),
             "task_id": payload.get("taskId"),
             "dispatch": payload.get("dispatchId"),
             "outcome": payload.get("outcome"),
@@ -982,13 +1096,74 @@ def unread_reports(run: str | None = None) -> list[dict[str, Any]]:
     return _reports(_call("check", "--peek", *_run_args(run)))
 
 
-def ack_reports(run: str | None = None) -> list[dict[str, Any]]:
-    """Take delivery of the unread reports and acknowledge them. Returns the reports that were acknowledged."""
+def _take_delivery(run: str | None) -> tuple[list[dict[str, Any]], str | None]:
+    """Take delivery of the oldest unacknowledged batch: its worker reports and its delivery id."""
     answer = _call("check", *_run_args(run))
-    reports = _reports(answer)
     result = answer.get("result") if isinstance(answer, dict) else None
     delivery = (result.get("deliveryId") or result.get("delivery_id")) if isinstance(result, dict) else None
-    if isinstance(delivery, str) and delivery:
+    return _reports(answer), delivery if isinstance(delivery, str) and delivery else None
+
+
+def ack_reports(run: str | None = None) -> list[dict[str, Any]]:
+    """Take delivery of the unread reports and acknowledge them. Returns the reports that were acknowledged."""
+    reports, delivery = _take_delivery(run)
+    if delivery:
         _call("check", "--ack", delivery, *_run_args(run))
     return reports
 
+
+# Orca acknowledges a whole delivery batch at once. Reports the coordinator acknowledged one task at a time are kept
+# here until the rest of their batch is handled too, and are left out of what it reads as unread.
+ACKED_FILE = Path(".coding-agent") / "acked.jsonl"
+
+
+def report_key(report: dict[str, Any]) -> str:
+    """A report's identity: its Orca message id, else its task, dispatch, type and subject."""
+    if report.get("id"):
+        return str(report["id"])
+    return "|".join(str(report.get(key) or "") for key in ("task_id", "dispatch", "type", "subject"))
+
+
+def acked_keys(root: Path) -> set[str]:
+    path = root / ACKED_FILE
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    keys: set[str] = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("key"), str):
+            keys.add(record["key"])
+    return keys
+
+
+def drop_acked(root: Path, reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`reports` without the ones acknowledged per task (`ack_task_reports`)."""
+    done = acked_keys(root)
+    return [report for report in reports if report_key(report) not in done] if done else reports
+
+
+def ack_task_reports(root: Path, task_ids: set[str], run: str | None = None) -> list[dict[str, Any]]:
+    """Acknowledge only the unread reports of `task_ids`. Returns them.
+
+    They are recorded in `ACKED_FILE`. Orca's batch is acknowledged only once no other unread report is left and the
+    batch it delivers holds nothing that was not acknowledged, so a report of another task is never acknowledged here.
+    """
+    pending = drop_acked(root, unread_reports(run))
+    chosen = [report for report in pending if str(report.get("task_id")) in task_ids]
+    if chosen:
+        path = root / ACKED_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            for report in chosen:
+                handle.write(json.dumps({"key": report_key(report), "task_id": report.get("task_id")}, ensure_ascii=False) + "\n")
+    if len(chosen) == len(pending):
+        batch, delivery = _take_delivery(run)
+        done = acked_keys(root)
+        if delivery and all(report_key(report) in done for report in batch):
+            _call("check", "--ack", delivery, *_run_args(run))
+    return chosen

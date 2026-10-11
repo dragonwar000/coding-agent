@@ -246,7 +246,8 @@ def contract(python_src: str) -> str:
         "- Folder project (root không phải repo git, chứa nhiều repo con): mọi lệnh delegate phải có `--repo <đường dẫn repo>`, và mỗi node trong plan đặt `repo:`. Worker tách nhánh từ HEAD của repo đó; đổi bằng `--base-branch` / `base:`.",
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
-        "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, chạy `plan-next`, rồi `inbox --ack`.",
+        "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, rồi `inbox --ack --task-id <id>` cho đúng task vừa gộp (không ack cả hộp thư: báo cáo chưa xem sẽ mất khỏi bảng), rồi `plan-next`.",
+        "- Task giao bằng `delegate`/`plan-next` với `--root <repo khác>` được ghi vào .coding-agent/roots.json, nên vẫn hiện trên bảng (kèm tên repo) và được tự dọn như task của repo này.",
         "- " + RECOVER,
         "- Worktree của worker đã xong, đã gộp và sạch thì tự được xoá (khi dựng bảng việc và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`), không cần hỏi người dùng. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit: kiểm rồi gộp nhánh vào HEAD, lượt sau nó tự được dọn. Muốn bỏ việc đó thì hỏi người dùng trong hội thoại trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp; host cũng hỏi xác nhận, trừ khi phiên đang bypass permissions).",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
@@ -255,12 +256,16 @@ def contract(python_src: str) -> str:
     ])
 
 
-def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: str) -> list[str]:
-    """The task board for this repository, one line per task, grouped by state."""
-    mine = [{**task, "project": owners[str(task.get("id"))]} for task in tasks if owners.get(str(task.get("id"))) == project]
+def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: str, others: frozenset[str] | set[str] = frozenset()) -> list[str]:
+    """The task board for this repository, one line per task, grouped by state.
+
+    `others` are the repositories this coordinator delegated into; their tasks are listed too, each with its repository.
+    """
+    shown = {project, *others}
+    mine = [{**task, "project": owners[str(task.get("id"))]} for task in tasks if owners.get(str(task.get("id"))) in shown]
     if not mine:
         return ["bảng việc: chưa có task nào của repo này"]
-    groups = orca.reconcile(mine, project=project)
+    groups = orca.reconcile(mine)
     labels = {
         "running": "đang chạy",
         "never_dispatched": "chưa giao worker",
@@ -276,7 +281,8 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
         lines.append(f"{label} ({len(items)}):")
         for task in items:
             title = task.get("task_title") or task.get("title") or ""
-            lines.append(f"  - {task.get('id')} [{task.get('status')}] {title}".rstrip())
+            repo = f" (repo {task['project']})" if task.get("project") != project else ""
+            lines.append(f"  - {task.get('id')} [{task.get('status')}] {title}".rstrip() + repo)
     return lines[:BOARD_LIMIT] + (["  ..."] if len(lines) > BOARD_LIMIT else [])
 
 
@@ -296,20 +302,44 @@ def board_context(board: list[str], error: str | None) -> str:
 def read_board(root: Path, run: str | None = None, session: str = "board") -> tuple[list[str], str | None]:
     """The board lines for this repository, or the reason Orca could not be read.
 
-    Settled worker worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists
-    only the ones that still hold work.
+    The Run read is the one Orca has bound to this terminal: when `root` stores another one (an older Run, fenced by
+    Orca), the board switches to the bound Run, stores it, and says so in its first line. Tasks, reports and worker
+    worktrees are read for `root` and every repository it delegated into (`orca_cli.all_roots`). Settled worker
+    worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists only the ones
+    that still hold work; that group does not depend on the inbox being readable.
     """
     orca_cli.use_stored_run(root)
+    notes: list[str] = []
+    if run is None:
+        note = orca_cli.sync_bound_run(root, session=session)
+        notes += [note] if note else []
+    lines, error, fenced = _board(root, run, session)
+    if fenced and run is None:
+        note = orca_cli.switch_run(root, fenced, session=session)
+        if note:
+            notes.append(note)
+            lines, error, fenced = _board(root, run, session)
+    return notes + lines, error
+
+
+def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | None, str | None]:
+    """`read_board` for the current Run: (lines, error, the Run Orca says this terminal is bound to when it fenced a call)."""
     try:
         tasks = orca_cli.list_tasks(run)
     except orca_cli.OrcaError as error:
-        return [], str(error)[:300]
-    lines = board_lines(tasks, orca_cli.links(root), orca.project_name(root))
+        return [], str(error)[:300], orca_cli.fenced_run(error)
+    roots = orca_cli.all_roots(root)
+    owners = repo_owners(roots)
+    home = orca.project_name(root)
+    lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]})
     try:
-        reports = orca_cli.unread_reports(run)
+        reports = orca_cli.drop_acked(root, orca_cli.unread_reports(run))
     except orca_cli.OrcaError as error:
-        return lines + [f"hộp thư worker không đọc được: {str(error)[:160]}"], None
-    lines = lines + report_lines(reports, _plan_ids(root))
+        if orca_cli.fenced_run(error):
+            return lines, None, orca_cli.fenced_run(error)
+        lines.append(f"hộp thư worker không đọc được: {str(error)[:160]}")
+    else:
+        lines += report_lines(reports, plan_ids(roots), owners, home)
     try:
         from coding_agent import cleanup
 
@@ -318,7 +348,23 @@ def read_board(root: Path, run: str | None = None, session: str = "board") -> tu
         lines = lines + cleanup.board_lines([item for item in found if item.worktree not in removed])
     except orca_cli.OrcaError as error:
         lines.append(f"danh sách worktree chờ dọn không đọc được: {str(error)[:160]}")
-    return lines, None
+    return lines, None, None
+
+
+def repo_owners(roots: list[Path]) -> dict[str, str]:
+    """Orca task id to its repository, from the link ledgers of `roots`; the first root's links win."""
+    owners: dict[str, str] = {}
+    for root in reversed(roots):
+        owners.update(orca_cli.links(root))
+    return owners
+
+
+def plan_ids(roots: list[Path]) -> dict[str, str]:
+    """`_plan_ids` of every root; the first root's plan wins."""
+    out: dict[str, str] = {}
+    for root in reversed(roots):
+        out.update(_plan_ids(root))
+    return out
 
 
 def _plan_ids(root: Path) -> dict[str, str]:
@@ -331,19 +377,32 @@ def _plan_ids(root: Path) -> dict[str, str]:
     return {task_id: node for node, task_id in data.items() if isinstance(node, str) and isinstance(task_id, str)} if isinstance(data, dict) else {}
 
 
-def report_lines(reports: list[dict[str, Any]], plan_ids: dict[str, str]) -> list[str]:
+def report_name(report: dict[str, Any], plan_ids: dict[str, str], owners: dict[str, str] | None = None, home: str | None = None,
+                always_repo: bool = False) -> str:
+    """How a report's task is named: `node <id> (<task>)` or `<task>`, with its repository when it is not `home`
+    (or always, with `always_repo`)."""
+    task_id = str(report.get("task_id") or "?")
+    node = plan_ids.get(task_id)
+    name = f"node {node} ({task_id})" if node else task_id
+    repo = (owners or {}).get(task_id)
+    if always_repo or (repo and repo != home):
+        name += f" [repo {repo or '?'}]"
+    return name
+
+
+def report_lines(reports: list[dict[str, Any]], plan_ids: dict[str, str], owners: dict[str, str] | None = None,
+                 home: str | None = None) -> list[str]:
     """Lines for the unacknowledged worker reports, with the next step. Empty when there are none."""
     if not reports:
         return []
     lines = [f"worker vừa báo, chưa xử lý ({len(reports)}):"]
     for report in reports[:10]:
         task_id = str(report.get("task_id") or "?")
-        node = plan_ids.get(task_id)
-        name = f"node {node} ({task_id})" if node else task_id
+        name = report_name(report, plan_ids, owners, home)
         lines.append(f"  - {name}: {report.get('outcome') or report.get('type')} — {report.get('subject', '')[:80]}")
         if str(report.get("subject", "")).startswith(REJECTED_PREFIX):
             lines.append(f"    worker_done bị Orca từ chối (thiếu token); kiểm kết quả rồi `worker-settle --task-id {task_id} --basis verifier`")
-    lines.append("  việc cần làm: kiểm kết quả của worker, gộp nhánh nếu đạt, chạy `plan-next` để giao node kế, rồi `inbox --ack`.")
+    lines.append("  việc cần làm: kiểm kết quả của worker, gộp nhánh nếu đạt, rồi `inbox --ack --task-id <id>` cho task đó, rồi `plan-next` để giao node kế.")
     return lines
 
 

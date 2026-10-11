@@ -46,3 +46,14 @@ def no_session_project(tmp_path_factory: pytest.TempPathFactory, monkeypatch: py
     """No test sees the real session's project: no CLAUDE_PROJECT_DIR, and an empty working directory."""
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
+
+
+@pytest.fixture(autouse=True)
+def no_real_orca(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches the real `orca` CLI (or the Run this machine's terminal is bound to): a test that needs Orca
+    patches `orca_cli` or points `CODING_AGENT_ORCA` at the fake."""
+    monkeypatch.setenv("CODING_AGENT_ORCA", "orca-not-available-in-tests")
+    # The code under test sets CODING_AGENT_ORCA_RUN in os.environ directly (a stored or bound Run); recording it here
+    # makes monkeypatch restore it after each test, so a Run never leaks into the next one.
+    monkeypatch.setenv("CODING_AGENT_ORCA_RUN", "unset")
+    monkeypatch.delenv("CODING_AGENT_ORCA_RUN")

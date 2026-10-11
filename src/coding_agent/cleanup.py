@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from coding_agent import events, orca_cli
+from coding_agent import events, orca, orca_cli
 
 SETTLED = ("completed", "failed")
 AUTO_ENV = "CODING_AGENT_AUTO_CLEAN"
@@ -42,6 +42,8 @@ class Candidate:
     exists: bool
     dirty: int
     unmerged: int
+    root: str = ""  # the repository whose workers ledger lists the worktree; "" for the coordinator's own
+    repo: str = ""  # that repository's name, when it is not the coordinator's
 
     @property
     def safe(self) -> bool:
@@ -86,6 +88,8 @@ HARNESS_RUNTIME = (
     ".coding-agent/plan.json",       # plan.LEDGER: plan id -> Orca task id
     ".coding-agent/installed.json",  # gate.INSTALLED / project_install record
     ".coding-agent/backups/",        # project_install package backups
+    ".coding-agent/roots.json",      # orca_cli.ROOTS_FILE: repositories the coordinator delegated into
+    ".coding-agent/acked.jsonl",     # orca_cli.ACKED_FILE: reports acknowledged one task at a time
 )
 
 
@@ -152,25 +156,37 @@ def _empty_dir(path: Path) -> bool:
 
 
 def candidates(root: Path, run: str | None = None) -> list[Candidate]:
-    """Worker worktrees whose task settled, oldest first, with what removing each one would lose."""
+    """Worker worktrees whose task settled, oldest first, with what removing each one would lose.
+
+    Read from `root`'s workers ledger and from that of every repository `root` delegated into (`orca_cli.all_roots`);
+    a worktree listed by two of them (repositories sharing one git directory) is listed once.
+    """
     tasks = {str(task.get("id")): task for task in orca_cli.list_tasks(run)}
+    home = orca.project_name(root)
+    own = root.resolve()
     found: list[Candidate] = []
-    for record in orca_cli.worker_records(root):
-        task = tasks.get(record["task_id"])
-        if task is None or task.get("status") not in SETTLED:
-            continue
-        path = Path(record["worktree"])
-        exists = path.is_dir() and not _empty_dir(path)
-        found.append(Candidate(
-            task_id=record["task_id"],
-            dispatch=record["dispatch"],
-            worktree=record["worktree"],
-            status=str(task.get("status")),
-            title=str(task.get("task_title") or task.get("title") or ""),
-            exists=exists,
-            dirty=_dirty(path) if exists else 0,
-            unmerged=_unmerged(orca_cli.repo_of(root, record), path, record.get("base", "")) if exists else 0,
-        ))
+    seen: set[str] = set()
+    for owner in orca_cli.all_roots(root):
+        name = orca.project_name(owner) if owner != own else home
+        for record in orca_cli.worker_records(owner):
+            task = tasks.get(record["task_id"])
+            if record["worktree"] in seen or task is None or task.get("status") not in SETTLED:
+                continue
+            seen.add(record["worktree"])
+            path = Path(record["worktree"])
+            exists = path.is_dir() and not _empty_dir(path)
+            found.append(Candidate(
+                task_id=record["task_id"],
+                dispatch=record["dispatch"],
+                worktree=record["worktree"],
+                status=str(task.get("status")),
+                title=str(task.get("task_title") or task.get("title") or ""),
+                exists=exists,
+                dirty=_dirty(path) if exists else 0,
+                unmerged=_unmerged(orca_cli.repo_of(owner, record), path, record.get("base", "")) if exists else 0,
+                root="" if owner == own else str(owner),
+                repo="" if name == home else name,
+            ))
     return found
 
 
@@ -197,7 +213,7 @@ def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session
         except orca_cli.OrcaError as error:
             results.append((item, f"failed: {str(error)[:200]}"))
             continue
-        orca_cli.mark_removed(root, item.worktree)
+        orca_cli.mark_removed(Path(item.root) if item.root else root, item.worktree)
         events.record(root, guard="coordinator", kind=kind, mode="enforce", applied=True, session=session,
                       detail={"task_id": item.task_id, "worktree": item.worktree, "discarded": discard and not item.safe})
         results.append((item, "removed"))
@@ -235,7 +251,7 @@ def auto_clean(root: Path, run: str | None = None, *, session: str = "cli",
     if not auto_enabled():
         return []
     if found is None:
-        if not orca_cli.worker_records(root):
+        if not any(orca_cli.worker_records(owner) for owner in orca_cli.all_roots(root)):
             return []
         found = candidates(root, run)
     chosen = [item for item in found if item.safe or not item.exists]
@@ -246,13 +262,16 @@ def board_lines(found: list[Candidate]) -> list[str]:
     """Lines for the coordinator's board. Empty when no worktree is left.
 
     Merged, clean worktrees are removed by `auto_clean` before the board is built, so what is listed here normally
-    holds work that is not merged or not committed.
+    holds work that is not merged or not committed. This group comes from git and the workers ledger, not from the
+    inbox: a finished task whose branch is not merged stays listed until it is merged or discarded, even after its
+    report was acknowledged.
     """
     if not found:
         return []
-    lines = [f"worktree của worker đã xong, còn việc chưa gộp hoặc chưa commit ({len(found)}):"]
+    lines = [f"xong, worktree còn việc chưa gộp hoặc chưa commit ({len(found)}):"]
     for item in found[:10]:
-        lines.append(f"  - {Path(item.worktree).name} ({item.task_id}, {item.status}): {item.describe()}")
+        repo = f", repo {item.repo}" if item.repo else ""
+        lines.append(f"  - {Path(item.worktree).name} ({item.task_id}, {item.status}{repo}): {item.describe()}")
     lines.append("  việc cần làm: worktree đã gộp và sạch tự được xoá, không cần hỏi ai. Với các worktree trên: kiểm rồi gộp nhánh vào HEAD (lượt sau nó tự được dọn); "
                  "nếu muốn bỏ việc đó thì hỏi người dùng trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp). "
                  "Worktree ghi 'sạch, đã gộp' chỉ còn khi tự dọn bị tắt (CODING_AGENT_AUTO_CLEAN=off): xoá bằng `worktree-clean --task-id <id>`, không cần --yes.")

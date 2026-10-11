@@ -258,9 +258,23 @@ hay `blocked` không bao giờ được giao. Ánh xạ plan id → Orca task id
 chưa xử lý, kèm node tương ứng và việc cần làm. Đọc bảng không đánh dấu đã đọc; `inbox --ack` mới đánh dấu.
 
 ```sh
-python3 -m coding_agent.cli inbox          # báo cáo worker chưa xử lý
-python3 -m coding_agent.cli inbox --ack    # đánh dấu đã xử lý
+python3 -m coding_agent.cli inbox                             # báo cáo worker chưa xử lý
+python3 -m coding_agent.cli inbox --ack --task-id <id>        # đánh dấu đã xử lý chỉ báo cáo của task đó (lặp được)
+python3 -m coding_agent.cli inbox --ack                       # đánh dấu đã xử lý cả hộp thư
 ```
+
+- `inbox --ack` in từng báo cáo vừa đánh dấu (task, repo, subject). Gộp xong một task thì ack đúng task đó bằng `--task-id`:
+  ack cả hộp thư làm báo cáo chưa xem mất khỏi bảng. Orca chỉ ack được cả một lô (delivery); báo cáo ack theo task được ghi vào
+  `.coding-agent/acked.jsonl` và bị lọc khỏi bảng/`inbox`, còn lô Orca chỉ được ack khi mọi báo cáo trong lô đã được ack.
+- **Bảng việc theo Run đang gắn:** bảng việc và `inbox` (khi không có `--run`) đọc Run mà Orca đang gắn với terminal coordinator
+  (`orca orchestration run-current`, hoặc lỗi `consumer_fenced: ... bound to run_X`). Khi khác Run đã lưu, Run mới được ghi vào
+  `.coding-agent/orca-run`, ghi event `run-switched`, và dòng đầu của bảng ghi `đã chuyển Run từ A sang X`. `CODING_AGENT_ORCA_RUN`
+  do người dùng đặt (khác Run đã lưu) thì được giữ.
+- **Giao vào repo khác:** `delegate`/`plan-next` với `--root` khác thư mục coordinator (`$CLAUDE_PROJECT_DIR`, không có thì thư mục
+  làm việc) ghi root đó vào `.coding-agent/roots.json` của coordinator. Bảng việc, báo cáo, `worktree-list` và tự dọn đọc
+  links, `plan.json` và sổ worker của mọi root đã ghi; dòng của task ở repo khác kèm tên repo.
+- Nhóm `xong, worktree còn việc chưa gộp hoặc chưa commit` lấy từ git và sổ worker, không từ hộp thư: nó luôn hiện, kể cả khi
+  hộp thư không đọc được hay báo cáo đã được ack, tới khi nhánh được gộp hoặc bỏ.
 
 ### Folder project: root chứa nhiều repo git
 
@@ -360,7 +374,7 @@ python3 -m coding_agent.cli worktree-clean --task-id <id> --discard --yes   # b�
 - Worktree còn file chưa commit, hoặc còn commit của worker mà nhánh của coordinator chưa có, được **giữ lại**. Với
   `--task-id` thì lệnh thoát 1; với `--all` thì đó là chủ ý và lệnh thoát 0. Nếu git không so sánh được, worktree cũng được giữ.
 - File harness tự ghi vào worktree (`.coding-agent/events.jsonl`, `.coding-agent/state/`, `orca-run`, `links.jsonl`,
-  `workers.jsonl`, `plan.json`, `installed.json`, `backups/`) không tính là việc; `.coding-agent/plan.yaml` thì có. Trên Windows,
+  `workers.jsonl`, `plan.json`, `installed.json`, `backups/`, `roots.json`, `acked.jsonl`) không tính là việc; `.coding-agent/plan.yaml` thì có. Trên Windows,
   thay đổi chỉ ở bit thực thi (repo clone bằng git của WSL/Linux) cũng không tính.
 - Tự dọn chỉ thấy task của Run đang dùng (`CODING_AGENT_ORCA_RUN`, hoặc Run đã lưu); worktree của task thuộc Run cũ phải xoá tay.
 - Xoá gồm: nhả terminal của worker, `orca worktree rm` (xoá cả nhánh), và ghi `removed` vào sổ worker.
