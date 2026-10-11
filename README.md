@@ -273,8 +273,19 @@ python3 -m coding_agent.cli inbox --ack                       # đánh dấu đ�
   như cũ). Khi khác Run đã lưu, dòng đầu của bảng ghi `bảng theo Run X của terminal này (orca-run lưu Y)` và event `run-differs`
   được ghi tối đa một lần mỗi phiên (đánh dấu ở `.coding-agent/state/orca-run.<session>`).
 - **Giao vào repo khác:** `delegate`/`plan-next` với `--root` khác thư mục coordinator (`$CLAUDE_PROJECT_DIR`, không có thì thư mục
-  làm việc) ghi root đó vào `.coding-agent/roots.json` của coordinator. Bảng việc, báo cáo, `worktree-list` và tự dọn đọc
-  links, `plan.json` và sổ worker của mọi root đã ghi; dòng của task ở repo khác kèm tên repo.
+  làm việc). Bảng việc, báo cáo, `inbox`, `worktree-list`, tự dọn và `roots-list` cùng đọc một danh sách (`orca_cli.all_roots`):
+  thư mục coordinator; mọi thư mục trong cây của nó (tối đa 3 cấp, không vào thư mục ẩn, `node_modules`... hay bên trong repo con)
+  có `.coding-agent/links.jsonl`, tìm lại mỗi lần đọc; và repo ngoài cây ghi trong `.coding-agent/roots.json` (lệnh `--root` ghi
+  vào đó chỉ khi root nằm ngoài cây). Từ mỗi root đọc links, `plan.json` và sổ worker; dòng của task ở repo khác kèm tên repo.
+  Task của Run mà chưa sổ nào biết (giao trước khi có `roots.json`) được tìm lại repo từ Orca (`orchestration worker-list` →
+  worktree → repo chính, hoặc main worktree Orca liệt kê) và ghi vào `roots.json` nếu `links.jsonl` của repo đó có task; lỗi Orca
+  ghi event `guard=roots`, thử lại sau 10 phút. `roots-list` liệt kê kèm nguồn (`own`, `tree`, `roots.json`); `roots-add <path>...`
+  ghi tay repo ngoài cây.
+- **Worker đang hỏi:** worker chờ trả lời `orca orchestration ask` (type `question`/`escalation`, hoặc `payload.question`) nằm ở
+  nhóm đầu bảng `worker đang hỏi, chờ trả lời (N):` kèm lựa chọn, msg id và lệnh `orca orchestration reply --id <msg> --run <run>`,
+  và không còn nằm trong `đang chạy`. Đã trả lời = có tin cùng thread, worker báo cáo task, hoặc câu hỏi mới hơn của cùng dispatch;
+  heartbeat và `send` thường tới dispatch không tính. Task đang chạy mà worker im lặng quá 20 phút ghi `(không có tin X phút)`.
+  `inbox` (không `--ack`) in cả câu hỏi mở.
 - Nhóm `xong, worktree còn việc chưa gộp hoặc chưa commit` lấy từ git và sổ worker, không từ hộp thư: nó luôn hiện, kể cả khi
   hộp thư không đọc được hay báo cáo đã được ack, tới khi nhánh được gộp hoặc bỏ.
 

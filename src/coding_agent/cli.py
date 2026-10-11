@@ -32,11 +32,18 @@
   `CODING_AGENT_AUTO_CLEAN=off` turns that off. An auto-clean error is a warning and does not change the exit code.
 - `inbox [--ack [--task-id ID ...]]`: worker reports the coordinator has not handled; `--ack` acknowledges them and prints
   each one (task, repository, subject). With `--task-id` (repeatable) only those tasks' reports are acknowledged.
+  Without `--ack` it first prints the worker questions nobody answered, each with its `orca orchestration reply` command.
   Without `--run`, the inbox follows the Run Orca has bound to this terminal (`orca_cli.sync_bound_run`); the shared
   `.coding-agent/orca-run` is not rewritten.
-- `delegate` and `plan-next` with a `--root` other than the coordinator's directory (`$CLAUDE_PROJECT_DIR`, else the
-  working directory) add that root to the coordinator's `.coding-agent/roots.json`, so its board and auto-clean see
-  the tasks and worktrees recorded there.
+- The board, `inbox`, auto-clean and `roots-list` read the coordinator's directory and every repository it delegated
+  into with `--root` (`orca_cli.all_roots`): a directory in the coordinator's tree (at most `orca_cli.SCAN_DEPTH` levels,
+  not inside a child repository) that holds `.coding-agent/links.jsonl` is found on each read; a repository outside the
+  tree is kept in the coordinator's `.coding-agent/roots.json`, which `delegate` and `plan-next` with such a `--root`
+  write (the coordinator's directory is `$CLAUDE_PROJECT_DIR`, else the working directory).
+- A task of the Run that no known link ledger owns (delegated before `roots.json` existed) makes the board, `inbox` and
+  auto-clean look its repository up from Orca's worker records and register it (`roots.discover`).
+- `roots-list`: the repositories `all_roots` reads, each with where it comes from (`own`, `tree`, `roots.json`).
+- `roots-add PATH...`: register repositories outside the tree by hand. Both act on `--root`, else the coordinator's directory.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
 - `plan-apply FILE`, `plan-next FILE [--max N] [--permission-mode M]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
 """
@@ -51,7 +58,7 @@ from pathlib import Path
 import os
 import uuid
 
-from coding_agent import cleanup, coordinator, events, orca, orca_cli
+from coding_agent import cleanup, coordinator, events, orca, orca_cli, roots
 from coding_agent import plan as plan_graph
 from coding_agent.brief import BriefError, brief
 from coding_agent.hooks import utf8_output
@@ -141,17 +148,38 @@ def _inbox(args: argparse.Namespace, root: Path) -> int:
         if note:
             print(f"inbox: {note}", file=sys.stderr)
         reports = _read_inbox(args, root)
-    roots = orca_cli.all_roots(root)
-    owners, plans, home = coordinator.repo_owners(roots), coordinator.plan_ids(roots), orca.project_name(root)
+    roots.discover(root, [str(report.get("task_id") or "") for report in reports], args.run)
+    known = orca_cli.all_roots(root)
+    owners, plans, home = coordinator.repo_owners(known), coordinator.plan_ids(known), orca.project_name(root)
     if not args.ack:
+        try:
+            asking = coordinator.question_lines(orca_cli.worker_activity(args.run)[0], owners, home, orca_cli.run_id(args.run))
+        except orca_cli.OrcaError as error:
+            asking = [f"inbox: worker questions unreadable: {str(error)[:160]}"]
         lines = coordinator.report_lines(reports, plans, owners, home)
-        print("\n".join(lines[:-1]) if lines else "inbox: no worker reports")
+        print("\n".join(asking + (lines[:-1] if lines else ["inbox: no worker reports"])))
         return 0
     for report in reports:
         name = coordinator.report_name(report, plans, owners, home, always_repo=True)
         print(f"  - {name}: {report.get('outcome') or report.get('type')} — {report.get('subject', '')}")
     scope = f" of {', '.join(args.task_id)}" if args.task_id else ""
     print(f"inbox: acknowledged {len(reports)} report(s){scope}" if reports else f"inbox: no worker reports{scope} to acknowledge")
+    return 0
+
+
+def _roots(args: argparse.Namespace) -> int:
+    coordinator_dir = _root(args.root) if args.root else orca_cli.coordinator_root()
+    if args.command == "roots-add":
+        results = roots.add(coordinator_dir, args.paths)
+        for path, outcome in results:
+            print(f"{outcome}: {path}")
+        if any(outcome == "tree" for _path, outcome in results):
+            print("roots-add: `tree` paths are in the coordinator's tree; they are read once they hold .coding-agent/links.jsonl")
+        return 1 if any(outcome == "missing" for _path, outcome in results) else 0
+    listed = roots.listing(coordinator_dir)
+    print(f"roots of {listed[0][0]} (tree up to {orca_cli.SCAN_DEPTH} levels, and {coordinator_dir / orca_cli.ROOTS_FILE}):")
+    for path, source in listed:
+        print(f"  {path} [{source}] ({len(orca_cli.links(path))} task link(s))")
     return 0
 
 
@@ -232,6 +260,9 @@ def main(argv: list[str] | None = None) -> int:
     inbox.add_argument("--ack", action="store_true", help="acknowledge the reports after printing them")
     inbox.add_argument("--task-id", action="append", default=[], help="with --ack: acknowledge only this task's reports (repeatable)")
     inbox.add_argument("--run")
+    sub.add_parser("roots-list", help="the repositories the coordinator reads besides its own")
+    roots_add = sub.add_parser("roots-add", help="register repositories outside the tree the coordinator delegated into")
+    roots_add.add_argument("paths", nargs="+", type=Path)
     run_init = sub.add_parser("run-init", help="create an Orca Run from this terminal and store it")
     run_init.add_argument("--objective", required=True)
     for name, text in (("plan-apply", "create the Orca tasks of a plan graph"), ("plan-next", "start workers for the ready nodes"), ("plan-status", "show the graph and each node's state")):
@@ -324,6 +355,8 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             return 1 if unknown or missed else 0
         if args.command == "inbox":
             return _inbox(args, root)
+        if args.command in ("roots-list", "roots-add"):
+            return _roots(args)
         if args.command == "run-init":
             print(json.dumps({"run": orca_cli.run_init(root, args.objective)}))
             return 0
