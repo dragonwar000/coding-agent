@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # Commit chứa code đã kiểm (installer, gate, hooks). Tách khỏi commit của chính file này.
-PINNED_REF="ecfa27c48c048ce2ebdca5f678ba33db9a9894f4"
+PINNED_REF="0004eda379884cdbe2bf31c7a0c5abfeb7cc2fbb"
 OWNER="${CODING_AGENT_OWNER:-dragonwar000}"
 REPO="${CODING_AGENT_REPO:-coding-agent}"
 REF="${CODING_AGENT_REF:-$PINNED_REF}"
