@@ -302,23 +302,24 @@ def board_context(board: list[str], error: str | None) -> str:
 def read_board(root: Path, run: str | None = None, session: str = "board") -> tuple[list[str], str | None]:
     """The board lines for this repository, or the reason Orca could not be read.
 
-    The Run read is the one Orca has bound to this terminal: when `root` stores another one (an older Run, fenced by
-    Orca), the board switches to the bound Run, stores it, and says so in its first line. Tasks, reports and worker
-    worktrees are read for `root` and every repository it delegated into (`orca_cli.all_roots`). Settled worker
-    worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists only the ones
-    that still hold work; that group does not depend on the inbox being readable.
+    The Run read is, in order: `run`, `CODING_AGENT_ORCA_RUN` set by the user, the Run Orca has bound to this terminal
+    (`run-current`, or the one a `consumer_fenced` answer names), then the Run stored in `.coding-agent/orca-run`.
+    Several coordinator terminals share that file, so the terminal's Run is used for this process only and the file is
+    left as it is; when they differ the first line says which Run the board follows (`orca_cli.adopt_run`). Tasks,
+    reports and worker worktrees are read for `root` and every repository it delegated into (`orca_cli.all_roots`).
+    Settled worker worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists
+    only the ones that still hold work; that group does not depend on the inbox being readable.
     """
     orca_cli.use_stored_run(root)
     notes: list[str] = []
     if run is None:
         note = orca_cli.sync_bound_run(root, session=session)
-        notes += [note] if note else []
+        notes += [f"bảng {note}"] if note else []
     lines, error, fenced = _board(root, run, session)
-    if fenced and run is None:
-        note = orca_cli.switch_run(root, fenced, session=session)
-        if note:
-            notes.append(note)
-            lines, error, fenced = _board(root, run, session)
+    if fenced and run is None and fenced != orca_cli.run_id(None):
+        note = orca_cli.adopt_run(root, fenced, session=session)
+        notes = [f"bảng {note}"] if note else []
+        lines, error, fenced = _board(root, run, session)
     return notes + lines, error
 
 

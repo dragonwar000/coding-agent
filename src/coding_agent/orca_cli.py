@@ -69,14 +69,21 @@ def run_id(explicit: str | None) -> str | None:
 RUN_FILE = Path(".coding-agent") / "orca-run"
 
 
+# The Run this process put in `CODING_AGENT_ORCA_RUN` itself (the stored Run or the one bound to the terminal). Any
+# other value there was set by the user and wins over the terminal's bound Run.
+_adopted: str | None = None
+
+
 def use_stored_run(root: Path) -> None:
     """Make the Run stored by `run-init` the default for this process, unless the environment already names one."""
+    global _adopted
     path = root / RUN_FILE
     if os.environ.get(RUN_ENV) or not path.exists():
         return
     stored = path.read_text(encoding="utf-8").strip()
     if stored:
         os.environ[RUN_ENV] = stored
+        _adopted = stored
 
 
 def stored_run(root: Path) -> str:
@@ -111,34 +118,58 @@ def bound_run() -> str | None:
     return run if isinstance(run, str) and run else None
 
 
-def switch_run(root: Path, new: str, session: str = "cli") -> str | None:
-    """Store `new` as `root`'s Run and make it this process's default, with an event. Returns the line saying so,
-    or None when `new` was already the stored and current Run."""
-    old = stored_run(root)
-    if old == new and os.environ.get(RUN_ENV) == new:
-        return None
-    path = root / RUN_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new + "\n", encoding="utf-8")
+def adopt_run(root: Path, new: str, session: str = "cli") -> str | None:
+    """Use `new`, the Run this terminal is bound to, as this process's Run. Returns a short line when `root` stores
+    another Run, else None.
+
+    `.coding-agent/orca-run` is shared by every coordinator terminal of `root`, each possibly bound to its own Run, so
+    it is written only when it stores no Run yet: rewriting it would flip the other terminals' default Run on every
+    turn. The difference is recorded as an event once per session (`_note_once`).
+    """
+    global _adopted
     os.environ[RUN_ENV] = new
-    events.record(root, guard="orca-run", kind="run-switched", mode="enforce", applied=True, session=session,
-                  detail={"from": old or None, "to": new})
-    return f"đã chuyển Run từ {old or '(chưa lưu)'} sang {new} (Run mà terminal coordinator đang gắn)"
+    _adopted = new
+    stored = stored_run(root)
+    if not stored:
+        path = root / RUN_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new + "\n", encoding="utf-8")
+        return None
+    if stored == new:
+        return None
+    _note_once(root, session, stored, new)
+    return f"theo Run {new} của terminal này (orca-run lưu {stored})"
+
+
+def _note_once(root: Path, session: str, stored: str, new: str) -> None:
+    """Record `run-differs` the first time a session sees `stored` and its terminal's Run `new` differ."""
+    marker = root / ".coding-agent" / "state" / f"orca-run.{re.sub(r'[^A-Za-z0-9_.-]', '_', session)}"
+    try:
+        if marker.read_text(encoding="utf-8").strip() == new:
+            return
+    except OSError:
+        pass
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(new + "\n", encoding="utf-8")
+    except OSError:
+        return
+    events.record(root, guard="orca-run", kind="run-differs", mode="enforce", applied=False, session=session,
+                  detail={"stored": stored, "terminal": new})
 
 
 def sync_bound_run(root: Path, session: str = "cli") -> str | None:
-    """Follow the Run Orca has bound to this terminal when `root` stores another one. Returns `switch_run`'s line or None.
+    """Use the Run Orca has bound to this terminal for this process. Returns `adopt_run`'s line or None.
 
-    A `CODING_AGENT_ORCA_RUN` that differs from the stored Run was set by the user and is kept.
+    A `CODING_AGENT_ORCA_RUN` this process did not set itself was set by the user and is kept.
     """
-    stored = stored_run(root)
     env = os.environ.get(RUN_ENV)
-    if env and env != stored:
+    if env and env != _adopted:
         return None
     bound = bound_run()
-    if not bound or (bound == stored and env == stored):
+    if not bound:
         return None
-    return switch_run(root, bound, session)
+    return adopt_run(root, bound, session)
 
 
 # Repositories the coordinator delegated into with `--root`. Their links, plan ledger and worker records live under

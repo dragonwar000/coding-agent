@@ -57,3 +57,6 @@ def no_real_orca(monkeypatch: pytest.MonkeyPatch) -> None:
     # makes monkeypatch restore it after each test, so a Run never leaks into the next one.
     monkeypatch.setenv("CODING_AGENT_ORCA_RUN", "unset")
     monkeypatch.delenv("CODING_AGENT_ORCA_RUN")
+    from coding_agent import orca_cli
+
+    monkeypatch.setattr(orca_cli, "_adopted", None)

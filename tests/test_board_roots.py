@@ -38,20 +38,94 @@ def other(tmp_path: Path) -> Path:
 # --- 1. the Run bound to the terminal ---------------------------------------------------------------------------
 
 
-def test_board_switches_to_the_bound_run(repo: Path, orca_fake: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_board_follows_the_bound_run_without_rewriting_the_stored_one(repo: Path, orca_fake: dict,
+                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
     _store_run(repo, "run_old")
     seen: list[str | None] = []
     monkeypatch.setattr(orca_cli, "bound_run", lambda: "run_new")
     monkeypatch.setattr(orca_cli, "list_tasks", lambda run=None: seen.append(orca_cli.run_id(run)) or [])
     monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: [])
 
+    for _ in range(3):
+        lines, error = coordinator.read_board(repo, session="s1")
+
+    assert error is None
+    assert lines[0] == "bảng theo Run run_new của terminal này (orca-run lưu run_old)"
+    assert set(seen) == {"run_new"}
+    assert orca_cli.stored_run(repo) == "run_old"
+    assert [(e["kind"], e["detail"]) for e in _events(repo)] == [("run-differs", {"stored": "run_old", "terminal": "run_new"})]
+
+
+def test_board_says_nothing_when_the_bound_run_is_the_stored_one(repo: Path, orca_fake: dict,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    _store_run(repo, "run_a")
+    monkeypatch.setattr(orca_cli, "bound_run", lambda: "run_a")
+    monkeypatch.setattr(orca_cli, "list_tasks", lambda run=None: [])
+    monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: [])
+
     lines, error = coordinator.read_board(repo)
 
     assert error is None
-    assert lines[0].startswith("đã chuyển Run từ run_old sang run_new")
-    assert set(seen) == {"run_new"}
+    assert not any("theo Run" in line for line in lines)
+    assert _events(repo) == []
+
+
+def test_bound_run_is_stored_when_none_is(repo: Path, orca_fake: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orca_cli, "bound_run", lambda: "run_new")
+
+    assert orca_cli.sync_bound_run(repo) is None
     assert orca_cli.stored_run(repo) == "run_new"
-    assert [(e["kind"], e["detail"]) for e in _events(repo)] == [("run-switched", {"from": "run_old", "to": "run_new"})]
+
+
+def test_two_sessions_bound_to_different_runs_share_the_stored_file(repo: Path, orca_fake: dict,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two coordinator terminals of one repository, each bound to its own Run, each see their own tasks and leave
+    `.coding-agent/orca-run` alone."""
+    _store_run(repo, "run_a")
+    tasks = {"run_a": [{"id": "task_a", "status": "ready", "title": "việc A"}],
+             "run_b": [{"id": "task_b", "status": "ready", "title": "việc B"}]}
+    for task_id in ("task_a", "task_b"):
+        orca.link(repo, t_id=f"T-{task_id}", task_id=task_id, project=orca.project_name(repo))
+    bound = {"run": "run_a"}
+    monkeypatch.setattr(orca_cli, "bound_run", lambda: bound["run"])
+    monkeypatch.setattr(orca_cli, "list_tasks", lambda run=None: tasks[orca_cli.run_id(run)])
+    monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: [])
+
+    def session(run: str, name: str) -> str:
+        # Each turn is a fresh hook process: no Run inherited from the other session.
+        monkeypatch.delenv(orca_cli.RUN_ENV, raising=False)
+        monkeypatch.setattr(orca_cli, "_adopted", None)
+        bound["run"] = run
+        lines, error = coordinator.read_board(repo, session=name)
+        assert error is None
+        return "\n".join(lines)
+
+    for _ in range(2):
+        a, b = session("run_a", "sa"), session("run_b", "sb")
+        assert "task_a" in a and "task_b" not in a and "theo Run" not in a
+        assert "task_b" in b and "task_a" not in b and "bảng theo Run run_b của terminal này (orca-run lưu run_a)" in b
+        assert orca_cli.stored_run(repo) == "run_a"
+    assert [e["kind"] for e in _events(repo)] == ["run-differs"]
+
+
+def test_cli_without_run_uses_the_terminal_run(repo: Path, orca_fake: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    _store_run(repo, "run_a")
+    seen: list[str | None] = []
+    monkeypatch.setattr(orca_cli, "bound_run", lambda: "run_b")
+    monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: seen.append(orca_cli.run_id(run)) or [])
+
+    assert cli.main(["--root", str(repo), "inbox"]) == 0
+
+    assert seen == ["run_b"]
+    assert orca_cli.stored_run(repo) == "run_a"
+
+
+def test_run_init_still_stores_the_run(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _store_run(repo, "run_a")
+    monkeypatch.setattr(orca_cli, "_call", lambda *args, **kwargs: {"ok": True, "result": {"run": {"id": "run_fresh"}}})
+
+    assert orca_cli.run_init(repo, "mục tiêu") == "run_fresh"
+    assert orca_cli.stored_run(repo) == "run_fresh"
 
 
 def test_board_follows_a_fenced_inbox(repo: Path, orca_fake: dict, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,10 +143,10 @@ def test_board_follows_a_fenced_inbox(repo: Path, orca_fake: dict, monkeypatch: 
 
     text = "\n".join(lines)
     assert error is None
-    assert "đã chuyển Run từ run_old sang run_new" in text
+    assert "bảng theo Run run_new của terminal này (orca-run lưu run_old)" in text
     assert "task_9: succeeded — Standalone xong" in text
     assert "không đọc được" not in text
-    assert orca_cli.stored_run(repo) == "run_new"
+    assert orca_cli.stored_run(repo) == "run_old"
 
 
 def test_a_run_set_by_the_user_is_kept(repo: Path, orca_fake: dict, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,6 +155,7 @@ def test_a_run_set_by_the_user_is_kept(repo: Path, orca_fake: dict, monkeypatch:
     monkeypatch.setattr(orca_cli, "bound_run", lambda: "run_new")
 
     assert orca_cli.sync_bound_run(repo) is None
+    assert orca_cli.run_id(None) == "run_user"
     assert orca_cli.stored_run(repo) == "run_old"
 
 

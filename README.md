@@ -266,10 +266,12 @@ python3 -m coding_agent.cli inbox --ack                       # đánh dấu đ�
 - `inbox --ack` in từng báo cáo vừa đánh dấu (task, repo, subject). Gộp xong một task thì ack đúng task đó bằng `--task-id`:
   ack cả hộp thư làm báo cáo chưa xem mất khỏi bảng. Orca chỉ ack được cả một lô (delivery); báo cáo ack theo task được ghi vào
   `.coding-agent/acked.jsonl` và bị lọc khỏi bảng/`inbox`, còn lô Orca chỉ được ack khi mọi báo cáo trong lô đã được ack.
-- **Bảng việc theo Run đang gắn:** bảng việc và `inbox` (khi không có `--run`) đọc Run mà Orca đang gắn với terminal coordinator
-  (`orca orchestration run-current`, hoặc lỗi `consumer_fenced: ... bound to run_X`). Khi khác Run đã lưu, Run mới được ghi vào
-  `.coding-agent/orca-run`, ghi event `run-switched`, và dòng đầu của bảng ghi `đã chuyển Run từ A sang X`. `CODING_AGENT_ORCA_RUN`
-  do người dùng đặt (khác Run đã lưu) thì được giữ.
+- **Run theo terminal:** bảng việc, `inbox` và các lệnh CLI làm việc trong Run (khi không có `--run`) lấy Run theo thứ tự:
+  `--run`, `CODING_AGENT_ORCA_RUN` do người dùng đặt, Run mà Orca đang gắn với terminal coordinator (`orca orchestration
+  run-current`, hoặc lỗi `consumer_fenced: ... bound to run_X`), rồi mới tới `.coding-agent/orca-run`. Nhiều terminal coordinator
+  dùng chung file đó, nên Run của terminal chỉ dùng trong tiến trình; file chỉ được ghi khi chưa lưu Run nào (`run-init` vẫn ghi
+  như cũ). Khi khác Run đã lưu, dòng đầu của bảng ghi `bảng theo Run X của terminal này (orca-run lưu Y)` và event `run-differs`
+  được ghi tối đa một lần mỗi phiên (đánh dấu ở `.coding-agent/state/orca-run.<session>`).
 - **Giao vào repo khác:** `delegate`/`plan-next` với `--root` khác thư mục coordinator (`$CLAUDE_PROJECT_DIR`, không có thì thư mục
   làm việc) ghi root đó vào `.coding-agent/roots.json` của coordinator. Bảng việc, báo cáo, `worktree-list` và tự dọn đọc
   links, `plan.json` và sổ worker của mọi root đã ghi; dòng của task ở repo khác kèm tên repo.

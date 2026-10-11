@@ -32,7 +32,8 @@
   `CODING_AGENT_AUTO_CLEAN=off` turns that off. An auto-clean error is a warning and does not change the exit code.
 - `inbox [--ack [--task-id ID ...]]`: worker reports the coordinator has not handled; `--ack` acknowledges them and prints
   each one (task, repository, subject). With `--task-id` (repeatable) only those tasks' reports are acknowledged.
-  Without `--run`, the inbox follows the Run Orca has bound to this terminal (`orca_cli.sync_bound_run`).
+  Without `--run`, the inbox follows the Run Orca has bound to this terminal (`orca_cli.sync_bound_run`); the shared
+  `.coding-agent/orca-run` is not rewritten.
 - `delegate` and `plan-next` with a `--root` other than the coordinator's directory (`$CLAUDE_PROJECT_DIR`, else the
   working directory) add that root to the coordinator's `.coding-agent/roots.json`, so its board and auto-clean see
   the tasks and worktrees recorded there.
@@ -105,6 +106,11 @@ def _permission_option(command: argparse.ArgumentParser) -> None:
 
 AUTO_CLEAN_AFTER = frozenset({"plan-next", "plan-status", "inbox", "delegate"})
 ROOT_REGISTERED = frozenset({"delegate", "plan-next"})
+# Commands that act in an Orca Run. Without `--run` they use the Run Orca has bound to this terminal ahead of the
+# shared `.coding-agent/orca-run` (`orca_cli.sync_bound_run`); `board` resolves it in `coordinator.read_board`.
+TERMINAL_RUN = frozenset({"orca-create", "orca-status", "claim", "status", "worker-start", "worker-adopt", "worker-kick",
+                          "worker-settle", "worktree-list", "worktree-clean", "inbox", "delegate", "plan-apply",
+                          "plan-next", "plan-status"})
 
 
 def _auto_clean(root: Path, run: str | None) -> None:
@@ -125,18 +131,15 @@ def _inbox(args: argparse.Namespace, root: Path) -> int:
     if args.task_id and not args.ack:
         print("inbox: --task-id only goes with --ack", file=sys.stderr)
         return 2
-    if args.run is None:
-        note = orca_cli.sync_bound_run(root)
-        if note:
-            print(f"inbox: {note}")
     try:
         reports = _read_inbox(args, root)
     except orca_cli.OrcaError as error:
         bound = orca_cli.fenced_run(error) if args.run is None else None
-        note = orca_cli.switch_run(root, bound) if bound else None
-        if not note:
+        if not bound or bound == orca_cli.run_id(None):
             raise
-        print(f"inbox: {note}")
+        note = orca_cli.adopt_run(root, bound)
+        if note:
+            print(f"inbox: {note}", file=sys.stderr)
         reports = _read_inbox(args, root)
     roots = orca_cli.all_roots(root)
     owners, plans, home = coordinator.repo_owners(roots), coordinator.plan_ids(roots), orca.project_name(root)
@@ -256,6 +259,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = _root(args.root)
     orca_cli.use_stored_run(root)
+    if args.command in TERMINAL_RUN and getattr(args, "run", None) is None:
+        note = orca_cli.sync_bound_run(root)
+        if note:
+            print(f"{args.command}: {note}", file=sys.stderr)
     if args.command in ROOT_REGISTERED and orca_cli.register_root(orca_cli.coordinator_root(), root):
         print(f"roots: {root} ghi vào {orca_cli.coordinator_root() / orca_cli.ROOTS_FILE}", file=sys.stderr)
     code = _command(args, root)
