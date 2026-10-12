@@ -52,6 +52,16 @@ loop:
   max_tool_calls_per_turn: 400
   max_denials_per_turn: 5     # ASSUMPTION: 5 lượt gọi tool bị từ chối hoặc lỗi trong một lượt là đủ để dừng việc thử lại.
 
+# Auto-decide (FR-001): agent hỏi user bằng AskUserQuestion thì chờ timeout_s giây; hết giờ thì Fable chọn
+# (fable: true, tối đa fable_timeout_s giây), lùi về phương án được gợi ý. User bật/tắt bằng
+# `python -m coding_agent.cli auto-decide on|off [--timeout N]`; giá trị đó ghi đè khối này.
+# ASSUMPTION: 60 giây là đủ để một user đang ngồi máy kịp trả lời. Chưa đo trên phiên thật.
+auto_decide:
+  enabled: false
+  timeout_s: 60
+  fable: true
+  fable_timeout_s: 90
+
 # Hook. `mode` có ba giá trị: off (không chạy), shadow (ghi quyết định, không chặn), enforce (được chặn).
 # Mặc định là shadow (FR-010). Mọi hook không off bắt buộc có `assumption`: câu nêu điều hook giả định về model.
 # Chỉ hook đã khai enforce mới được chặn. Hiện orca-guard (FR-009), stop-gate (SC-002) và coordinator-guard (bắt buộc chia việc theo graph) ở enforce.
@@ -106,3 +116,11 @@ hooks:
     event: UserPromptSubmit
     mode: shadow
     assumption: "Bảng việc đọc từ Orca ở mỗi prompt đủ mới để trả lời người dùng về tiến độ."
+  - id: auto-decide
+    host: [claude_code]
+    event: PreToolUse
+    matcher: AskUserQuestion
+    mode: shadow
+    # Phải lớn hơn timeout_s + fable_timeout_s tối đa (3600 + 600) để Claude Code không giết hook đang chờ.
+    timeout_s: 4215
+    assumption: "User đã bật auto-decide chấp nhận để agent tự chọn khi không trả lời trong thời gian chờ; phương án Fable chọn hoặc agent gợi ý là đủ tốt để chạy tiếp."

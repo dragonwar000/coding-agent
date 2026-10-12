@@ -46,11 +46,15 @@
 - `roots-add PATH...`: register repositories outside the tree by hand. Both act on `--root`, else the coordinator's directory.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
 - `plan-apply FILE`, `plan-next FILE [--max N] [--permission-mode M]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
+- `auto-decide [on|off|status] [--timeout N] [--fable|--no-fable] [--fable-timeout N]`: turn auto-decide on or off and set how
+  long a question to the user waits (10 to 3600 s) before Fable or the suggested option decides it. Stored in
+  `.coding-agent/state/auto-decide.json`, which wins over `auto_decide:` in integration.yaml.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import sys
 from pathlib import Path
@@ -58,11 +62,11 @@ from pathlib import Path
 import os
 import uuid
 
-from coding_agent import cleanup, coordinator, events, orca, orca_cli, roots
+from coding_agent import autodecide, cleanup, coordinator, events, orca, orca_cli, roots
 from coding_agent import plan as plan_graph
 from coding_agent.brief import BriefError, brief
 from coding_agent.hooks import utf8_output
-from coding_agent.manifest import ManifestError, load
+from coding_agent.manifest import ManifestError, auto_decide_from, load
 from coding_agent.memory import zeromem
 
 
@@ -286,6 +290,11 @@ def main(argv: list[str] | None = None) -> int:
     check = sub.add_parser("orca-check", help="find tasks that claim completion while an artifact is missing")
     check.add_argument("--tasks", required=True, type=Path)
     check.add_argument("--strict", action="store_true")
+    decide = sub.add_parser("auto-decide", help="turn auto-decide on or off, or change how long a question waits")
+    decide.add_argument("action", nargs="?", choices=("on", "off", "status"), default="status")
+    decide.add_argument("--timeout", type=int, help="seconds a question waits for the user (10 to 3600)")
+    decide.add_argument("--fable", action=argparse.BooleanOptionalAction, default=None, help="let Fable decide when the wait runs out")
+    decide.add_argument("--fable-timeout", type=int, help="seconds Fable may take (10 to 600)")
 
     args = parser.parse_args(argv)
     root = _root(args.root)
@@ -302,8 +311,32 @@ def main(argv: list[str] | None = None) -> int:
     return code
 
 
+def _auto_decide(args: argparse.Namespace, root: Path) -> int:
+    current = autodecide.effective(root, autodecide.manifest_settings(root))
+    changes: dict[str, object] = {}
+    if args.action in ("on", "off"):
+        changes["enabled"] = args.action == "on"
+    if args.timeout is not None:
+        changes["timeout_s"] = args.timeout
+    if args.fable is not None:
+        changes["fable"] = args.fable
+    if args.fable_timeout is not None:
+        changes["fable_timeout_s"] = args.fable_timeout
+    if changes:
+        try:
+            current = auto_decide_from({**asdict(current), **changes}, "auto-decide")
+        except ManifestError as error:
+            print(f"auto-decide: {error}", file=sys.stderr)
+            return 1
+        autodecide.save(root, current)
+    print(json.dumps(asdict(current), ensure_ascii=False))
+    return 0
+
+
 def _command(args: argparse.Namespace, root: Path) -> int:
     try:
+        if args.command == "auto-decide":
+            return _auto_decide(args, root)
         if args.command == "report":
             print(json.dumps(events.summarize(root), indent=2, ensure_ascii=False))
             return 0

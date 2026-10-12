@@ -22,6 +22,9 @@ INGEST = ("conversation", "episodes", "both")
 EMBEDDERS = ("hash", "default")
 VERIFY_WHEN = ("changed", "always")
 VERIFY_SCOPES = ("root", "changed-repos")
+# auto-decide (FR-001): how long a question to the user waits, and how long Fable may take to decide it.
+AUTO_DECIDE_TIMEOUT_S = (10, 3600)
+FABLE_TIMEOUT_S = (10, 600)
 
 
 class ManifestError(ValueError):
@@ -36,6 +39,8 @@ class Hook:
     matcher: str | None
     mode: str | None
     assumption: str
+    # Seconds the host lets this hook run; None leaves the host's default.
+    timeout_s: int | None = None
 
     @property
     def env_name(self) -> str:
@@ -62,6 +67,14 @@ class Loop:
 
 
 @dataclass(frozen=True)
+class AutoDecide:
+    enabled: bool = False
+    timeout_s: int = 60
+    fable: bool = True
+    fable_timeout_s: int = 90
+
+
+@dataclass(frozen=True)
 class Manifest:
     path: Path
     verified: bool
@@ -77,6 +90,7 @@ class Manifest:
     # `root`: run the commands in the repository root. `changed-repos`: in each git repository the turn changed.
     verify_scope: str = "root"
     hooks: tuple[Hook, ...] = field(default_factory=tuple)
+    auto_decide: AutoDecide = field(default_factory=AutoDecide)
 
     @property
     def root(self) -> Path:
@@ -105,6 +119,31 @@ def _str_list(value: Any, field_name: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _require_range(value: Any, field_name: str, low: int, high: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise ManifestError(f"{field_name} must be an integer from {low} to {high}")
+    return value
+
+
+def auto_decide_from(raw: Any, where: str = "auto_decide") -> AutoDecide:
+    """The auto-decide settings in `raw`; a missing block is the defaults, a wrong value raises ManifestError."""
+    if raw is None:
+        return AutoDecide()
+    if not isinstance(raw, dict):
+        raise ManifestError(f"{where} must be a mapping")
+    enabled = raw.get("enabled", False)
+    fable = raw.get("fable", True)
+    for name, value in (("enabled", enabled), ("fable", fable)):
+        if not isinstance(value, bool):
+            raise ManifestError(f"{where}.{name} must be true or false")
+    return AutoDecide(
+        enabled=enabled,
+        timeout_s=_require_range(raw.get("timeout_s", 60), f"{where}.timeout_s", *AUTO_DECIDE_TIMEOUT_S),
+        fable=fable,
+        fable_timeout_s=_require_range(raw.get("fable_timeout_s", 90), f"{where}.fable_timeout_s", *FABLE_TIMEOUT_S),
+    )
+
+
 def _hook(item: Any, seen: set[str]) -> Hook:
     if not isinstance(item, dict):
         raise ManifestError("each hooks entry must be a mapping")
@@ -127,7 +166,10 @@ def _hook(item: Any, seen: set[str]) -> Hook:
     assumption = item.get("assumption", "")
     if mode != "off" and not (isinstance(assumption, str) and assumption.strip()):
         raise ManifestError(f"hooks[{hook_id}] runs in mode {mode!r} and needs a non-blank assumption")
-    return Hook(id=hook_id, host=host, event=event, matcher=matcher, mode=mode, assumption=str(assumption))
+    timeout_s = item.get("timeout_s")
+    if timeout_s is not None:
+        timeout_s = _require_int(timeout_s, f"hooks[{hook_id}].timeout_s", 1)
+    return Hook(id=hook_id, host=host, event=event, matcher=matcher, mode=mode, assumption=str(assumption), timeout_s=timeout_s)
 
 
 def load(path: Path) -> Manifest:
@@ -217,4 +259,5 @@ def load(path: Path) -> Manifest:
         verify_when=verify_when,
         verify_scope=verify_scope,
         hooks=hooks,
+        auto_decide=auto_decide_from(raw.get("auto_decide")),
     )

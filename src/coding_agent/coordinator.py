@@ -236,9 +236,17 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python
     return None
 
 
-def contract(python_src: str) -> str:
+AUTO_DECIDE_LINE = (
+    "- Auto-decide đang bật: khi cần người dùng quyết (kể cả câu hỏi worker leo thang), hỏi bằng tool AskUserQuestion, "
+    "không hỏi bằng văn bản rồi kết thúc lượt. Đặt phương án bạn gợi ý lên đầu, nhãn kết thúc bằng \"(Recommended)\". "
+    "Người dùng không trả lời trong thời gian chờ thì hệ thống tự chọn và báo lại; hãy nói lại lựa chọn đó cho người dùng "
+    "rồi làm tiếp (với câu hỏi của worker: trả lời worker theo lựa chọn đó)."
+)
+
+
+def contract(python_src: str, auto_decide: bool = False) -> str:
     """The coordinator contract injected at session start and after a compaction."""
-    return "\n".join([
+    lines = [
         "[coordinator] Bạn là coordinator của repo này. Vai trò: nhận yêu cầu, lập kế hoạch, giao việc, và trả lời người dùng.",
         "- Mọi thay đổi file đi qua graph: bạn viết plan, worker Orca làm từng node trong worktree riêng. Ở mode enforce, hook chặn sửa trực tiếp, lệnh shell ghi file, và subagent nội bộ.",
         "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và gộp kết quả: `git add`, `git commit`, `git merge <nhánh worker>`.",
@@ -258,7 +266,10 @@ def contract(python_src: str) -> str:
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",
-    ])
+    ]
+    if auto_decide:
+        lines.append(AUTO_DECIDE_LINE)
+    return "\n".join(lines)
 
 
 def _minutes_since(when: Any, now: datetime) -> int | None:

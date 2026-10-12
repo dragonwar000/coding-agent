@@ -21,6 +21,7 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/transcript.py` | Đọc một lượt từ transcript, có số dòng làm bằng chứng và số lần lỗi/bị từ chối |
 | `src/coding_agent/orca.py` | Quy tắc Orca thuần: completion cần bằng chứng, task thuộc một repo, bằng chứng `CLAIMED-DONE BUT ABSENT` |
 | `src/coding_agent/orca_cli.py` | Adapter tới `orca orchestration`: tạo task, claim, đổi trạng thái, liệt kê |
+| `src/coding_agent/autodecide.py` | Auto-decide: câu hỏi `AskUserQuestion` chờ N giây trong cửa sổ đếm ngược, hết giờ thì Fable hoặc phương án gợi ý chọn |
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
@@ -50,6 +51,25 @@ uv venv .venv && uv pip install --python .venv/bin/python "pyyaml>=6" "pytest>=8
 Test `hooks` và `zeromem` cần binary `zm` trên `PATH` (hoặc `CODING_AGENT_ZM`); không có thì
 các test đó được bỏ qua và báo rõ là bỏ qua. Test Orca dùng `fake_orca.py` qua `CODING_AGENT_ORCA`,
 không cần Orca thật.
+
+## Auto-decide
+
+Khi bật, mỗi lần agent hỏi bạn bằng `AskUserQuestion`, câu hỏi hiện trong một cửa sổ nhỏ có đồng hồ đếm ngược.
+Bạn chọn trong thời gian chờ thì agent dùng câu trả lời của bạn. Hết giờ thì Fable (`claude-fable-5-1`) chọn một
+phương án trong danh sách; Fable lỗi hoặc tắt thì dùng phương án agent gợi ý (nhãn có `(Recommended)`, không có thì
+phương án đầu). Câu hỏi về xoá, ghi đè, commit/push cũng được tự chọn, và được gắn cờ `sensitive` trong
+`.coding-agent/events.jsonl`. Đóng cửa sổ thì câu hỏi quay về terminal như thường. Hộp xin quyền của
+`coordinator-guard` không bao giờ được tự trả lời.
+
+```sh
+python -m coding_agent.cli auto-decide on --timeout 60   # bật, chờ 60 giây (10 đến 3600)
+python -m coding_agent.cli auto-decide --no-fable        # hết giờ thì dùng thẳng phương án gợi ý
+python -m coding_agent.cli auto-decide status            # xem cấu hình đang có hiệu lực
+python -m coding_agent.cli auto-decide off
+```
+
+Giá trị mặc định nằm ở khối `auto_decide:` của `integration.yaml`; lệnh trên ghi `.coding-agent/state/auto-decide.json`
+và ghi đè khối đó từ câu hỏi kế tiếp. Cần `tkinter` và màn hình; thiếu thì câu hỏi hỏi như thường.
 
 ## Cài vào một dự án
 
