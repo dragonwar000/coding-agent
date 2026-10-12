@@ -49,6 +49,11 @@
 - `auto-decide [on|off|status] [--timeout N] [--fable|--no-fable] [--fable-timeout N]`: turn auto-decide on or off and set how
   long a question to the user waits (10 to 3600 s) before Fable or the suggested option decides it. Stored in
   `.coding-agent/state/auto-decide.json`, which wins over `auto_decide:` in integration.yaml.
+- `wiki-sync [--check|--mark-synced|--flags-for PAGES] [--root DIR] [--wiki-dir DIR] [--json]`: the code→wiki anchor
+  (`wiki/sync.py`). `--check` exits 0 when no code changed since the anchor, 3 on drift, 2 without a valid anchor.
+- `wikieval [--root DIR] [--evals-dir DIR] [--outputs FILE] [--check|--write-baseline|--self-test]`: the wiki goldens
+  eval suite (`wiki/evaluate.py`); the baseline defaults to `<root>/harness/metrics/eval-baseline.json`.
+  Both take their own options after the command name and touch neither Orca nor the memory store.
 """
 
 from __future__ import annotations
@@ -68,6 +73,8 @@ from coding_agent.brief import BriefError, brief
 from coding_agent.hooks import utf8_output
 from coding_agent.manifest import ManifestError, auto_decide_from, load
 from coding_agent.memory import zeromem
+from coding_agent.wiki import evaluate as wiki_eval
+from coding_agent.wiki import sync as wiki_sync
 
 
 def _root(path: str | None) -> Path:
@@ -195,8 +202,15 @@ def _read_inbox(args: argparse.Namespace, root: Path) -> list[dict]:
     return orca_cli.drop_acked(root, orca_cli.unread_reports(args.run))
 
 
+WIKI_COMMANDS = {"wiki-sync": wiki_sync.main, "wikieval": wiki_eval.main}
+
+
 def main(argv: list[str] | None = None) -> int:
     utf8_output()
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in WIKI_COMMANDS:
+        # The wiki tools parse their own options (their --root is the project the wiki belongs to).
+        return WIKI_COMMANDS[argv[0]](argv[1:])
     parser = argparse.ArgumentParser(prog="coding_agent.cli")
     parser.add_argument("--root", help="project root (default: current directory)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -295,6 +309,9 @@ def main(argv: list[str] | None = None) -> int:
     decide.add_argument("--timeout", type=int, help="seconds a question waits for the user (10 to 3600)")
     decide.add_argument("--fable", action=argparse.BooleanOptionalAction, default=None, help="let Fable decide when the wait runs out")
     decide.add_argument("--fable-timeout", type=int, help="seconds Fable may take (10 to 600)")
+    for name, text in (("wiki-sync", "the code→wiki anchor: --check, --mark-synced, --flags-for"),
+                       ("wikieval", "the wiki goldens eval suite: --check, --write-baseline, --self-test")):
+        sub.add_parser(name, help=f"{text} (see `{name} --help`)", add_help=False)
 
     args = parser.parse_args(argv)
     root = _root(args.root)

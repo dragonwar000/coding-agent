@@ -25,7 +25,8 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
-| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-settle` |
+| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-settle`, `wiki-sync`, `wikieval` |
+| `src/coding_agent/wiki/` | Công cụ wiki của dự án: neo đồng bộ code→wiki (`sync.py`) và bộ eval goldens (`evaluate.py`) |
 | `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
 | `install.sh` | Lệnh một dòng cho `project_install` |
 | `src/coding_agent/gate.py` | Cổng của package (FR-003): thất bại khi file đang dùng lệch manifest |
@@ -70,6 +71,36 @@ python -m coding_agent.cli auto-decide off
 
 Giá trị mặc định nằm ở khối `auto_decide:` của `integration.yaml`; lệnh trên ghi `.coding-agent/state/auto-decide.json`
 và ghi đè khối đó từ câu hỏi kế tiếp. Cần `tkinter` và màn hình; thiếu thì câu hỏi hỏi như thường.
+
+## Wiki: wiki-sync và wikieval
+
+Hai công cụ wiki chạy từ coding-agent, không cần bản global của `setup` ở `~/.claude/harness`. Cả hai tất định,
+không gọi model. Chạy trong thư mục dự án; dự án có `harness/coding-agent/src` vendored thì đặt
+`PYTHONPATH=harness/coding-agent/src`.
+
+```sh
+python -m coding_agent.cli wiki-sync --check          # 0 = wiki current, 3 = code đổi (cờ code-drift vào stale.json), 2 = chưa có neo
+python -m coding_agent.cli wiki-sync --mark-synced    # chốt neo sau khi rà wiki; chỉ ghi khi có gì đổi
+python -m coding_agent.cli wiki-sync --flags-for "slug1,slug2"   # đường đọc của /query: luôn thoát 0
+python -m coding_agent.cli wikieval --outputs harness/evals/outputs.json --check            # 2 khi có golden tụt
+python -m coding_agent.cli wikieval --outputs harness/evals/outputs.json --write-baseline
+python -m coding_agent.cli wikieval --self-test       # assert của mỗi golden chạy trên chính `expected` của nó
+```
+
+`wiki-sync` tìm `llmwiki/wiki` (hoặc `wiki/`) từ `--root` đi ngược lên. Dự án là gốc repo hoặc thư mục con được track
+thì neo theo git (`.last-sync.json` giữ `gitHead`); dự án không có git, untracked hay bị repo cha ignore thì neo
+theo dấu vân tay cây file (`mode: tree`, kèm `.last-sync-tree.json`). Chế độ tree bỏ qua thư mục build/vendor/cache,
+file runtime (`.claude/audit/`, `*.jsonl` trong `.claude/`) và file bị `.gitignore` loại, kể cả `.gitignore` của
+repo con. Chi phí mỗi lượt `--check` ghi vào `harness/metrics/sync-log.jsonl` khi thư mục đó có sẵn.
+
+`wikieval` đọc goldens ở `fdk/wiki/sources/evals` hoặc `llmwiki/wiki/sources/evals` (`--evals-dir` để chọn thư mục
+khác), baseline ở `<root>/harness/metrics/eval-baseline.json` và cấu hình adapter ở `<root>/harness/wikieval.config.yaml`
+(thiếu thì tier 2 và tier 3 tắt). Mọi đường dẫn mặc định tính từ `--root` (mặc định thư mục hiện tại), không bao giờ
+từ nơi cài coding-agent. `--write-baseline` từ chối ghi đè một baseline có dữ liệu bằng lượt chạy không chấm được
+golden nào.
+
+Định dạng `.last-sync.json`, `.last-sync-tree.json`, `stale.json` và `eval-baseline.json` (`wikieval-baseline/v1`)
+giữ nguyên như bản của `setup`, nên neo và baseline có sẵn dùng tiếp được.
 
 ## Cài vào một dự án
 
