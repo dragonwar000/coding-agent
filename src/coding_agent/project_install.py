@@ -173,11 +173,63 @@ def _hook_command(document: dict[str, Any] | None, hook_id: str) -> str | None:
     return None
 
 
-def posix_shell() -> str | None:
-    """A POSIX shell to run a generated hook command with: `sh`, else `bash` (Git Bash on Windows), else None."""
+def _is_wsl_launcher(path: str) -> bool:
+    """`bash.exe` in System32 or WindowsApps is the WSL launcher, not a shell: it runs the command inside a Linux distro."""
+    from pathlib import PureWindowsPath
+
+    parts = {part.lower() for part in PureWindowsPath(path).parts}
+    return "system32" in parts or "windowsapps" in parts
+
+
+def _git_bash_candidates() -> list[Path]:
+    """Where Git for Windows keeps `bin/bash.exe`, in the order Claude Code looks: the env override, then the `git` on PATH."""
+    import os
     import shutil
 
-    return shutil.which("sh") or shutil.which("bash")
+    candidates: list[Path] = []
+    override = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+    if override:
+        candidates.append(Path(override))
+    roots: list[Path] = []
+    try:
+        # `git --exec-path` = <Git>/mingw64/libexec/git-core (hoặc clangarm64/...), nên gốc Git là parents[2].
+        exec_path = subprocess.run(["git", "--exec-path"], capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        if exec_path:
+            roots.append(Path(exec_path).parents[2])
+    except (OSError, subprocess.SubprocessError, IndexError):
+        pass
+    git = shutil.which("git")
+    if git:
+        # <Git>/cmd/git.exe hoặc <Git>/bin/git.exe
+        roots.append(Path(git).resolve().parent.parent)
+    for env_name in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        if os.environ.get(env_name):
+            roots.append(Path(os.environ[env_name]) / "Git")
+    if os.environ.get("LOCALAPPDATA"):
+        roots.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Git")
+    candidates += [root / "bin" / "bash.exe" for root in roots]
+    return candidates
+
+
+def posix_shell() -> str | None:
+    """A POSIX shell to run a generated hook command with, the one the host would use, else None.
+
+    POSIX: `sh`, else `bash`. Windows: Git Bash, as Claude Code picks it (CLAUDE_CODE_GIT_BASH_PATH, else from Git),
+    then a `bash`/`sh` on PATH that is not the WSL launcher. System32 `bash.exe` is never used: it runs the command
+    in a WSL distro (often one with no /bin/bash at all), which is not where Claude Code runs hooks.
+    """
+    import shutil
+
+    if sys.platform != "win32":
+        return shutil.which("sh") or shutil.which("bash")
+    for candidate in _git_bash_candidates():
+        if candidate.is_file() and not _is_wsl_launcher(str(candidate)):
+            return str(candidate)
+    for name in ("bash", "sh"):
+        found = shutil.which(name)
+        if found and not _is_wsl_launcher(found):
+            return found
+    return None
 
 
 def _run_hook(command: str, project: Path, payload: dict[str, Any], role: str | None = None) -> subprocess.CompletedProcess:
@@ -199,8 +251,10 @@ def verify_wiring(project: Path, manifest_path: Path, hosts: list[str]) -> list[
     report.append(f"verify: gate passed for {', '.join(hosts)}")
     if "claude_code" not in hosts:
         return report
-    if posix_shell() is None:
-        report.append("verify: hook commands not run: no sh or bash on PATH. On Windows, install Git for Windows and run the installer from Git Bash")
+    shell = posix_shell()
+    if shell is None:
+        report.append("verify: hook commands not run: no sh or bash on PATH (WSL bash.exe is not used). On Windows, install Git for Windows "
+                      "or set CLAUDE_CODE_GIT_BASH_PATH to its bin\\bash.exe; Claude Code needs Git Bash to run these hooks")
         return report
     document = gen._read(project / gen.CLAUDE_FILE)
     guard_command = _hook_command(document, "orca-guard")
