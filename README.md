@@ -24,7 +24,7 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
-| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-settle` |
+| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-settle` |
 | `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
 | `install.sh` | Lệnh một dòng cho `project_install` |
 | `src/coding_agent/gate.py` | Cổng của package (FR-003): thất bại khi file đang dùng lệch manifest |
@@ -330,6 +330,41 @@ dispatch còn active. coding-agent xử lý như sau:
 - **`worker-settle --task-id <id> --basis verifier|predicate|human [--artifact FILE ...]`:** chốt task mà worker đã báo nhưng báo cáo
   bị từ chối. Coordinator kiểm kết quả trước; lệnh `worker-abandon` dispatch còn active rồi gửi `completed` theo quy tắc bằng chứng
   (FR-007). Dispatch đã settled thì không abandon. Bảng việc và `inbox` in gợi ý lệnh này ngay dưới báo cáo `Rejected worker_done`.
+
+## Khi worker bị dừng vì mất mạng / lỗi API tạm thời
+
+Đã xảy ra (2026-10-12): 5 worker Claude Code dừng 3 giờ vì mất mạng. Màn hình mỗi worker kết thúc bằng
+`API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)` (có khi kèm `API Error: Connection lost
+mid-response`), dòng `Worked for 3h 5m · done 9:24 PM`, rồi ô nhập trống. Orca vẫn báo dispatch `ready`, bảng việc vẫn ghi
+"đang chạy", và khi mạng có lại không có gì đánh thức worker. coding-agent xử lý như sau (`src/coding_agent/resume.py`):
+
+- **Phát hiện:** với mỗi task chưa `completed`/`failed` của coordinator này, đọc màn hình terminal của dispatch. Worker là
+  **stalled** khi ô nhập trống, không có spinner, và trong 15 dòng không trống phía trên ô nhập, dòng `API Error` cuối cùng là
+  lỗi tạm thời (`ENOTFOUND`, `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `EAI_AGAIN`, `Connection lost`, `Can't reach the API`,
+  `fetch failed`, `overloaded`, `rate limit`, mã 429/500/502/503/504/529; bảng `TRANSIENT_MARKS`), và sau nó chưa có lượt làm
+  việc mới (dòng `⏺` không phải lỗi). Lỗi mà thử lại không sửa được (401/403, invalid API key, credit, context length, hoặc
+  `API Error` lạ) là **blocked**: chỉ báo, không tự resume.
+- **Kiểm mạng trước khi gửi:** mở kết nối TCP tới `api.anthropic.com:443` (timeout 3 giây). Không nối được thì không gửi gì,
+  chỉ ghi nhận "đang chờ mạng". Đổi đích bằng `CODING_AGENT_API_HOST=host` hoặc `host:port` (ví dụ proxy bắt buộc).
+- **Resume:** gửi một dòng không dấu vào terminal của worker qua `orca terminal send --enter --wait-submit 20`: mạng đã có
+  lại, làm tiếp task từ chỗ đang dở, kiểm lại lệnh và shell nền đang chạy dở, xong thì commit và gửi `worker_done`.
+- **Chống gửi lặp:** mỗi lần gửi ghi vào `.coding-agent/resumes.jsonl` kèm dấu vân tay của màn hình. Không resume lại cùng một
+  màn hình, tối đa 5 lần cho mỗi dispatch, cách nhau ít nhất 60 giây. Quá giới hạn thì bảng việc ghi "bị chặn, cần người xử lý".
+- **Tự động mỗi lượt của coordinator:** bước dựng bảng việc (hook `SessionStart` / `UserPromptSubmit`, lệnh `board`) quét và
+  resume, bỏ qua nếu lần quét trước chưa tới 60 giây (vẫn hiện kết quả lần quét đó). Mỗi lượt quét tự động chỉ gửi trong 20 giây
+  đầu để không giữ hook; worker còn lại được gửi ở lượt quét sau. Bảng việc có nhóm riêng "worker bị dừng vì
+  lỗi API/mạng" (đã tự resume / đang chờ mạng / bị chặn cần người xử lý); các task đó không còn nằm trong "đang chạy". Mọi lỗi
+  của bước này bị nuốt và ghi event, không làm hỏng hook. Tắt bằng `CODING_AGENT_AUTO_RESUME=off`.
+- **`worker-resume [--task-id <id> ...] [--dry-run] [--watch [--interval GIÂY]] [--run ID]`:** quét và resume bằng tay. Mặc
+  định quét mọi worker đang chạy của Run; `--task-id` chỉ một task (lặp lại được, và resume được cả task không do coordinator
+  này tạo); `--dry-run` chỉ in; `--watch` lặp vô hạn (mặc định 60 giây một lần) để coordinator chạy nền, tự resume khi mạng trở
+  lại, in một dòng mỗi khi trạng thái một worker đổi. Mã thoát 0 kể cả khi không có gì để làm.
+- **Event** (`guard: worker-resume`): `resumed`, `resume-failed`, và khi trạng thái đổi: `waiting-network`, `blocked`, `limit`,
+  `already-resumed`; `error` khi bước tự động gặp lỗi.
+
+Giới hạn: phát hiện dựa trên chữ trên màn hình Claude Code; màn hình worker bị dừng thật chưa được đo lại trên máy (dạng dòng
+lỗi lấy theo mô tả sự cố), và agent khác (codex) có dạng lỗi khác thì chưa nhận ra. Không có coordinator nào đang chạy lượt mới
+và không có `worker-resume --watch` chạy nền thì không ai quét.
 
 ## Khởi động worker
 

@@ -249,6 +249,7 @@ def contract(python_src: str) -> str:
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, rồi `inbox --ack --task-id <id>` cho đúng task vừa gộp (không ack cả hộp thư: báo cáo chưa xem sẽ mất khỏi bảng), rồi `plan-next`.",
         "- Task giao bằng `delegate`/`plan-next` với `--root <repo khác>` được ghi vào .coding-agent/roots.json, nên vẫn hiện trên bảng (kèm tên repo) và được tự dọn như task của repo này.",
         "- " + RECOVER,
+        "- Worker dừng vì lỗi API tạm thời (mất mạng, quá tải, rate limit) được tự resume khi dựng bảng việc, sau khi kiểm thấy mạng đã có lại; bảng việc ghi rõ worker nào đã resume, đang chờ mạng, hay bị chặn cần người xử lý. Khi còn worker đang chạy mà bạn không có lượt mới, chạy nền `worker-resume --watch` để chúng được resume ngay khi mạng trở lại.",
         "- Worktree của worker đã xong, đã gộp và sạch thì tự được xoá (khi dựng bảng việc và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`), không cần hỏi người dùng. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit: kiểm rồi gộp nhánh vào HEAD, lượt sau nó tự được dọn. Muốn bỏ việc đó thì hỏi người dùng trong hội thoại trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp; host cũng hỏi xác nhận, trừ khi phiên đang bypass permissions).",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
@@ -256,16 +257,27 @@ def contract(python_src: str) -> str:
     ])
 
 
-def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: str, others: frozenset[str] | set[str] = frozenset()) -> list[str]:
+def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: str, others: frozenset[str] | set[str] = frozenset(),
+                stalled: dict[str, str] | None = None) -> list[str]:
     """The task board for this repository, one line per task, grouped by state.
 
     `others` are the repositories this coordinator delegated into; their tasks are listed too, each with its repository.
+    `stalled` maps a task whose worker stopped on an API error to what was done about it (`resume.board_notes`); those
+    tasks are listed first, in a group of their own, and not as running.
     """
     shown = {project, *others}
+    stalled = stalled or {}
     mine = [{**task, "project": owners[str(task.get("id"))]} for task in tasks if owners.get(str(task.get("id"))) in shown]
     if not mine:
         return ["bảng việc: chưa có task nào của repo này"]
-    groups = orca.reconcile(mine)
+
+    def row(task: dict[str, Any]) -> str:
+        title = task.get("task_title") or task.get("title") or ""
+        repo = f" (repo {task['project']})" if task.get("project") != project else ""
+        return f"  - {task.get('id')} [{task.get('status')}] {title}".rstrip() + repo
+
+    halted = [task for task in mine if str(task.get("id")) in stalled]
+    groups = orca.reconcile([task for task in mine if str(task.get("id")) not in stalled])
     labels = {
         "running": "đang chạy",
         "never_dispatched": "chưa giao worker",
@@ -274,15 +286,17 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
         "other": "khác",
     }
     lines: list[str] = []
+    if halted:
+        lines.append(f"worker bị dừng vì lỗi API/mạng, không còn chạy ({len(halted)}):")
+        lines += [f"{row(task)}: {stalled[str(task.get('id'))]}" for task in halted]
+        lines.append("  việc cần làm: worker 'đã tự resume' hoặc 'đang chờ mạng' thì không cần làm gì (chạy nền `worker-resume --watch` để resume ngay khi mạng có lại); "
+                     "worker 'bị chặn' thì đọc màn hình terminal của nó và báo người dùng.")
     for key, label in labels.items():
         items = groups.get(key) or []
         if not items:
             continue
         lines.append(f"{label} ({len(items)}):")
-        for task in items:
-            title = task.get("task_title") or task.get("title") or ""
-            repo = f" (repo {task['project']})" if task.get("project") != project else ""
-            lines.append(f"  - {task.get('id')} [{task.get('status')}] {title}".rstrip() + repo)
+        lines += [row(task) for task in items]
     return lines[:BOARD_LIMIT] + (["  ..."] if len(lines) > BOARD_LIMIT else [])
 
 
@@ -307,6 +321,7 @@ def read_board(root: Path, run: str | None = None, session: str = "board") -> tu
     Several coordinator terminals share that file, so the terminal's Run is used for this process only and the file is
     left as it is; when they differ the first line says which Run the board follows (`orca_cli.adopt_run`). Tasks,
     reports and worker worktrees are read for `root` and every repository it delegated into (`orca_cli.all_roots`).
+    Workers that stopped on a transient API error are resumed first (`resume.auto`), and listed in a group of their own.
     Settled worker worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists
     only the ones that still hold work; that group does not depend on the inbox being readable.
     """
@@ -332,7 +347,10 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
     roots = orca_cli.all_roots(root)
     owners = repo_owners(roots)
     home = orca.project_name(root)
-    lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]})
+    from coding_agent import resume
+
+    stalled = resume.board_notes(resume.auto(root, tasks, run, session))
+    lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]}, stalled)
     try:
         reports = orca_cli.drop_acked(root, orca_cli.unread_reports(run))
     except orca_cli.OrcaError as error:

@@ -732,9 +732,11 @@ def _composer_idle(screen: str) -> bool:
 
     Measured on Claude Code 2.1 under Orca on Windows: a ready prompt line is `❯` alone or the `❯ Try "..."`
     placeholder. A working agent shows a spinner line such as `✶ Ideating… (21s · ...)` or
-    `(running UserPromptSubmit hooks… 3/4 · 0s)`, sometimes with `esc to interrupt`.
+    `(running UserPromptSubmit hooks… 3/4 · 0s)`, sometimes with `esc to interrupt`. Measured on Claude Code under
+    Orca on macOS (2026-10-12): past a minute the spinner reads `✽ Crystallizing… (6m 41s · ↓ 35.1k tokens)`, with no
+    `esc to interrupt`.
     """
-    if "esc to interrupt" in screen or re.search(r"…\s*\(\d+s|\(running ", screen):
+    if "esc to interrupt" in screen or re.search(r"…\s*\(\d+[hms]|\(running ", screen):
         return False
     # The prompt line separates `❯` from the placeholder with a no-break space (U+00A0).
     lines = [line.replace("\xa0", " ").strip() for line in screen.splitlines()]
@@ -975,6 +977,11 @@ def screen_of(handle: str) -> str:
     return "\n".join(str(line) for line in tail) if isinstance(tail, list) else ""
 
 
+def send_line(handle: str, text: str) -> None:
+    """Type one line into a worker's terminal and submit it (`terminal send --enter --wait-submit 20`)."""
+    _call_tool("terminal", "send", "--terminal", handle, "--enter", "--wait-submit", "20", "--text", text)
+
+
 def _at_prompt(screen: str) -> bool:
     return any(line.strip().startswith(PROMPT_MARKS) for line in screen.splitlines())
 
@@ -1003,7 +1010,7 @@ def kick_worker(root: Path, *, task_id: str, dispatch: str, session: str = "cli"
             time.sleep(KICK_POLL_S)
         text = kickoff_text(task_id, dispatch)
         while attempts < KICK_ATTEMPTS and not seen:
-            _call_tool("terminal", "send", "--terminal", handle, "--enter", "--wait-submit", "20", "--text", text)
+            send_line(handle, text)
             attempts += 1
             time.sleep(KICK_SETTLE_S)
             seen = KICK_MARK in screen_of(handle)

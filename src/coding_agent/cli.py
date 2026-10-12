@@ -21,6 +21,11 @@
   The mode a worker started in is logged in `.coding-agent/events.jsonl` (`guard: permission-mode`, `kind: worker-started`).
 - `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator.
 - `worker-kick --task-id ID`: record the task's worktree as a worker's and send the kick-off to its terminal, for a worker that never received its task.
+- `worker-resume [--task-id ID ...] [--dry-run] [--watch [--interval SECONDS]]`: find the Run's workers that stopped at an
+  empty prompt under a transient API error (lost network, overloaded API, rate limit) and send each one line to go on,
+  once the API host answers on TCP 443 (`CODING_AGENT_API_HOST`, default `api.anthropic.com`). `--dry-run` only prints;
+  `--watch` repeats every `--interval` seconds (default 60) and prints a line when a worker's state changes. Exits 0
+  when there is nothing to do. The board runs the same step each turn; `CODING_AGENT_AUTO_RESUME=off` turns that off.
 - `worker-settle --task-id ID --basis B [--artifact PATH ...]`: abandon the task's active dispatch and mark it completed, once the coordinator
   has checked the result; for a worker whose `worker_done` Orca rejected.
 - `worktree-list`: worker worktrees whose task settled and that still hold work, and what removing each would lose.
@@ -51,7 +56,7 @@ from pathlib import Path
 import os
 import uuid
 
-from coding_agent import cleanup, coordinator, events, orca, orca_cli
+from coding_agent import cleanup, coordinator, events, orca, orca_cli, resume
 from coding_agent import plan as plan_graph
 from coding_agent.brief import BriefError, brief
 from coding_agent.hooks import utf8_output
@@ -109,7 +114,7 @@ ROOT_REGISTERED = frozenset({"delegate", "plan-next"})
 # Commands that act in an Orca Run. Without `--run` they use the Run Orca has bound to this terminal ahead of the
 # shared `.coding-agent/orca-run` (`orca_cli.sync_bound_run`); `board` resolves it in `coordinator.read_board`.
 TERMINAL_RUN = frozenset({"orca-create", "orca-status", "claim", "status", "worker-start", "worker-adopt", "worker-kick",
-                          "worker-settle", "worktree-list", "worktree-clean", "inbox", "delegate", "plan-apply",
+                          "worker-resume", "worker-settle", "worktree-list", "worktree-clean", "inbox", "delegate", "plan-apply",
                           "plan-next", "plan-status"})
 
 
@@ -215,6 +220,12 @@ def main(argv: list[str] | None = None) -> int:
     kick = sub.add_parser("worker-kick", help="send the task's worker its kick-off and record its worktree")
     kick.add_argument("--task-id", required=True)
     kick.add_argument("--run")
+    resumed = sub.add_parser("worker-resume", help="resume workers that stopped on a transient API error")
+    resumed.add_argument("--task-id", action="append", default=[], help="only this task's worker (repeatable; default: every running worker of the Run)")
+    resumed.add_argument("--dry-run", action="store_true", help="print what would be resumed and send nothing")
+    resumed.add_argument("--watch", action="store_true", help="keep scanning and resume when the network is back")
+    resumed.add_argument("--interval", type=float, default=resume.WATCH_INTERVAL_S, help="seconds between scans with --watch (default 60)")
+    resumed.add_argument("--run")
     settle = sub.add_parser("worker-settle", help="abandon the task's dispatch and complete the task after checking its result")
     settle.add_argument("--task-id", required=True)
     settle.add_argument("--basis", required=True, choices=sorted(orca.PROOF_BASES))
@@ -295,6 +306,15 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             outcome = orca_cli.kick_by_hand(root, task_id=args.task_id, run=args.run)
             print(json.dumps(outcome, ensure_ascii=False))
             return 0 if outcome["kicked"] else 1
+        if args.command == "worker-resume":
+            if args.watch:
+                try:
+                    resume.watch(root, args.run, task_ids=args.task_id, dry_run=args.dry_run, interval_s=max(args.interval, 1.0))
+                except KeyboardInterrupt:
+                    pass
+                return 0
+            print("\n".join(resume.main_lines(resume.scan(root, args.run, task_ids=args.task_id, dry_run=args.dry_run))))
+            return 0
         if args.command == "worker-settle":
             outcome = orca_cli.settle(root, task_id=args.task_id, basis=args.basis, artifacts=tuple(args.artifact), run=args.run)
             print(json.dumps(outcome, ensure_ascii=False))

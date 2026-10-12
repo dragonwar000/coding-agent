@@ -49,6 +49,16 @@ def no_session_project(tmp_path_factory: pytest.TempPathFactory, monkeypatch: py
 
 
 @pytest.fixture(autouse=True)
+def no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test opens a connection to the API host: the probe says the network is down unless a test patches it."""
+    from coding_agent import resume
+
+    monkeypatch.setattr(resume, "network_up", lambda timeout_s=0.0: False)
+    monkeypatch.delenv("CODING_AGENT_AUTO_RESUME", raising=False)
+    monkeypatch.delenv("CODING_AGENT_API_HOST", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def no_real_orca(monkeypatch: pytest.MonkeyPatch) -> None:
     """No test reaches the real `orca` CLI (or the Run this machine's terminal is bound to): a test that needs Orca
     patches `orca_cli` or points `CODING_AGENT_ORCA` at the fake."""
