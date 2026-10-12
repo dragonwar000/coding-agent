@@ -217,7 +217,9 @@ def window_main() -> int:
             var = tk.StringVar(value="")
             for option in options:
                 text = str(option["label"]) + (f" — {option['description']}" if option.get("description") else "")
-                tk.Radiobutton(frame, text=text, value=str(option["label"]), variable=var, wraplength=480, justify="left", anchor="w").pack(anchor="w")
+                # tristatevalue defaults to "", the variable's start value, which would draw every option as selected.
+                tk.Radiobutton(frame, text=text, value=str(option["label"]), variable=var, tristatevalue="\x00",
+                               wraplength=480, justify="left", anchor="w").pack(anchor="w")
             choices.append((question, var))
 
     status = tk.Label(window, text="", fg="#b45309")
