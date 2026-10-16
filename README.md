@@ -190,18 +190,18 @@ Session chính là **coordinator**. Nó lập plan, giao từng node cho worker 
 Nó không tự sửa file.
 
 - **`coordinator-guard` (enforce)** chặn trong session coordinator: `Write`, `Edit`, `MultiEdit`, `NotebookEdit`; lệnh shell
-  sửa nội dung file (`sed -i`, `>`, `rm`, `pip install`, ...); các dạng git phá huỷ (xem dưới); và tool
+  sửa nội dung file (`sed -i`, `>`, `rm`, `pip install`, ...); và tool
   `Agent`/`Task` (subagent nội bộ không qua graph). Guard bỏ phần nằm trong dấu nháy trước khi so khớp, nên `echo "a -> b"`
   hay `git commit -m "rm cũ"` không bị chặn; `$(...)` và backtick trong nháy kép vẫn được xét vì shell chạy chúng.
 - **Sửa cấu hình hook** (`.claude/settings.json`, `.claude/settings.local.json`, `integration.yaml`) bằng `Write`/`Edit`
   không bị chặn mà host hỏi người dùng xác nhận, để guard luôn tắt được từ trong phiên.
 - **Coordinator vẫn được:** đọc file, lệnh đọc, ghi `.coding-agent/plan.yaml`, chạy một lệnh `coding_agent.cli` đơn lẻ,
-  và chạy lệnh git (add, commit, merge, push, fetch, pull, checkout, switch, branch, rebase, stash, apply, restore, rm,
-  tag, cherry-pick, worktree, ...), trừ các dạng phá huỷ làm mất dữ liệu không lấy lại được: `git push --force` / `-f` /
-  `--force-with-lease` / `+refspec`, `git reset --hard`, `git clean -f` (mọi tổ hợp cờ có `f`), `git checkout -- <path>`
-  và `git checkout .`, `git restore` không có `--staged`, `git stash drop` / `clear`, `git branch -D`. Guard xét cả lệnh
-  nối bằng `&&`/`;`/`|` và script trong `sh -c`. Khởi động phiên với `CODING_AGENT_COORDINATOR_GIT=all` để bỏ cả phần
-  chặn này.
+  và chạy mọi lệnh git (add, commit, merge, push, fetch, pull, checkout, switch, branch, rebase, stash, apply, restore,
+  rm, tag, cherry-pick, worktree, ...), kể cả `push --force`, `reset --hard`, `clean -f`. Khởi động phiên với
+  `CODING_AGENT_COORDINATOR_GIT=safe` để chặn các dạng phá huỷ làm mất dữ liệu không lấy lại được: `git push --force` /
+  `-f` / `--force-with-lease` / `+refspec`, `git reset --hard`, `git clean -f` (mọi tổ hợp cờ có `f`),
+  `git checkout -- <path>` và `git checkout .`, `git restore` không có `--staged`, `git stash drop` / `clear`,
+  `git branch -D`. Ở chế độ đó guard xét cả lệnh nối bằng `&&`/`;`/`|` và script trong `sh -c`.
 - **Tự giao việc:** chỉ worker được ghi. Khi việc cần ghi hoặc khi guard chặn một lệnh, coordinator giao ngay trong cùng
   lượt (`delegate` cho một việc nhỏ, graph cho nhiều việc), không xin phép người dùng và không viết lại lệnh để lách guard.
   Chưa có Orca Run thì nó tự chạy `run-init`. Lời từ chối của guard kèm sẵn lệnh `delegate`. Nó chỉ hỏi người dùng về

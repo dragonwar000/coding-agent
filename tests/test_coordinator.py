@@ -81,8 +81,8 @@ def test_the_role_environment_variable_overrides_detection(repo, monkeypatch):
     ("Bash", {"command": "echo hi > out.txt"}, True),
     ("Bash", {"command": "git commit -m x"}, False),
     ("Bash", {"command": "git add -A && git merge worker-branch"}, False),
-    ("Bash", {"command": "git reset --hard HEAD~1"}, True),
-    ("Bash", {"command": "git checkout -- src/app.py"}, True),
+    ("Bash", {"command": "git reset --hard HEAD~1"}, False),
+    ("Bash", {"command": "git checkout -- src/app.py"}, False),
     ("Bash", {"command": "git push origin main && git checkout main"}, False),
     ("Bash", {"command": "rm -rf build"}, True),
     ("Bash", {"command": "pytest -q 2>&1"}, False),
@@ -101,7 +101,8 @@ def test_the_role_environment_variable_overrides_detection(repo, monkeypatch):
     ("Agent", {"description": "do it all"}, True),
     ("Task", {"description": "do it all"}, True),
 ])
-def test_the_guard_reason_covers_writes_and_mutating_shell(tool, tool_input, blocked):
+def test_the_guard_reason_covers_writes_and_mutating_shell(tool, tool_input, blocked, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
     assert (coordinator.guard_reason(tool, tool_input) is not None) is blocked
 
 
@@ -130,7 +131,7 @@ def test_the_guard_reason_covers_writes_and_mutating_shell(tool, tool_input, blo
     "sh -c 'git fetch && git rebase origin/main'",
 ])
 def test_the_coordinator_runs_git_commands(command, monkeypatch):
-    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
+    monkeypatch.setenv("CODING_AGENT_COORDINATOR_GIT", "safe")
     assert coordinator.guard_reason("Bash", {"command": command}) is None
 
 
@@ -161,16 +162,30 @@ def test_the_coordinator_runs_git_commands(command, monkeypatch):
     ("sh -c 'git fetch && git reset --hard origin/main'", "git reset --hard"),
     ("bash -lc \"git clean -fdx\"", "git clean -f"),
 ])
-def test_the_coordinator_guard_blocks_destructive_git(command, form, monkeypatch):
-    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
+def test_the_safe_git_mode_blocks_destructive_git(command, form, monkeypatch):
+    monkeypatch.setenv("CODING_AGENT_COORDINATOR_GIT", "safe")
     reason = coordinator.guard_reason("Bash", {"command": command})
     assert reason is not None and form in reason
-    assert "phá huỷ" in reason and "CODING_AGENT_COORDINATOR_GIT=all" in reason
+    assert "phá huỷ" in reason and "CODING_AGENT_COORDINATOR_GIT=safe" in reason
 
 
-def test_the_coordinator_git_environment_lifts_the_destructive_block(monkeypatch):
-    monkeypatch.setenv("CODING_AGENT_COORDINATOR_GIT", "all")
-    assert coordinator.guard_reason("Bash", {"command": "git reset --hard && git push -f"}) is None
+@pytest.mark.parametrize("value", [None, "all", "nonsense"])
+@pytest.mark.parametrize("command", [
+    "git reset --hard && git push -f origin main",
+    "git clean -fdx; git checkout -- .",
+    "git stash drop && git branch -D old",
+    "sh -c 'git fetch && git reset --hard origin/main'",
+])
+def test_the_coordinator_runs_destructive_git_by_default(command, value, monkeypatch):
+    if value is None:
+        monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
+    else:
+        monkeypatch.setenv("CODING_AGENT_COORDINATOR_GIT", value)
+    assert coordinator.guard_reason("Bash", {"command": command}) is None
+
+
+def test_the_default_git_mode_still_blocks_file_writes(monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
     assert coordinator.guard_reason("Bash", {"command": "git clean -fd && rm -rf build"}) is not None
 
 
@@ -512,7 +527,7 @@ def test_a_maintainer_session_is_let_through_and_logged(repo, monkeypatch):
     manifest(repo, verify=[])
     committed_repo(repo)
     assert coordinator.role_for(repo) == "maintainer"
-    result = call(repo, "coordinator-guard", {"session_id": "c32", "cwd": str(repo), **{"tool_name": "Bash", "tool_input": {"command": "git stash drop"}}}, mode="enforce")
+    result = call(repo, "coordinator-guard", {"session_id": "c32", "cwd": str(repo), **{"tool_name": "Bash", "tool_input": {"command": "rm -rf build"}}}, mode="enforce")
     assert result.returncode == 0 and result.stdout == ""
     last = json.loads(events.log_path(repo).read_text(encoding="utf-8").splitlines()[-1])
     assert last["kind"] == "maintainer-allowed" and last["applied"] is False

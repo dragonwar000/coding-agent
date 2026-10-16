@@ -5,8 +5,8 @@ Role is decided per session. The main worktree of the repository is the coordina
 overrides the detection; a maintainer session is not blocked, and what the guard would have blocked is still logged. A worker never gets the coordinator contract, and the coordinator guard does
 nothing in a worker.
 
-The guard blocks direct file writes, shell commands that change files, and destructive git forms in the
-coordinator, so the work goes to a worker. Every other git command is the coordinator's to run. The contract and the task board are injected at session start and on every prompt, so the
+The guard blocks direct file writes and shell commands that change files in the coordinator, so the work goes
+to a worker. git commands are the coordinator's to run; `CODING_AGENT_COORDINATOR_GIT=safe` blocks the destructive forms. The contract and the task board are injected at session start and on every prompt, so the
 coordinator keeps the user's question in view while workers run.
 """
 
@@ -27,7 +27,7 @@ WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 BOARD_LIMIT = 20
 
 # Shell forms that change file content. Read-only forms (ls, cat, grep) and the coding-agent CLI are not matched.
-# git commands are not matched here: the coordinator runs any git command except the destructive forms below.
+# git commands are not matched here: the coordinator runs any git command (in `safe` mode, all but the destructive forms below).
 # A heuristic: what it misses is recorded by stop-gate as `direct-change`.
 MUTATING_BASH = re.compile(
     r"(\bsed\s+-i\b|\brm\s|\bmv\s|\bcp\s|\bmkdir\b|\btouch\b|\btee\b|\bchmod\b|\bln\s|"
@@ -99,7 +99,7 @@ def checked_shell(command: str) -> str:
 
 # One git invocation: `git` as a word of its own, up to the next separator or redirect.
 GIT_CALL = re.compile(r"(?<![^\s;&|(`'\"])git(?=\s|$)([^;&|\n()`>]*)")
-# `CODING_AGENT_COORDINATOR_GIT=all` lets the coordinator run the destructive git forms too.
+# `CODING_AGENT_COORDINATOR_GIT=safe` blocks the destructive git forms. Unset or `all` (the default), every git command runs.
 COORDINATOR_GIT_ENV = "CODING_AGENT_COORDINATOR_GIT"
 # Global options of git that take a value as the next word.
 GIT_OPTIONS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
@@ -268,8 +268,8 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python
     """Why the coordinator must not do this call itself, or None when the call is allowed.
 
     Allowed: read-only shell, a single `coding_agent.cli` command, and writing the plan file.
-    Refused: any other file write, a shell command that changes files, a destructive git form (unless
-    `CODING_AGENT_COORDINATOR_GIT=all`), and an in-process subagent, which would bypass the graph.
+    Refused: any other file write, a shell command that changes files, a destructive git form (only with
+    `CODING_AGENT_COORDINATOR_GIT=safe`), and an in-process subagent, which would bypass the graph.
     Every refusal ends with the delegate command, with `python_src` in it when the caller knows the path.
     """
     data = tool_input if isinstance(tool_input, dict) else {}
@@ -285,12 +285,13 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python
         shell = checked_shell(command)
         if DELEGATE_CALL.search(command) and not CHAINING.search(shell):
             return None
-        if os.environ.get(COORDINATOR_GIT_ENV) != "all":
+        if os.environ.get(COORDINATOR_GIT_ENV) == "safe":
             form = destructive_git(shell)
             if form:
                 return (
-                    f"[coordinator] `{form}` là dạng git phá huỷ: làm mất dữ liệu không lấy lại được, nên bị chặn. "
-                    f"Muốn cho coordinator chạy cả dạng này: khởi động phiên với {COORDINATOR_GIT_ENV}=all. {how}"
+                    f"[coordinator] `{form}` là dạng git phá huỷ: làm mất dữ liệu không lấy lại được, nên bị chặn "
+                    f"vì phiên đặt {COORDINATOR_GIT_ENV}=safe. Muốn cho coordinator chạy cả dạng này: khởi động phiên "
+                    f"không đặt biến đó (hoặc {COORDINATOR_GIT_ENV}=all). {how}"
                 )
         if MUTATING_BASH.search(GIT_CALL.sub("git", shell)):
             return f"[coordinator] lệnh shell này làm thay đổi file. {how}"
@@ -302,7 +303,7 @@ def contract(python_src: str) -> str:
     return "\n".join([
         "[coordinator] Bạn là coordinator của repo này. Vai trò: nhận yêu cầu, lập kế hoạch, giao việc, và trả lời người dùng.",
         "- Mọi thay đổi file đi qua graph: bạn viết plan, worker Orca làm từng node trong worktree riêng. Ở mode enforce, hook chặn sửa trực tiếp, lệnh shell ghi file, và subagent nội bộ.",
-        "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và được chạy lệnh git (gộp nhánh worker, push, pull, checkout, rebase, stash, tag...), trừ các dạng phá huỷ: `git push --force`/`-f`/`+refspec`, `git reset --hard`, `git clean -f`, `git checkout -- <path>`/`git checkout .`, `git restore` không có `--staged`, `git stash drop/clear`, `git branch -D`.",
+        "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và được chạy mọi lệnh git (gộp nhánh worker, push, pull, checkout, rebase, stash, tag...). Phiên đặt `CODING_AGENT_COORDINATOR_GIT=safe` thì chặn các dạng phá huỷ: `git push --force`/`-f`/`+refspec`, `git reset --hard`, `git clean -f`, `git checkout -- <path>`/`git checkout .`, `git restore` không có `--staged`, `git stash drop/clear`, `git branch -D`.",
         "- Worker tách nhánh từ commit hiện tại: commit việc đang dở trước khi `plan-next`, nếu không worker sẽ không thấy nó.",
         "- Chỉ worker được ghi: mọi lần ghi file, script tạm, hay lệnh shell đổi trạng thái là việc của worker. Bạn không tự làm, và không viết lại lệnh bị chặn để lách guard.",
         "- Khi việc cần ghi, hoặc khi hook chặn một lệnh: giao ngay trong cùng lượt, bằng lệnh delegate (một việc nhỏ) hoặc graph (nhiều việc). Không xin phép người dùng, không kết thúc lượt để chờ. Chỉ hỏi người dùng khi quyết định thật sự là của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài), không hỏi \"có giao việc không\".",
