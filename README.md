@@ -21,10 +21,12 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/transcript.py` | Đọc một lượt từ transcript, có số dòng làm bằng chứng và số lần lỗi/bị từ chối |
 | `src/coding_agent/orca.py` | Quy tắc Orca thuần: completion cần bằng chứng, task thuộc một repo, bằng chứng `CLAIMED-DONE BUT ABSENT` |
 | `src/coding_agent/orca_cli.py` | Adapter tới `orca orchestration`: tạo task, claim, đổi trạng thái, liệt kê |
+| `src/coding_agent/autodecide.py` | Auto-decide: câu hỏi `AskUserQuestion` chờ N giây trong cửa sổ đếm ngược, hết giờ thì Fable hoặc phương án gợi ý chọn |
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
-| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-settle` |
+| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-settle`, `wiki-sync`, `wikieval` |
+| `src/coding_agent/wiki/` | Công cụ wiki của dự án: neo đồng bộ code→wiki (`sync.py`) và bộ eval goldens (`evaluate.py`) |
 | `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
 | `install.sh` | Lệnh một dòng cho `project_install` |
 | `src/coding_agent/gate.py` | Cổng của package (FR-003): thất bại khi file đang dùng lệch manifest |
@@ -50,6 +52,55 @@ uv venv .venv && uv pip install --python .venv/bin/python "pyyaml>=6" "pytest>=8
 Test `hooks` và `zeromem` cần binary `zm` trên `PATH` (hoặc `CODING_AGENT_ZM`); không có thì
 các test đó được bỏ qua và báo rõ là bỏ qua. Test Orca dùng `fake_orca.py` qua `CODING_AGENT_ORCA`,
 không cần Orca thật.
+
+## Auto-decide
+
+Khi bật, mỗi lần agent hỏi bạn bằng `AskUserQuestion`, câu hỏi hiện trong một cửa sổ nhỏ có đồng hồ đếm ngược.
+Bạn chọn trong thời gian chờ thì agent dùng câu trả lời của bạn. Hết giờ thì Fable (`claude-fable-5-1`) chọn một
+phương án trong danh sách; Fable lỗi hoặc tắt thì dùng phương án agent gợi ý (nhãn có `(Recommended)`, không có thì
+phương án đầu). Câu hỏi về xoá, ghi đè, commit/push cũng được tự chọn, và được gắn cờ `sensitive` trong
+`.coding-agent/events.jsonl`. Đóng cửa sổ thì câu hỏi quay về terminal như thường. Hộp xin quyền của
+`coordinator-guard` không bao giờ được tự trả lời.
+
+```sh
+python -m coding_agent.cli auto-decide on --timeout 60   # bật, chờ 60 giây (10 đến 3600)
+python -m coding_agent.cli auto-decide --no-fable        # hết giờ thì dùng thẳng phương án gợi ý
+python -m coding_agent.cli auto-decide status            # xem cấu hình đang có hiệu lực
+python -m coding_agent.cli auto-decide off
+```
+
+Giá trị mặc định nằm ở khối `auto_decide:` của `integration.yaml`; lệnh trên ghi `.coding-agent/state/auto-decide.json`
+và ghi đè khối đó từ câu hỏi kế tiếp. Cần `tkinter` và màn hình; thiếu thì câu hỏi hỏi như thường.
+
+## Wiki: wiki-sync và wikieval
+
+Hai công cụ wiki chạy từ coding-agent, không cần bản global của `setup` ở `~/.claude/harness`. Cả hai tất định,
+không gọi model. Chạy trong thư mục dự án; dự án có `harness/coding-agent/src` vendored thì đặt
+`PYTHONPATH=harness/coding-agent/src`.
+
+```sh
+python -m coding_agent.cli wiki-sync --check          # 0 = wiki current, 3 = code đổi (cờ code-drift vào stale.json), 2 = chưa có neo
+python -m coding_agent.cli wiki-sync --mark-synced    # chốt neo sau khi rà wiki; chỉ ghi khi có gì đổi
+python -m coding_agent.cli wiki-sync --flags-for "slug1,slug2"   # đường đọc của /query: luôn thoát 0
+python -m coding_agent.cli wikieval --outputs harness/evals/outputs.json --check            # 2 khi có golden tụt
+python -m coding_agent.cli wikieval --outputs harness/evals/outputs.json --write-baseline
+python -m coding_agent.cli wikieval --self-test       # assert của mỗi golden chạy trên chính `expected` của nó
+```
+
+`wiki-sync` tìm `llmwiki/wiki` (hoặc `wiki/`) từ `--root` đi ngược lên. Dự án là gốc repo hoặc thư mục con được track
+thì neo theo git (`.last-sync.json` giữ `gitHead`); dự án không có git, untracked hay bị repo cha ignore thì neo
+theo dấu vân tay cây file (`mode: tree`, kèm `.last-sync-tree.json`). Chế độ tree bỏ qua thư mục build/vendor/cache,
+file runtime (`.claude/audit/`, `*.jsonl` trong `.claude/`) và file bị `.gitignore` loại, kể cả `.gitignore` của
+repo con. Chi phí mỗi lượt `--check` ghi vào `harness/metrics/sync-log.jsonl` khi thư mục đó có sẵn.
+
+`wikieval` đọc goldens ở `fdk/wiki/sources/evals` hoặc `llmwiki/wiki/sources/evals` (`--evals-dir` để chọn thư mục
+khác), baseline ở `<root>/harness/metrics/eval-baseline.json` và cấu hình adapter ở `<root>/harness/wikieval.config.yaml`
+(thiếu thì tier 2 và tier 3 tắt). Mọi đường dẫn mặc định tính từ `--root` (mặc định thư mục hiện tại), không bao giờ
+từ nơi cài coding-agent. `--write-baseline` từ chối ghi đè một baseline có dữ liệu bằng lượt chạy không chấm được
+golden nào.
+
+Định dạng `.last-sync.json`, `.last-sync-tree.json`, `stale.json` và `eval-baseline.json` (`wikieval-baseline/v1`)
+giữ nguyên như bản của `setup`, nên neo và baseline có sẵn dùng tiếp được.
 
 ## Cài vào một dự án
 
@@ -278,8 +329,19 @@ python3 -m coding_agent.cli inbox --ack                       # đánh dấu đ�
   như cũ). Khi khác Run đã lưu, dòng đầu của bảng ghi `bảng theo Run X của terminal này (orca-run lưu Y)` và event `run-differs`
   được ghi tối đa một lần mỗi phiên (đánh dấu ở `.coding-agent/state/orca-run.<session>`).
 - **Giao vào repo khác:** `delegate`/`plan-next` với `--root` khác thư mục coordinator (`$CLAUDE_PROJECT_DIR`, không có thì thư mục
-  làm việc) ghi root đó vào `.coding-agent/roots.json` của coordinator. Bảng việc, báo cáo, `worktree-list` và tự dọn đọc
-  links, `plan.json` và sổ worker của mọi root đã ghi; dòng của task ở repo khác kèm tên repo.
+  làm việc). Bảng việc, báo cáo, `inbox`, `worktree-list`, tự dọn và `roots-list` cùng đọc một danh sách (`orca_cli.all_roots`):
+  thư mục coordinator; mọi thư mục trong cây của nó (tối đa 3 cấp, không vào thư mục ẩn, `node_modules`... hay bên trong repo con)
+  có `.coding-agent/links.jsonl`, tìm lại mỗi lần đọc; và repo ngoài cây ghi trong `.coding-agent/roots.json` (lệnh `--root` ghi
+  vào đó chỉ khi root nằm ngoài cây). Từ mỗi root đọc links, `plan.json` và sổ worker; dòng của task ở repo khác kèm tên repo.
+  Task của Run mà chưa sổ nào biết (giao trước khi có `roots.json`) được tìm lại repo từ Orca (`orchestration worker-list` →
+  worktree → repo chính, hoặc main worktree Orca liệt kê) và ghi vào `roots.json` nếu `links.jsonl` của repo đó có task; lỗi Orca
+  ghi event `guard=roots`, thử lại sau 10 phút. `roots-list` liệt kê kèm nguồn (`own`, `tree`, `roots.json`); `roots-add <path>...`
+  ghi tay repo ngoài cây.
+- **Worker đang hỏi:** worker chờ trả lời `orca orchestration ask` (type `question`/`escalation`, hoặc `payload.question`) nằm ở
+  nhóm đầu bảng `worker đang hỏi, chờ trả lời (N):` kèm lựa chọn, msg id và lệnh `orca orchestration reply --id <msg> --run <run>`,
+  và không còn nằm trong `đang chạy`. Đã trả lời = có tin cùng thread, worker báo cáo task, hoặc câu hỏi mới hơn của cùng dispatch;
+  heartbeat và `send` thường tới dispatch không tính. Task đang chạy mà worker im lặng quá 20 phút ghi `(không có tin X phút)`.
+  `inbox` (không `--ack`) in cả câu hỏi mở.
 - Nhóm `xong, worktree còn việc chưa gộp hoặc chưa commit` lấy từ git và sổ worker, không từ hộp thư: nó luôn hiện, kể cả khi
   hộp thư không đọc được hay báo cáo đã được ack, tới khi nhánh được gộp hoặc bỏ.
 

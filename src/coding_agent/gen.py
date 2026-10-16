@@ -44,7 +44,10 @@ def _render_host(manifest: Manifest, host: str, root_expr: str) -> dict[str, Any
     for hook in manifest.hooks:
         if host not in hook.host:
             continue
-        entry: dict[str, Any] = {"hooks": [{"type": "command", "command": command_for(manifest, hook, root_expr)}]}
+        command: dict[str, Any] = {"type": "command", "command": command_for(manifest, hook, root_expr)}
+        if hook.timeout_s is not None:
+            command["timeout"] = hook.timeout_s
+        entry: dict[str, Any] = {"hooks": [command]}
         if hook.matcher is not None:
             entry = {"matcher": hook.matcher, **entry}
         events.setdefault(hook.event, []).append(entry)

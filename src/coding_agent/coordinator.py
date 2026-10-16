@@ -16,15 +16,19 @@ import json
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from coding_agent import orca, orca_cli
+from coding_agent import orca, orca_cli, roots as root_discovery
 
 ROLE_ENV = "CODING_AGENT_ROLE"
 ROLES = ("coordinator", "worker", "maintainer")
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 BOARD_LIMIT = 20
+QUESTION_CHARS = 200
+# A dispatched task whose worker sent nothing (heartbeat, report, question) for longer than this is flagged on the board.
+SILENT_MINUTES = 20
 
 # Shell forms that change file content. Read-only forms (ls, cat, grep) and the coding-agent CLI are not matched.
 # git commands are not matched here: the coordinator runs any git command (in `safe` mode, all but the destructive forms below).
@@ -298,9 +302,17 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python
     return None
 
 
-def contract(python_src: str) -> str:
+AUTO_DECIDE_LINE = (
+    "- Auto-decide đang bật: khi cần người dùng quyết (kể cả câu hỏi worker leo thang), hỏi bằng tool AskUserQuestion, "
+    "không hỏi bằng văn bản rồi kết thúc lượt. Đặt phương án bạn gợi ý lên đầu, nhãn kết thúc bằng \"(Recommended)\". "
+    "Người dùng không trả lời trong thời gian chờ thì hệ thống tự chọn và báo lại; hãy nói lại lựa chọn đó cho người dùng "
+    "rồi làm tiếp (với câu hỏi của worker: trả lời worker theo lựa chọn đó)."
+)
+
+
+def contract(python_src: str, auto_decide: bool = False) -> str:
     """The coordinator contract injected at session start and after a compaction."""
-    return "\n".join([
+    lines = [
         "[coordinator] Bạn là coordinator của repo này. Vai trò: nhận yêu cầu, lập kế hoạch, giao việc, và trả lời người dùng.",
         "- Mọi thay đổi file đi qua graph: bạn viết plan, worker Orca làm từng node trong worktree riêng. Ở mode enforce, hook chặn sửa trực tiếp, lệnh shell ghi file, và subagent nội bộ.",
         "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và được chạy mọi lệnh git (gộp nhánh worker, push, pull, checkout, rebase, stash, tag...). Phiên đặt `CODING_AGENT_COORDINATOR_GIT=safe` thì chặn các dạng phá huỷ: `git push --force`/`-f`/`+refspec`, `git reset --hard`, `git clean -f`, `git checkout -- <path>`/`git checkout .`, `git restore` không có `--staged`, `git stash drop/clear`, `git branch -D`.",
@@ -313,32 +325,78 @@ def contract(python_src: str) -> str:
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, rồi `inbox --ack --task-id <id>` cho đúng task vừa gộp (không ack cả hộp thư: báo cáo chưa xem sẽ mất khỏi bảng), rồi `plan-next`.",
-        "- Task giao bằng `delegate`/`plan-next` với `--root <repo khác>` được ghi vào .coding-agent/roots.json, nên vẫn hiện trên bảng (kèm tên repo) và được tự dọn như task của repo này.",
+        "- Task giao bằng `delegate`/`plan-next` với `--root <repo khác>` vẫn hiện trên bảng (kèm tên repo) và được tự dọn như task của repo này: repo trong cây thư mục của bạn được tự tìm (có .coding-agent/links.jsonl), repo ngoài cây được ghi vào .coding-agent/roots.json. Task giao trước khi có roots.json được tự tìm lại repo từ Orca; nếu bảng vẫn thiếu, chạy `roots-add <path>`, xem bằng `roots-list`.",
         "- " + RECOVER,
         "- Worker dừng vì lỗi API tạm thời (mất mạng, quá tải, rate limit) được tự resume khi dựng bảng việc, sau khi kiểm thấy mạng đã có lại; bảng việc ghi rõ worker nào đã resume, đang chờ mạng, hay bị chặn cần người xử lý. Khi còn worker đang chạy mà bạn không có lượt mới, chạy nền `worker-resume --watch` để chúng được resume ngay khi mạng trở lại.",
         "- Worker im lặng (task còn dispatched, terminal đứng ở ô nhập trống quá 10 phút, chưa có worker_done trong hộp thư) được tự nhắc tối đa 2 lần: việc xong thì commit và gửi worker_done, chưa xong thì làm tiếp. Bảng việc tách riêng nhóm 'worker im lặng, chưa báo' kèm số lần đã nhắc; nhắc đủ 2 lần mà vẫn im thì đọc màn hình terminal và diff của worktree rồi xử lý (gộp và `worker-settle` nếu đạt).",
         "- Worktree của worker đã xong, đã gộp và sạch thì tự được xoá (khi dựng bảng việc và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`), không cần hỏi người dùng. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit: kiểm rồi gộp nhánh vào HEAD, lượt sau nó tự được dọn. Muốn bỏ việc đó thì hỏi người dùng trong hội thoại trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp; host cũng hỏi xác nhận, trừ khi phiên đang bypass permissions).",
+        "- Khi bảng việc ghi 'worker đang hỏi, chờ trả lời': worker đó đang đứng chờ, không chạy. Trả lời ngay bằng lệnh in trên bảng (`orca orchestration reply --id <msg> --run <run> --body \"...\"`). Câu hỏi cần người dùng quyết (phạm vi, xoá/ghi đè, commit/push, chọn hướng) thì hỏi người dùng trong hội thoại trước rồi mới trả lời worker. Dòng task có '(không có tin X phút)' là worker im lặng lâu: đọc terminal của nó trước khi coi là đang chạy.",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",
-    ])
+    ]
+    if auto_decide:
+        lines.append(AUTO_DECIDE_LINE)
+    return "\n".join(lines)
+
+
+def _minutes_since(when: Any, now: datetime) -> int | None:
+    try:
+        then = datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    then = then if then.tzinfo else then.replace(tzinfo=timezone.utc)
+    return int((now - then).total_seconds() // 60)
+
+
+def question_lines(questions: list[dict[str, Any]], owners: dict[str, str] | None = None, home: str | None = None,
+                   run: str | None = None) -> list[str]:
+    """Lines for the worker questions nobody answered, each with the command that answers it. Empty when there are none."""
+    if not questions:
+        return []
+    lines = [f"worker đang hỏi, chờ trả lời ({len(questions)}):"]
+    for question in questions:
+        task = str(question.get("task_id") or "?")
+        repo = (owners or {}).get(task)
+        where = f" (repo {repo})" if repo and repo != home else ""
+        text = " ".join(str(question.get("question") or "").split())
+        text = text if len(text) <= QUESTION_CHARS else text[:QUESTION_CHARS] + "…"
+        kind = "" if question.get("type") in (None, "question") else f" [{question['type']}]"
+        lines.append(f"  - {task}{where}{kind}: {text}")
+        if question.get("options"):
+            lines.append("    lựa chọn: " + " | ".join(question["options"]))
+        target = question.get("run") or run
+        lines.append(f"    msg {question.get('id')}; trả lời: `orca orchestration reply --id {question.get('id')}"
+                     + (f" --run {target}" if target else "") + ' --body "..."`')
+    return lines
 
 
 def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: str, others: frozenset[str] | set[str] = frozenset(),
-                stalled: dict[str, str] | None = None, silent: dict[str, str] | None = None) -> list[str]:
+                questions: list[dict[str, Any]] | None = None, heard: dict[str, str] | None = None,
+                now: datetime | None = None, run: str | None = None, stalled: dict[str, str] | None = None,
+                silent: dict[str, str] | None = None) -> list[str]:
     """The task board for this repository, one line per task, grouped by state.
 
     `others` are the repositories this coordinator delegated into; their tasks are listed too, each with its repository.
+    `questions` (`orca_cli.open_questions`) come first: a task waiting on an answer is not listed as running. `heard`
+    maps a task to when its worker last sent anything; a running task silent for over `SILENT_MINUTES` says so.
     `stalled` maps a task whose worker stopped on an API error to what was done about it (`resume.board_notes`); those
-    tasks are listed first, in a group of their own, and not as running. `silent` does the same for a worker that went
+    tasks are listed next, in a group of their own, and not as running. `silent` does the same for a worker that went
     quiet without reporting (`resume.silent_notes`), in the group after it.
     """
     shown = {project, *others}
     stalled = stalled or {}
     silent = {task: note for task, note in (silent or {}).items() if task not in stalled}
     mine = [{**task, "project": owners[str(task.get("id"))]} for task in tasks if owners.get(str(task.get("id"))) in shown]
+    ids = {str(task.get("id")) for task in mine}
+    known = {str(task.get("id")) for task in tasks}
+    # A question of another coordinator's task stays off this board; one of a task the Run does not list is shown.
+    asking = [question for question in questions or []
+              if str(question.get("task_id")) in ids or str(question.get("task_id")) not in known]
+    waiting = {str(question.get("task_id")) for question in asking}
+    lines: list[str] = question_lines(asking, owners, project, run)
     if not mine:
-        return ["bảng việc: chưa có task nào của repo này"]
+        return lines + ["bảng việc: chưa có task nào của repo này"]
 
     def row(task: dict[str, Any]) -> str:
         title = task.get("task_title") or task.get("title") or ""
@@ -348,6 +406,8 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
     halted = [task for task in mine if str(task.get("id")) in stalled]
     quiet = [task for task in mine if str(task.get("id")) in silent]
     groups = orca.reconcile([task for task in mine if str(task.get("id")) not in stalled and str(task.get("id")) not in silent])
+    groups["running"] = [task for task in groups["running"] if str(task.get("id")) not in waiting]
+    now = now or datetime.now(timezone.utc)
     labels = {
         "running": "đang chạy",
         "never_dispatched": "chưa giao worker",
@@ -355,7 +415,6 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
         "unverified": "báo xong nhưng chưa có bằng chứng",
         "other": "khác",
     }
-    lines: list[str] = []
     if halted:
         lines.append(f"worker bị dừng vì lỗi API/mạng, không còn chạy ({len(halted)}):")
         lines += [f"{row(task)}: {stalled[str(task.get('id'))]}" for task in halted]
@@ -371,7 +430,12 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
         if not items:
             continue
         lines.append(f"{label} ({len(items)}):")
-        lines += [row(task) for task in items]
+        for task in items:
+            quiet_for = ""
+            if key == "running" and (heard or {}).get(str(task.get("id"))):
+                minutes = _minutes_since(heard[str(task.get("id"))], now)
+                quiet_for = f" (không có tin {minutes} phút)" if minutes is not None and minutes > SILENT_MINUTES else ""
+            lines.append(row(task) + quiet_for)
     return lines[:BOARD_LIMIT] + (["  ..."] if len(lines) > BOARD_LIMIT else [])
 
 
@@ -395,9 +459,11 @@ def read_board(root: Path, run: str | None = None, session: str = "board") -> tu
     (`run-current`, or the one a `consumer_fenced` answer names), then the Run stored in `.coding-agent/orca-run`.
     Several coordinator terminals share that file, so the terminal's Run is used for this process only and the file is
     left as it is; when they differ the first line says which Run the board follows (`orca_cli.adopt_run`). Tasks,
-    reports and worker worktrees are read for `root` and every repository it delegated into (`orca_cli.all_roots`).
-    Workers that stopped on a transient API error are resumed first (`resume.auto`), and listed in a group of their own;
-    so are workers that went silent without reporting, which `resume.auto` reminds.
+    reports and worker worktrees are read for `root` and every repository it delegated into (`orca_cli.all_roots`); a
+    task no known repository owns makes `roots.discover` look its repository up from Orca and register it first.
+    Worker questions nobody answered come first (`orca_cli.worker_activity`). Workers that stopped on a transient API
+    error are resumed (`resume.auto`), and listed in a group of their own; so are workers that went silent without
+    reporting, which `resume.auto` reminds.
     Settled worker worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists
     only the ones that still hold work; that group does not depend on the inbox being readable.
     """
@@ -420,14 +486,24 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
         tasks = orca_cli.list_tasks(run)
     except orca_cli.OrcaError as error:
         return [], str(error)[:300], orca_cli.fenced_run(error)
+    root_discovery.discover(root, [str(task.get("id") or "") for task in tasks], run, session)
     roots = orca_cli.all_roots(root)
     owners = repo_owners(roots)
     home = orca.project_name(root)
+    try:
+        questions, heard = orca_cli.worker_activity(run)
+        activity_error = None
+    except orca_cli.OrcaError as error:
+        if orca_cli.fenced_run(error):
+            return [], None, orca_cli.fenced_run(error)
+        questions, heard, activity_error = [], {}, str(error)[:160]
     from coding_agent import resume
 
     found = resume.auto(root, tasks, run, session)
-    lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]}, resume.board_notes(found),
-                        resume.silent_notes(found))
+    lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]}, questions, heard,
+                        run=orca_cli.run_id(run), stalled=resume.board_notes(found), silent=resume.silent_notes(found))
+    if activity_error:
+        lines.append(f"câu hỏi của worker không đọc được: {activity_error}")
     try:
         reports = orca_cli.drop_acked(root, orca_cli.unread_reports(run))
     except orca_cli.OrcaError as error:

@@ -173,8 +173,10 @@ def sync_bound_run(root: Path, session: str = "cli") -> str | None:
 
 
 # Repositories the coordinator delegated into with `--root`. Their links, plan ledger and worker records live under
-# their own `.coding-agent`, so the coordinator's board and auto-clean read them through this list.
+# their own `.coding-agent`, so the coordinator's board, inbox and auto-clean read them through `all_roots`: the ones
+# inside the coordinator's directory tree are found there (`tree_roots`), and `roots.json` lists the others.
 ROOTS_FILE = Path(".coding-agent") / "roots.json"
+LINKS_FILE = Path(".coding-agent") / "links.jsonl"
 
 
 def coordinator_root() -> Path:
@@ -200,15 +202,46 @@ def registered_roots(root: Path) -> list[Path]:
     return out
 
 
+def tree_roots(root: Path) -> list[Path]:
+    """Directories under `root` that hold a link ledger (`.coding-agent/links.jsonl`), as `child_repos` walks the tree.
+
+    These are the repositories a coordinator delegated into with `--root <child>`; they need no entry in `roots.json`.
+    A linked git worktree (`.git` is a file) is left out: its main repository is the one that counts.
+    """
+    own = root.resolve()
+    return [path.resolve() for path in _tree(own) if (path / LINKS_FILE).is_file() and not (path / ".git").is_file()]
+
+
 def all_roots(root: Path) -> list[Path]:
-    """`root` first, then every repository it delegated into."""
-    return [root.resolve(), *registered_roots(root)]
+    """`root` first, then every repository it delegated into: the ones in its tree (`tree_roots`), then `roots.json`.
+
+    The board, the inbox, cleanup and `roots-list` all read the repositories through this one function.
+    """
+    out = [root.resolve()]
+    for path in [*tree_roots(root), *registered_roots(root)]:
+        if path not in out:
+            out.append(path)
+    return out
+
+
+def in_tree(coordinator: Path, path: Path) -> bool:
+    """True when `tree_roots(coordinator)` would see `path` once it holds a link ledger, so `roots.json` need not list it."""
+    coordinator, path = coordinator.resolve(), path.resolve()
+    try:
+        parts = path.relative_to(coordinator).parts
+    except ValueError:
+        return False
+    if not parts or len(parts) > SCAN_DEPTH or any(part.startswith(".") or part in SCAN_SKIP for part in parts):
+        return False
+    # `_tree` does not enter a repository, so a directory below a child repository is not seen.
+    return not any((coordinator.joinpath(*parts[:depth]) / ".git").exists() for depth in range(1, len(parts)))
 
 
 def register_root(coordinator: Path, root: Path) -> bool:
-    """Add `root` to the coordinator's `roots.json`. Returns False when it is the coordinator or already listed."""
+    """Add `root` to the coordinator's `roots.json`. Returns False when it is the coordinator, already listed, or in
+    the coordinator's tree (`in_tree`), where `tree_roots` finds it."""
     coordinator, root = coordinator.resolve(), root.resolve()
-    if root == coordinator:
+    if root == coordinator or in_tree(coordinator, root):
         return False
     path = coordinator / ROOTS_FILE
     try:
@@ -252,9 +285,9 @@ def _call(*args: str) -> Any:
     return _run_orca("orchestration", *args)
 
 
-def _call_tool(*args: str) -> Any:
+def _call_tool(*args: str, timeout: float = TIMEOUT_S) -> Any:
     """Run `orca <args> --json`, for commands outside `orchestration`, and return the parsed answer."""
-    return _run_orca(*args)
+    return _run_orca(*args, timeout=timeout)
 
 
 def _command(*words: str) -> list[str]:
@@ -264,7 +297,7 @@ def _command(*words: str) -> list[str]:
     return [*prefix, *words, "--json"]
 
 
-def _run_orca(*words: str) -> Any:
+def _run_orca(*words: str, timeout: float = TIMEOUT_S) -> Any:
     """Run one Orca command and return its parsed answer.
 
     An `ok: true` answer is returned even when the process exits non-zero: Orca uses the exit code for an
@@ -273,7 +306,7 @@ def _run_orca(*words: str) -> Any:
     """
     args = words[1:] if words[0] == "orchestration" else words
     try:
-        run = subprocess.run(_command(*words), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S, check=False)
+        run = subprocess.run(_command(*words), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         raise OrcaError(f"cannot run {binary()}: {error}") from error
     try:
@@ -589,7 +622,14 @@ def child_repos(root: Path, depth: int = SCAN_DEPTH) -> list[str]:
 
     Hidden directories and dependency or build directories are not entered, and neither is a repository once found.
     """
-    found: list[str] = []
+    found = [path.relative_to(root).as_posix() for path in _tree(root, depth) if (path / ".git").exists()]
+    return sorted(found)[:SCAN_LIMIT]
+
+
+def _tree(root: Path, depth: int = SCAN_DEPTH) -> list[Path]:
+    """The directories under `root`, at most `depth` levels down, level by level: hidden, dependency and build
+    directories are skipped, and a git repository (`.git` directory or file) is listed but not entered."""
+    seen: list[Path] = []
     level = [root]
     for _ in range(depth):
         below: list[Path] = []
@@ -601,12 +641,11 @@ def child_repos(root: Path, depth: int = SCAN_DEPTH) -> list[str]:
             for child in children:
                 if child.name.startswith(".") or child.name in SCAN_SKIP:
                     continue
-                if (child / ".git").exists():
-                    found.append(child.relative_to(root).as_posix())
-                else:
+                seen.append(child)
+                if not (child / ".git").exists():
                     below.append(child)
         level = below
-    return sorted(found)[:SCAN_LIMIT]
+    return seen
 
 
 def target_repo(root: Path, repo: str | Path | None) -> Path | None:
@@ -1116,13 +1155,7 @@ def _reports(answer: Any) -> list[dict[str, Any]]:
     for message in (result.get("messages") if isinstance(result, dict) else None) or []:
         if not isinstance(message, dict) or not str(message.get("type", "")).startswith("worker_"):
             continue
-        payload = message.get("payload")
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                payload = {}
-        payload = payload if isinstance(payload, dict) else {}
+        payload = _payload_of(message)
         out.append({
             "id": message.get("id"),
             "task_id": payload.get("taskId"),
@@ -1138,6 +1171,111 @@ def _reports(answer: Any) -> list[dict[str, Any]]:
 def unread_reports(run: str | None = None) -> list[dict[str, Any]]:
     """Worker reports the coordinator has not acknowledged. Reading them this way does not mark them read."""
     return _reports(_call("check", "--peek", *_run_args(run)))
+
+
+def _payload_of(message: dict[str, Any]) -> dict[str, Any]:
+    """A message's `payload`, which Orca stores as a JSON string, as a dict (empty when there is none)."""
+    payload = message.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _messages(answer: Any) -> list[dict[str, Any]]:
+    result = answer.get("result", answer) if isinstance(answer, dict) else None
+    messages = result.get("messages") if isinstance(result, dict) else None
+    return [message for message in messages or [] if isinstance(message, dict)]
+
+
+def _when(message: dict[str, Any]) -> tuple[str, int]:
+    """Order of messages: `created_at` (ISO, UTC), then Orca's `sequence`."""
+    sequence = message.get("sequence")
+    return str(message.get("created_at") or ""), sequence if isinstance(sequence, int) else -1
+
+
+def is_question(message: dict[str, Any]) -> bool:
+    """A worker waiting on the coordinator: `orca orchestration ask` (type `question`, `payload.question`) or an escalation."""
+    return message.get("type") in ("question", "escalation") or "question" in _payload_of(message)
+
+
+def open_questions(run_messages: list[dict[str, Any]], replies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The worker questions in `run_messages` that nothing answered yet, oldest first.
+
+    `run_messages` are the messages sent to the Run (`check --all`); `replies` are messages from any inbox
+    (`inbox --full`), where the coordinator's replies to a dispatch show up. A question is answered by a later message
+    in its thread (`orca orchestration reply --id <question>` sets `thread_id` to the question's id), a later worker
+    report of its task, or a later question of the same dispatch (which is the one still open). Two things do not
+    answer it, as seen on 2026-10-11: a plain `send` to the dispatch while it waits (a follow-up, not the reply its
+    `ask` blocks on), and a heartbeat (a worker whose `ask` timed out keeps sending them while it still waits).
+    """
+    out: list[dict[str, Any]] = []
+    everything = run_messages + replies
+    for message in run_messages:
+        if not is_question(message):
+            continue
+        payload = _payload_of(message)
+        qid = str(message.get("id") or "")
+        sender = str(message.get("from_handle") or "")
+        dispatch = payload.get("dispatchId") or (sender.split(":", 1)[1] if sender.startswith("dispatch:") else None)
+        task = payload.get("taskId")
+        after = _when(message)
+
+        def answers(other: dict[str, Any]) -> bool:
+            if other.get("id") == qid or _when(other) <= after:
+                return False
+            other_payload = _payload_of(other)
+            if qid and other.get("thread_id") == qid:
+                return True
+            same = (dispatch and other_payload.get("dispatchId") == dispatch) or (task and other_payload.get("taskId") == task)
+            return bool(same) and (str(other.get("type") or "").startswith("worker_") or is_question(other))
+
+        if any(answers(other) for other in everything):
+            continue
+        options = payload.get("options")
+        out.append({
+            "id": qid,
+            "run": message.get("run_id"),
+            "task_id": task,
+            "dispatch": dispatch,
+            "type": message.get("type"),
+            "question": str(payload.get("question") or message.get("body") or message.get("subject") or ""),
+            "options": [str(option) for option in options] if isinstance(options, list) else [],
+            "created_at": message.get("created_at"),
+        })
+    return sorted(out, key=lambda question: str(question.get("created_at") or ""))
+
+
+def last_heard(run_messages: list[dict[str, Any]]) -> dict[str, str]:
+    """Task id to the `created_at` of the latest message its worker sent (heartbeat, report or question)."""
+    out: dict[str, str] = {}
+    for message in run_messages:
+        task = _payload_of(message).get("taskId")
+        when = message.get("created_at")
+        if isinstance(task, str) and isinstance(when, str) and when > out.get(task, ""):
+            out[task] = when
+    return out
+
+
+INBOX_LIMIT = 200
+
+
+def worker_activity(run: str | None = None) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """(open worker questions, task id to when its worker last sent anything) for the Run.
+
+    Reads `check --all` (every message to the Run, not marking any read) and `inbox --full`, which also holds the
+    replies sent to dispatches. When the inbox cannot be read, questions are judged on the Run's messages alone.
+    A question is about a worker that waits, so it is not the same as `turn_unobserved` (a worker that never got its
+    task, see `kick_worker`) or a rejected report (`settle`).
+    """
+    run_messages = _messages(_call("check", "--all", *_run_args(run)))
+    try:
+        replies = _messages(_call("inbox", "--full", "--limit", str(INBOX_LIMIT)))
+    except OrcaError:
+        replies = []
+    return open_questions(run_messages, replies), last_heard(run_messages)
 
 
 def _take_delivery(run: str | None) -> tuple[list[dict[str, Any]], str | None]:

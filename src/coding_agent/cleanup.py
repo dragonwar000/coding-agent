@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from coding_agent import events, orca, orca_cli
+from coding_agent import events, orca, orca_cli, roots
 
 SETTLED = ("completed", "failed")
 AUTO_ENV = "CODING_AGENT_AUTO_CLEAN"
@@ -159,9 +159,11 @@ def candidates(root: Path, run: str | None = None) -> list[Candidate]:
     """Worker worktrees whose task settled, oldest first, with what removing each one would lose.
 
     Read from `root`'s workers ledger and from that of every repository `root` delegated into (`orca_cli.all_roots`);
-    a worktree listed by two of them (repositories sharing one git directory) is listed once.
+    a worktree listed by two of them (repositories sharing one git directory) is listed once. A task no known
+    repository owns makes `roots.discover` look its repository up from Orca first.
     """
     tasks = {str(task.get("id")): task for task in orca_cli.list_tasks(run)}
+    roots.discover(root, tasks, run)
     home = orca.project_name(root)
     own = root.resolve()
     found: list[Candidate] = []

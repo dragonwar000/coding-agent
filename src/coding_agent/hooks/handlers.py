@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from coding_agent import coordinator, events, orca, state, transcript
+from coding_agent import autodecide, coordinator, events, orca, state, transcript
 from coding_agent.hooks import Context, HookResult
 from coding_agent.manifest import Loop
 from coding_agent.memory import record, zeromem
@@ -390,9 +391,42 @@ def coordinator_context(ctx: Context) -> HookResult:
     board, error = coordinator.read_board(ctx.root, session=ctx.session)
     text = coordinator.board_context(board, error)
     if event == "SessionStart":
-        text = coordinator.contract(ctx.manifest.python_src) + "\n" + text
+        auto = autodecide.effective(ctx.root, ctx.manifest.auto_decide).enabled
+        text = coordinator.contract(ctx.manifest.python_src, auto_decide=auto) + "\n" + text
     ctx.note(guard="coordinator-context", kind="injected", applied=False, detail={"event": event, "board_lines": len(board), "error": error})
     return HookResult(stdout=_inject(event, text))
+
+
+def _turn_context(ctx: Context) -> str:
+    """The user's latest prompt and the agent's latest text in this turn, for Fable to decide with."""
+    path = ctx.payload.get("transcript_path")
+    if not path or ctx.manifest is None:
+        return ""
+    turn = transcript.read_turn(_path(path), ctx.manifest.memory.change_tools)
+    parts = [f"Prompt gần nhất của người dùng: {turn.prompt}" if turn.prompt else "",
+             f"Trả lời gần nhất của agent: {turn.response}" if turn.response else ""]
+    return "\n".join(part for part in parts if part)[-autodecide.CONTEXT_CHARS:]
+
+
+def auto_decide(ctx: Context) -> HookResult:
+    """With auto-decide on, an AskUserQuestion waits in a countdown window; when nobody answers, the agent decides.
+
+    The user switched this on, so it acts in `shadow` too: the mode only turns the hook off. A window that cannot
+    open leaves the question to the host, never a choice the user did not see.
+    """
+    if ctx.payload.get("tool_name") != "AskUserQuestion" or os.environ.get(autodecide.NESTED_ENV):
+        return HookResult()
+    settings = autodecide.effective(ctx.root, ctx.manifest.auto_decide if ctx.manifest is not None else None)
+    if not settings.enabled:
+        return HookResult()
+    tool_input = ctx.payload.get("tool_input") if isinstance(ctx.payload.get("tool_input"), dict) else {}
+    decision = autodecide.decide(tool_input, settings, _turn_context(ctx))
+    if decision.answers is None:
+        ctx.note(guard="auto-decide", kind="auto-decide-fallback", applied=False, detail=decision.detail)
+        return HookResult()
+    kind = "answered-by-user" if decision.by == "user" else "auto-decided"
+    ctx.note(guard="auto-decide", kind=kind, applied=True, detail=decision.detail)
+    return HookResult(stdout=autodecide.hook_output(tool_input, decision.answers, decision.note))
 
 
 REGISTRY: dict[str, Callable[[Context], HookResult]] = {
@@ -405,4 +439,5 @@ REGISTRY: dict[str, Callable[[Context], HookResult]] = {
     "coordinator-guard": coordinator_guard,
     "coordinator-context": coordinator_context,
     "coordinator-board": coordinator_context,
+    "auto-decide": auto_decide,
 }

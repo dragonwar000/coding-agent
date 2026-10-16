@@ -68,8 +68,51 @@ def test_verify_says_so_when_no_posix_shell_can_run_the_hooks(tmp_path, monkeypa
     monkeypatch.setattr(project_install, "posix_shell", lambda: None)
     report = project_install.verify_wiring(project, project / "integration.yaml", ["claude_code"])
     assert report[0].startswith("verify: gate passed")
-    assert "no sh or bash on PATH" in report[1] and "Git for Windows" in report[1]
+    assert "no sh or bash on PATH" in report[1] and "Git for Windows" in report[1] and "CLAUDE_CODE_GIT_BASH_PATH" in report[1]
     assert len(report) == 2
+
+
+def windows_without_git(monkeypatch, tmp_path, which: dict[str, str]) -> None:
+    """A Windows machine whose PATH answers `which` from the dict and that has no Git install anywhere."""
+    import shutil
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda name: which.get(name))
+    for name in ("CLAUDE_CODE_GIT_BASH_PATH", "ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "nothing-here"))
+    monkeypatch.setattr(project_install.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("no git")))
+
+
+def test_windows_never_picks_the_wsl_bash_launcher(tmp_path, monkeypatch):
+    windows_without_git(monkeypatch, tmp_path, {"bash": r"C:\WINDOWS\system32\bash.EXE"})
+    assert project_install.posix_shell() is None
+    windows_without_git(monkeypatch, tmp_path, {"bash": r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\bash.exe"})
+    assert project_install.posix_shell() is None
+
+
+def test_windows_prefers_claude_code_git_bash_path_over_path_bash(tmp_path, monkeypatch):
+    git_bash = tmp_path / "Git" / "bin" / "bash.exe"
+    git_bash.parent.mkdir(parents=True)
+    git_bash.write_text("", encoding="utf-8")
+    windows_without_git(monkeypatch, tmp_path, {"bash": r"C:\Windows\System32\bash.exe"})
+    monkeypatch.setenv("CLAUDE_CODE_GIT_BASH_PATH", str(git_bash))
+    assert project_install.posix_shell() == str(git_bash)
+
+
+def test_windows_finds_git_bash_from_the_git_on_path(tmp_path, monkeypatch):
+    git_root = tmp_path / "Git"
+    (git_root / "cmd").mkdir(parents=True)
+    (git_root / "bin").mkdir()
+    (git_root / "cmd" / "git.exe").write_text("", encoding="utf-8")
+    (git_root / "bin" / "bash.exe").write_text("", encoding="utf-8")
+    windows_without_git(monkeypatch, tmp_path, {"git": str(git_root / "cmd" / "git.exe"), "bash": r"C:\Windows\System32\bash.exe"})
+    assert project_install.posix_shell() == str((git_root / "bin" / "bash.exe").resolve())
+
+
+def test_windows_falls_back_to_a_non_wsl_bash_on_path(tmp_path, monkeypatch):
+    windows_without_git(monkeypatch, tmp_path, {"bash": r"C:\msys64\usr\bin\bash.exe"})
+    assert project_install.posix_shell() == r"C:\msys64\usr\bin\bash.exe"
 
 
 def test_both_bootstraps_pin_the_same_commit():
