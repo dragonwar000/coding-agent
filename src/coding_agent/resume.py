@@ -637,4 +637,3 @@ def main_lines(found: list[Finding]) -> list[str]:
     """What a single `worker-resume` prints: one line per stalled, blocked or silent worker, or that there is none."""
     lines = [describe(item) for item in found if item.attention]
     return lines or [f"worker-resume: no stalled worker ({len(found)} worker(s) read)"]
-
