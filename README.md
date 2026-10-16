@@ -344,6 +344,13 @@ mid-response`), dòng `Worked for 3h 5m · done 9:24 PM`, rồi ô nhập trốn
   `fetch failed`, `overloaded`, `rate limit`, mã 429/500/502/503/504/529; bảng `TRANSIENT_MARKS`), và sau nó chưa có lượt làm
   việc mới (dòng `⏺` không phải lỗi). Lỗi mà thử lại không sửa được (401/403, invalid API key, credit, context length, hoặc
   `API Error` lạ) là **blocked**: chỉ báo, không tự resume.
+- **Lượt bị cắt ngang giữa chừng (thêm sau sự cố 2026-10-15/16):** hai worker gần xong việc (một worker đã chạy đạt e2e, chỉ
+  còn commit và gửi `worker_done`) bị cắt lượt với đúng hai dòng `API Error: The response stopped arriving. The response above
+  may be incomplete.` và `API Error: Your computer went to sleep mid-response. The response above may be incomplete.` (đo trên
+  terminal thật). Trước đây chúng bị xếp **blocked** và `worker-resume --watch` in "needs a person" suốt nhiều giờ. Giờ các lỗi
+  ngắt lượt sau là tạm thời, được tự resume: `response stopped arriving`, `went to sleep mid-response`, `Request timed out`,
+  `socket hang up`, `network error`, `API Error: terminated`, `stream ended` / `stream error`, `UND_ERR_*`, `Premature close`.
+  Lỗi vĩnh viễn (401/403, credit, context length, `/login`) vẫn **blocked** dù dòng lỗi có kèm các chữ trên.
 - **Kiểm mạng trước khi gửi:** mở kết nối TCP tới `api.anthropic.com:443` (timeout 3 giây). Không nối được thì không gửi gì,
   chỉ ghi nhận "đang chờ mạng". Đổi đích bằng `CODING_AGENT_API_HOST=host` hoặc `host:port` (ví dụ proxy bắt buộc).
 - **Resume:** gửi một dòng không dấu vào terminal của worker qua `orca terminal send --enter --wait-submit 20`: mạng đã có
@@ -359,11 +366,26 @@ mid-response`), dòng `Worked for 3h 5m · done 9:24 PM`, rồi ô nhập trốn
   định quét mọi worker đang chạy của Run; `--task-id` chỉ một task (lặp lại được, và resume được cả task không do coordinator
   này tạo); `--dry-run` chỉ in; `--watch` lặp vô hạn (mặc định 60 giây một lần) để coordinator chạy nền, tự resume khi mạng trở
   lại, in một dòng mỗi khi trạng thái một worker đổi. Mã thoát 0 kể cả khi không có gì để làm.
-- **Event** (`guard: worker-resume`): `resumed`, `resume-failed`, và khi trạng thái đổi: `waiting-network`, `blocked`, `limit`,
-  `already-resumed`; `error` khi bước tự động gặp lỗi.
+- **Worker im lặng, chưa báo:** task còn `dispatched` mà màn hình worker ở trạng thái idle (lượt đã kết thúc, ô nhập trống,
+  không spinner, không có lỗi) và không đổi suốt một ngưỡng (mặc định 10 phút), trong khi hộp thư orchestration chưa có
+  `worker_done` của task đó (cùng dispatch), là **silent**. Worker được nhắc một dòng ngắn: gửi qua
+  `orca orchestration send --to dispatch:<id> --type status` rồi gõ cùng dòng đó vào terminal (`Nhac viec: ...`: việc đã xong
+  thì commit rồi gửi `worker_done` kèm tóm tắt, chưa xong thì làm tiếp). Tối đa 2 lần nhắc mỗi dispatch; sau một lần nhắc, worker
+  phải im thêm đủ ngưỡng mới bị nhắc lại. Mỗi lần nhắc ghi vào `.coding-agent/resumes.jsonl` với `kind: nudge` (resume ghi
+  `kind: resume`; hai loại có giới hạn riêng). Đồng hồ im lặng tính từ lần quét đầu tiên thấy màn hình idle (lưu ở
+  `.coding-agent/state/idle-since.json`, quét bằng bảng việc, `worker-resume` hay `--watch` đều tính); màn hình đổi hoặc
+  worker chạy lại thì đồng hồ đặt lại. Bảng việc có nhóm riêng "worker im lặng, chưa báo" kèm thời gian im và số lần đã nhắc
+  (`đã nhắc 1/2 lần`), tách khỏi nhóm lỗi API/mạng; nhắc đủ 2 lần mà vẫn im thì ghi "cần người xử lý".
+  `worker-resume --dry-run` liệt kê cả worker stalled ("would be resumed") lẫn worker silent ("would be reminded").
+- **Biến môi trường:** `CODING_AGENT_SILENT_MINUTES` đổi ngưỡng im lặng (số phút, chấp nhận số lẻ, mặc định `10`); `off`
+  hoặc `0` tắt việc nhắc. `CODING_AGENT_AUTO_RESUME=off` tắt cả bước tự động của bảng việc (resume lẫn nhắc).
+  `CODING_AGENT_API_HOST` đổi đích kiểm mạng.
+- **Event** (`guard: worker-resume`): `resumed`, `resume-failed`, `nudged`, `nudge-failed`, và khi trạng thái đổi:
+  `waiting-network`, `blocked`, `limit`, `already-resumed`, `nudge-limit`, `inbox-unreadable`; `error` khi bước tự động gặp lỗi.
 
-Giới hạn: phát hiện dựa trên chữ trên màn hình Claude Code; màn hình worker bị dừng thật chưa được đo lại trên máy (dạng dòng
-lỗi lấy theo mô tả sự cố), và agent khác (codex) có dạng lỗi khác thì chưa nhận ra. Không có coordinator nào đang chạy lượt mới
+Giới hạn: phát hiện dựa trên chữ trên màn hình Claude Code; hai dòng lỗi ngắt lượt ở trên đã đo trên terminal thật, các dòng
+lỗi mạng của sự cố 2026-10-12 và các mẫu ngắt lượt còn lại lấy theo mô tả và thông báo lỗi của Node/undici, và agent khác
+(codex) có dạng lỗi khác thì chưa nhận ra. Worker im lặng chỉ được phát hiện khi có lượt quét. Không có coordinator nào đang chạy lượt mới
 và không có `worker-resume --watch` chạy nền thì không ai quét.
 
 ## Khởi động worker

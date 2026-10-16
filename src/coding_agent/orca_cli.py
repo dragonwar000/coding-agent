@@ -982,6 +982,12 @@ def send_line(handle: str, text: str) -> None:
     _call_tool("terminal", "send", "--terminal", handle, "--enter", "--wait-submit", "20", "--text", text)
 
 
+def send_message(dispatch: str, *, subject: str, body: str, task_id: str, run: str | None = None) -> None:
+    """Send a worker a `status` message through `orca orchestration send --to dispatch:<id>` (Orca relays it to that attempt)."""
+    _call("send", "--to", f"dispatch:{dispatch}", "--type", "status", "--subject", subject, "--body", body,
+          "--task-id", task_id, "--dispatch-id", dispatch, *_run_args(run))
+
+
 def _at_prompt(screen: str) -> bool:
     return any(line.strip().startswith(PROMPT_MARKS) for line in screen.splitlines())
 

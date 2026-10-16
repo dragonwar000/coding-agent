@@ -12,7 +12,16 @@ the network came back.
 answers on TCP 443, never twice for the same screen, at most `MAX_RESUMES` times per dispatch and `RESUME_GAP_S`
 apart. `auto` is the step the coordinator's board runs each turn; `watch` is the loop behind `worker-resume --watch`.
 
-The stalled screen itself was not measured on a live terminal: `classify` lists what was measured and what is assumed.
+What happened next (2026-10-15/16, project Bimgiamecco): two workers had almost finished (one had passed its e2e run
+and only had to commit and send `worker_done`) when their turns were cut by `API Error: The response stopped arriving.`
+and `API Error: Your computer went to sleep mid-response.`. Neither matched `TRANSIENT_MARKS`, so both were `blocked`
+for hours and nobody told the coordinator the work was nearly done. Those turn-cutting errors are transient now, and
+`nudge_silent` handles the other half: a worker whose task is still `dispatched` but whose screen has been `idle`
+(turn over, empty prompt, no spinner, no error) for `silent_after_s()` seconds without a `worker_done` in the inbox is
+`silent`; it gets a short reminder through `orca orchestration send` and the same line typed into its terminal, at
+most `MAX_NUDGES` times per dispatch, recorded in the same ledger as the resumes.
+
+The stalled screen of 2026-10-12 was not measured on a live terminal: `classify` lists what was measured and what is assumed.
 """
 
 from __future__ import annotations
@@ -41,8 +50,14 @@ SCAN_GAP_S = 60          # the board's automatic scan is skipped when the last o
 AUTO_BUDGET_S = 20.0     # the board's scan stops sending after this long: it runs inside a hook, and a send can wait 20s
 WATCH_INTERVAL_S = 60.0
 RESUME_MARK = "Mang da co lai"
+SILENT_ENV = "CODING_AGENT_SILENT_MINUTES"
+SILENT_AFTER_S = 600     # an idle worker that has not reported is `silent` after this long (10 minutes)
+MAX_NUDGES = 2           # reminders sent to one silent dispatch at most
+NUDGE_MARK = "Nhac viec"
+IDLE_FORGET_S = 86400    # an idle record not seen by any scan for this long is dropped
 LEDGER = Path(".coding-agent") / "resumes.jsonl"
 SCAN_FILE = Path(".coding-agent") / "state" / "resume-scan.json"
+IDLE_FILE = Path(".coding-agent") / "state" / "idle-since.json"
 DONE_STATUSES = frozenset({"completed", "failed"})
 
 # An agent's own error line: `API Error: ...`, bare or behind the turn bullet. Text a tool printed is indented deeper
@@ -54,11 +69,16 @@ TURN_LINE = re.compile(r"^\s*[⏺●]\s*\S")
 # of a finished turn (`✻ Worked for 3h 5m · done 9:24 PM`) has no ellipsis.
 SPINNER_LINE = re.compile(r"^\s*[^\s\w⏺●⎿❯]\s+[A-Z][a-z]+…")
 RULE_LINE = re.compile(r"^[\s─━═╭╮╰╯│-]+$")
-# What makes an `API Error` line transient: waiting and trying again can fix it. Extend here.
+# What makes an `API Error` line transient: waiting and trying again can fix it. Extend here, with a test, and keep each
+# mark tight: a permanent error (`PERMANENT_MARKS`) wins anyway, but an unknown error must stay `blocked`.
 TRANSIENT_MARKS = (
     r"ENOTFOUND", r"ECONNRESET", r"ECONNREFUSED", r"ETIMEDOUT", r"EAI_AGAIN",
     r"Connection lost", r"Can(?:.?t| ?not) reach the API", r"fetch failed",
     r"overloaded", r"rate.?limit", r"\b(?:429|500|502|503|504|529)\b",
+    # A turn cut off mid-stream (2026-10-15/16): the connection dropped or the machine slept while the answer streamed.
+    r"response stopped arriving", r"went to sleep mid-response", r"Request timed out", r"socket hang up",
+    r"\bnetwork error\b", r"API Error:\s*(?:TypeError:\s*)?terminated\b", r"\bstream (?:ended|error)\b",
+    r"\bUND_ERR(?:_[A-Z_]+)?\b", r"Premature close",
 )
 # What makes it permanent: a person has to act. Checked first; an `API Error` line that matches neither is blocked too.
 PERMANENT_MARKS = (
@@ -83,7 +103,9 @@ class Screen:
 class Finding:
     """One unsettled worker: its screen's `state`, and `action`, what `resume_stalled` did or decided about it.
 
-    `action` is empty for a worker that needs nothing. `attempt` counts the resumes sent to the dispatch so far.
+    `action` is empty for a worker that needs nothing. `attempt` counts the resumes sent to the dispatch so far, or
+    for a `silent` worker the reminders (`nudge_silent`). `status` is the task's status; `idle_s` how long the screen
+    has been idle and unchanged, as far as the scans saw.
     """
 
     task_id: str
@@ -94,10 +116,32 @@ class Finding:
     fingerprint: str = ""
     action: str = ""
     attempt: int = 0
+    status: str = ""
+    idle_s: int = 0
 
     @property
     def attention(self) -> bool:
+        return self.state in ("stalled", "blocked", "silent")
+
+    @property
+    def halted(self) -> bool:
+        """Stopped on an API error, as opposed to `silent`."""
         return self.state in ("stalled", "blocked")
+
+
+def silent_after_s() -> float | None:
+    """How long an idle worker that has not reported waits before a reminder: `CODING_AGENT_SILENT_MINUTES` (10 by
+    default; a number of minutes, fractions allowed). `off` or `0` turns the reminders off and answers None."""
+    value = os.environ.get(SILENT_ENV, "").strip().lower()
+    if not value:
+        return float(SILENT_AFTER_S)
+    if value in ("off", "false", "no"):
+        return None
+    try:
+        minutes = float(value)
+    except ValueError:
+        return float(SILENT_AFTER_S)
+    return minutes * 60 if minutes > 0 else None
 
 
 def auto_enabled() -> bool:
@@ -145,6 +189,12 @@ def classify(screen: str) -> Screen:
     it shows. Assumptions, from the incident's description and not measured on a stalled terminal: the error line
     starts with `API Error`, bare or after the bullet (`⏺`, or `●` on Windows); the user's earlier messages show as
     `❯ text`; a long error line wraps into lines indented by two spaces or more.
+
+    Measured on the screens of two stopped workers (Claude Code under Orca, 2026-10-15/16), word for word:
+    `API Error: The response stopped arriving. The response above may be incomplete.` and
+    `API Error: Your computer went to sleep mid-response. The response above may be incomplete.`. Both are `stalled`.
+    The other turn-cutting marks (`Request timed out`, `socket hang up`, `network error`, `terminated`, `stream ended`,
+    `UND_ERR_*`, `Premature close`) are the Node and undici messages behind such a cut, not seen on a screen yet.
     """
     lines = [line.replace("\xa0", " ").rstrip() for line in screen.splitlines()]
     if not any(lines):
@@ -200,7 +250,7 @@ def stalled_workers(root: Path, run: str | None = None, *, task_ids: list[str] |
             continue
         seen = classify(orca_cli.screen_of(dispatch["assignee_handle"]))
         found.append(Finding(task_id=task_id, dispatch=dispatch["id"], terminal=dispatch["assignee_handle"], state=seen.state,
-                             error=seen.error, fingerprint=seen.fingerprint))
+                             error=seen.error, fingerprint=seen.fingerprint, status=str(task.get("status") or "")))
     return found
 
 
@@ -225,6 +275,12 @@ def history(root: Path) -> list[dict[str, Any]]:
         if isinstance(record, dict):
             out.append(record)
     return out
+
+
+def _sent(root: Path, key: str, kind: str) -> list[dict[str, Any]]:
+    """The ledger's records of `kind` (`resume` or `nudge`) that reached dispatch `key`. A record without a kind is a resume."""
+    return [record for record in history(root)
+            if record.get("dispatch") == key and record.get("sent") is True and record.get("kind", "resume") == kind]
 
 
 def _held(sent: list[dict[str, Any]], fingerprint: str, now: float) -> str | None:
@@ -258,7 +314,7 @@ def resume_stalled(root: Path, findings: list[Finding], *, dry_run: bool = False
             out.append(item)
             continue
         key = item.dispatch or item.task_id
-        sent = [record for record in history(root) if record.get("dispatch") == key and record.get("sent") is True]
+        sent = _sent(root, key, "resume")
         held = _held(sent, item.fingerprint, time.time())
         if held is not None:
             out.append(replace(item, action=held, attempt=len(sent)))
@@ -279,8 +335,8 @@ def resume_stalled(root: Path, findings: list[Finding], *, dry_run: bool = False
         except orca_cli.OrcaError as failure:
             error = str(failure)[:300]
         attempt = len(sent) + (error is None)
-        orca_cli._append(root / LEDGER, {"ts": int(time.time()), "task_id": item.task_id, "dispatch": key, "terminal": item.terminal,
-                                         "fingerprint": item.fingerprint, "sent": error is None})
+        orca_cli._append(root / LEDGER, {"ts": int(time.time()), "kind": "resume", "task_id": item.task_id, "dispatch": key,
+                                         "terminal": item.terminal, "fingerprint": item.fingerprint, "sent": error is None})
         events.record(root, guard="worker-resume", kind="resumed" if error is None else "resume-failed", mode="enforce",
                       applied=error is None, session=session,
                       detail={"task_id": item.task_id, "dispatch": item.dispatch, "terminal": item.terminal, "attempt": attempt,
@@ -289,23 +345,155 @@ def resume_stalled(root: Path, findings: list[Finding], *, dry_run: bool = False
     return out
 
 
+def nudge_text(task_id: str) -> str:
+    """The reminder sent to a silent worker, through Orca and typed into its terminal. Same rules as `resume_text`."""
+    return (f"{NUDGE_MARK}: task {task_id} chua co worker_done ma terminal da im. Neu viec da xong thi commit roi gui "
+            "worker_done kem tom tat 3 cau, neu chua xong thi lam tiep tu cho dang do.")
+
+
+def track_idle(root: Path, findings: list[Finding], now: float | None = None) -> list[Finding]:
+    """Set `idle_s` on each `idle` finding: how long its screen has been idle with the same fingerprint, over the scans.
+
+    The first scan that sees a screen idle starts the clock, so a worker is never thought silent for longer than it
+    was seen to be. A changed screen restarts it, and a worker seen working or stopped on an error is forgotten; an
+    unreadable screen changes nothing. Kept in `IDLE_FILE`; records no scan has seen for `IDLE_FORGET_S` are dropped.
+    """
+    now = time.time() if now is None else now
+    path = root / IDLE_FILE
+    seen = _load_json(path)
+    out: list[Finding] = []
+    for item in findings:
+        key = item.dispatch or item.task_id
+        if item.state != "idle":
+            if item.state != "unreadable":
+                seen.pop(key, None)
+            out.append(item)
+            continue
+        record = seen.get(key)
+        if not isinstance(record, dict) or record.get("fingerprint") != item.fingerprint:
+            record = {"since": now, "fingerprint": item.fingerprint}
+        record["seen"] = now
+        seen[key] = record
+        out.append(replace(item, idle_s=max(0, int(now - float(record.get("since") or now)))))
+    kept = {key: record for key, record in seen.items() if isinstance(record, dict) and now - float(record.get("seen") or 0) < IDLE_FORGET_S}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(kept, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+    return out
+
+
+def _reported(run: str | None) -> set[tuple[str, str]]:
+    """(task, dispatch) of every `worker_done` in the coordinator's inbox that Orca has not marked handled (`check --peek`),
+    acknowledged per task or not; dispatch is empty when the report names none."""
+    return {(str(report.get("task_id") or ""), str(report.get("dispatch") or ""))
+            for report in orca_cli.unread_reports(run) if report.get("type") == "worker_done"}
+
+
+def nudge_silent(root: Path, findings: list[Finding], run: str | None = None, *, dry_run: bool = False, session: str = "cli",
+                 deadline: float | None = None, now: float | None = None) -> list[Finding]:
+    """Remind the silent workers to report. Returns the findings with `idle_s` set, and silent ones as `silent`.
+
+    A worker is `silent` when its task is `dispatched`, its screen is `idle` and has not changed for `silent_after_s()`
+    seconds (`track_idle`), and the inbox holds no `worker_done` for its task and dispatch; once reminded, it stays
+    `silent` whenever it is idle again without having reported. Actions: `nudged` (an `orca orchestration send` to the
+    dispatch, then the same line typed into its terminal; the terminal send is what counts), `would-nudge` (dry run),
+    `nudge-wait` (reminded before, not silent long enough again), `nudge-limit` (`MAX_NUDGES` sent),
+    `nudge-failed`, `nudge-deferred` (`deadline` passed) and `inbox-unreadable` (nothing sent without knowing). Each
+    send is appended to the resumes ledger with `kind: nudge` and recorded as an event. The inbox is read once, and
+    only when a worker may be silent. `CODING_AGENT_SILENT_MINUTES=off` leaves every idle worker `idle`.
+    """
+    now = time.time() if now is None else now
+    findings = track_idle(root, findings, now)
+    after = silent_after_s()
+    if after is None:
+        return findings
+    reports: set[tuple[str, str]] | None = None
+    unreadable = False
+    out: list[Finding] = []
+    for item in findings:
+        if item.state != "idle" or item.status != "dispatched":
+            out.append(item)
+            continue
+        key = item.dispatch or item.task_id
+        sent = _sent(root, key, "nudge")
+        if item.idle_s < after and not sent:
+            out.append(item)
+            continue
+        if reports is None and not unreadable:
+            try:
+                reports = _reported(run)
+            except orca_cli.OrcaError:
+                unreadable = True
+        silent = replace(item, state="silent", attempt=len(sent))
+        if unreadable:
+            out.append(replace(silent, action="inbox-unreadable"))
+            continue
+        if (item.task_id, item.dispatch) in (reports or set()) or (item.task_id, "") in (reports or set()):
+            out.append(item)
+            continue
+        if len(sent) >= MAX_NUDGES:
+            out.append(replace(silent, action="nudge-limit"))
+            continue
+        if item.idle_s < after or (sent and now - float(sent[-1].get("ts") or 0) < after):
+            out.append(replace(silent, action="nudge-wait"))
+            continue
+        if dry_run:
+            out.append(replace(silent, action="would-nudge"))
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            out.append(replace(silent, action="nudge-deferred"))
+            continue
+        text = nudge_text(item.task_id)
+        message: str | None = None
+        try:
+            orca_cli.send_message(item.dispatch, subject=f"{NUDGE_MARK}: chua co worker_done", body=text, task_id=item.task_id, run=run)
+        except orca_cli.OrcaError as failure:
+            message = str(failure)[:300]
+        error: str | None = None
+        try:
+            orca_cli.send_line(item.terminal, text)
+        except orca_cli.OrcaError as failure:
+            error = str(failure)[:300]
+        attempt = len(sent) + (error is None)
+        orca_cli._append(root / LEDGER, {"ts": int(now), "kind": "nudge", "task_id": item.task_id, "dispatch": key, "terminal": item.terminal,
+                                         "fingerprint": item.fingerprint, "idle_s": item.idle_s, "message": message is None, "sent": error is None})
+        events.record(root, guard="worker-resume", kind="nudged" if error is None else "nudge-failed", mode="enforce",
+                      applied=error is None, session=session,
+                      detail={"task_id": item.task_id, "dispatch": item.dispatch, "terminal": item.terminal, "attempt": attempt,
+                              "idle_s": item.idle_s, "fingerprint": item.fingerprint, "message_error": message, "error": error})
+        out.append(replace(silent, action="nudged" if error is None else "nudge-failed", attempt=attempt))
+    return out
+
+
 def scan(root: Path, run: str | None = None, *, task_ids: list[str] | None = None, dry_run: bool = False, session: str = "cli",
          tasks: list[dict[str, Any]] | None = None, budget_s: float | None = None) -> list[Finding]:
-    """Read every unsettled worker and resume the stalled ones. Raises `orca_cli.OrcaError` when the tasks cannot be listed."""
-    return resume_stalled(root, stalled_workers(root, run, task_ids=task_ids, tasks=tasks), dry_run=dry_run, session=session,
-                          budget_s=budget_s)
+    """Read every unsettled worker, resume the stalled ones and remind the silent ones. Raises `orca_cli.OrcaError` when
+    the tasks cannot be listed. `budget_s` covers both steps."""
+    deadline = None if budget_s is None else time.monotonic() + budget_s
+    found = resume_stalled(root, stalled_workers(root, run, task_ids=task_ids, tasks=tasks), dry_run=dry_run, session=session,
+                           budget_s=budget_s)
+    return nudge_silent(root, found, run, dry_run=dry_run, session=session, deadline=deadline)
 
 
-def _load_scan(root: Path) -> dict[str, Any]:
+def _load_json(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads((root / SCAN_FILE).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
+def _load_scan(root: Path) -> dict[str, Any]:
+    return _load_json(root / SCAN_FILE)
+
+
+# Decisions to send nothing that `auto` records as an event when they change, not on every scan.
+NOTED_ACTIONS = ("waiting-network", "blocked", "limit", "already-resumed", "nudge-limit", "inbox-unreadable")
+
+
 def auto(root: Path, tasks: list[dict[str, Any]], run: str | None = None, session: str = "board") -> list[Finding]:
-    """The board's step: scan and resume, and return the workers that are stalled or blocked. Never raises.
+    """The board's step: scan, resume and remind, and return the workers that are stalled, blocked or silent. Never raises.
 
     A scan less than `SCAN_GAP_S` after the last one of the same Run is skipped and that scan's findings are returned,
     so the board keeps showing them. A worker's waiting, blocked or unchanged state is recorded as an event when it
@@ -324,10 +512,11 @@ def auto(root: Path, tasks: list[dict[str, Any]], run: str | None = None, sessio
         noted = last.get("noted") if isinstance(last.get("noted"), dict) else {}
         marks = {item.task_id: f"{item.action}|{item.fingerprint}" for item in found}
         for item in found:
-            if item.action in ("waiting-network", "blocked", "limit", "already-resumed") and noted.get(item.task_id) != marks[item.task_id]:
+            if item.action in NOTED_ACTIONS and noted.get(item.task_id) != marks[item.task_id]:
                 events.record(root, guard="worker-resume", kind=item.action, mode="enforce", applied=False, session=session,
                               detail={"task_id": item.task_id, "dispatch": item.dispatch, "terminal": item.terminal,
-                                      "screen_error": item.error, "fingerprint": item.fingerprint, "attempt": item.attempt})
+                                      "screen_error": item.error, "fingerprint": item.fingerprint, "attempt": item.attempt,
+                                      "idle_s": item.idle_s})
         path = root / SCAN_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"ts": int(time.time()), "run": current, "findings": [asdict(item) for item in found], "noted": marks},
@@ -346,7 +535,7 @@ def board_notes(findings: list[Finding]) -> dict[str, str]:
     """Task id to what the board says about a stalled or blocked worker."""
     notes: dict[str, str] = {}
     for item in findings:
-        if not item.attention:
+        if not item.halted:
             continue
         said = {
             "resumed": f"đã tự resume (lần {item.attempt}/{MAX_RESUMES})",
@@ -362,10 +551,43 @@ def board_notes(findings: list[Finding]) -> dict[str, str]:
     return notes
 
 
+def _minutes(seconds: float) -> str:
+    return f"{seconds / 60:.0f}" if seconds >= 60 else f"{seconds / 60:.1f}".rstrip("0").rstrip(".")
+
+
+def silent_notes(findings: list[Finding]) -> dict[str, str]:
+    """Task id to what the board says about a silent worker: how long it has been idle and how many reminders it got."""
+    after = silent_after_s() or SILENT_AFTER_S
+    notes: dict[str, str] = {}
+    for item in findings:
+        if item.state != "silent":
+            continue
+        base = f"im {_minutes(item.idle_s)} phút, chưa gửi worker_done, đã nhắc {item.attempt}/{MAX_NUDGES} lần"
+        notes[item.task_id] = base + {
+            "nudged": ": vừa tự nhắc qua Orca và terminal",
+            "nudge-wait": f"; tự nhắc lại nếu im thêm {_minutes(after)} phút",
+            "nudge-limit": ": cần người xử lý (đọc màn hình terminal và diff của worktree)",
+            "nudge-failed": ": không gõ được lời nhắc vào terminal, lượt quét sau thử lại",
+            "nudge-deferred": ": chưa nhắc vì hết thời gian của lượt quét; lượt quét sau sẽ nhắc",
+            "inbox-unreadable": ": hộp thư worker không đọc được nên chưa nhắc",
+        }.get(item.action, "")
+    return notes
+
+
 def describe(item: Finding) -> str:
     """One line about a worker for `worker-resume`."""
     host, port = api_endpoint()
-    said = {
+    after = silent_after_s() or SILENT_AFTER_S
+    idle = f"silent for {_minutes(item.idle_s)} min without worker_done"
+    said = ({
+        "nudged": f"{idle}, reminded (reminder {item.attempt}/{MAX_NUDGES})",
+        "would-nudge": f"{idle}, would be reminded (dry run, nothing sent)",
+        "nudge-wait": f"silent again, reminded {item.attempt}/{MAX_NUDGES} times, reminded again after {_minutes(after)} min of silence",
+        "nudge-limit": f"{idle}, {MAX_NUDGES} reminders sent already: needs a person",
+        "nudge-failed": f"{idle}, the reminder could not be typed into its terminal",
+        "nudge-deferred": f"{idle}, not reminded yet (this scan ran out of time), the next scan reminds it",
+        "inbox-unreadable": f"idle for {_minutes(item.idle_s)} min, the worker inbox cannot be read, so not reminded",
+    } if item.state == "silent" else {
         "resumed": f"stalled, resumed (attempt {item.attempt}/{MAX_RESUMES})",
         "would-resume": "stalled, would be resumed (dry run, nothing sent)",
         "waiting-network": f"stalled, waiting for the network ({host}:{port} does not answer), nothing sent",
@@ -375,13 +597,13 @@ def describe(item: Finding) -> str:
         "limit": f"stalled, {MAX_RESUMES} resumes were sent already: needs a person",
         "send-failed": "stalled, the resume could not be sent to its terminal",
         "blocked": "BLOCKED by an error a retry does not fix, not resumed: needs a person",
-    }.get(item.action) or ("working again" if item.state == "working" else f"{item.state}, no API error on screen")
+    }).get(item.action) or ("working again" if item.state == "working" else f"{item.state}, no API error on screen")
     return f"worker-resume: {item.task_id} {said}" + (f": {item.error}" if item.error and item.attention else "")
 
 
 def watch(root: Path, run: str | None = None, *, task_ids: list[str] | None = None, dry_run: bool = False, interval_s: float = WATCH_INTERVAL_S,
           scans: int | None = None, sleep: Callable[[float], None] = time.sleep, out: Callable[[str], None] | None = None) -> None:
-    """Scan every `interval_s` seconds and resume stalled workers, printing one line when a worker's state changes.
+    """Scan every `interval_s` seconds, resume stalled workers and remind silent ones, printing one line when a worker's state changes.
 
     Runs until interrupted; `scans` stops it after that many scans (for tests). A worker that needs nothing prints only
     when it had a line before. An Orca failure is printed once and the loop goes on.
@@ -402,7 +624,7 @@ def watch(root: Path, run: str | None = None, *, task_ids: list[str] | None = No
             continue
         shown.pop("", None)
         for item in found:
-            mark = f"{item.action}|{item.fingerprint}" if item.attention else ""
+            mark = f"{item.action}|{item.fingerprint}|{item.attempt}" if item.attention else ""
             if shown.get(item.task_id, "") != mark:
                 say(describe(item))
             shown[item.task_id] = mark
@@ -412,7 +634,7 @@ def watch(root: Path, run: str | None = None, *, task_ids: list[str] | None = No
 
 
 def main_lines(found: list[Finding]) -> list[str]:
-    """What a single `worker-resume` prints: one line per stalled or blocked worker, or that there is none."""
+    """What a single `worker-resume` prints: one line per stalled, blocked or silent worker, or that there is none."""
     lines = [describe(item) for item in found if item.attention]
     return lines or [f"worker-resume: no stalled worker ({len(found)} worker(s) read)"]
 

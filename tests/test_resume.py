@@ -1,4 +1,5 @@
-"""Resuming workers that stopped on a transient API error: sorting a screen, the resume itself, its limits, the board, and `worker-resume`."""
+"""Resuming workers that stopped on a transient API error and reminding silent ones: sorting a screen, the resume and the
+reminder, their limits, the board, and `worker-resume`."""
 
 import json
 from pathlib import Path
@@ -52,6 +53,23 @@ BLOCKED = """⏺ API Error: 401 {"type":"error","error":{"type":"authentication_
 ✻ Worked for 4s · done 9:24 PM
 """ + FOOTER
 
+# The screens of 2026-10-15/16 (Bimgiamecco): the turn was cut after the e2e run passed, before the commit and worker_done.
+CUT_STOPPED = """⏺ Bash(npm run test:e2e)
+  ⎿  14 passed (1.2m)
+
+⏺ API Error: The response stopped arriving. The response above may be incomplete.
+
+✻ Worked for 47m 12s · done 11:02 PM
+""" + FOOTER
+
+CUT_SLEEP = """⏺ Bash(python3 -m pytest -q)
+  ⎿  88 passed in 9.40s
+
+API Error: Your computer went to sleep mid-response. The response above may be incomplete.
+
+✻ Worked for 1h 2m · done 1:15 AM
+""" + FOOTER
+
 IDLE = """⏺ Da xong, cho lenh tiep theo.
 
 ✻ Worked for 4s · done 9:24 PM
@@ -77,6 +95,21 @@ def test_the_incident_screen_is_stalled_with_its_last_error_line():
     "⏺ API Error: 502 Bad Gateway",
     '⏺ API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}',
     "  ⎿  API Error: Rate limit reached",
+    # Turns cut off mid-stream (2026-10-15/16): the first two word for word from the workers' screens.
+    "API Error: The response stopped arriving. The response above may be incomplete.",
+    "⏺ API Error: The response stopped arriving. The response above may be incomplete.",
+    "API Error: Your computer went to sleep mid-response. The response above may be incomplete.",
+    "⏺ API Error: Your computer went to sleep mid-response. The response above may be incomplete.",
+    "⏺ API Error: Request timed out.",
+    "⏺ API Error: socket hang up",
+    "⏺ API Error: Network error",
+    "⏺ API Error: terminated",
+    "⏺ API Error: TypeError: terminated",
+    "⏺ API Error: stream ended unexpectedly",
+    "⏺ API Error: Stream error: connection reset",
+    "⏺ API Error: UND_ERR_SOCKET other side closed",
+    "⏺ API Error: fetch failed (UND_ERR_CONNECT_TIMEOUT)",
+    "⏺ API Error: Premature close",
 ])
 def test_each_transient_error_line_is_stalled(line):
     assert resume.classify(line + "\n\n✻ Worked for 1m · done 9:24 PM\n" + FOOTER).state == "stalled"
@@ -91,9 +124,35 @@ def test_each_transient_error_line_is_stalled(line):
     "⏺ API Error: 400 input length and max_tokens exceed context length",
     "⏺ Prompt is too long",
     '⏺ API Error: 400 {"type":"error","error":{"type":"invalid_request_error"}}',
+    # A permanent error stays permanent whatever turn-cutting words come with it.
+    "⏺ API Error: 401 network error",
+    "⏺ API Error: 403 Forbidden (socket hang up)",
+    "⏺ API Error: Your credit balance is too low (stream ended)",
+    "⏺ API Error: authentication failed: Request timed out",
+    "⏺ API Error: 400 input length exceeds context length · Premature close",
+    "⏺ API Error: The response stopped arriving · Please run /login",
+    # The marks are tight: words that only look like them are an unknown error, and unknown is blocked.
+    "⏺ API Error: Request was terminated by policy",
+    "⏺ API Error: the session was terminated",
+    "⏺ API Error: streaming is not supported for this model",
+    "⏺ API Error: response stopped",
+    "⏺ API Error: Your computer went to sleep",
+    "⏺ API Error: UNDERR",
 ])
 def test_an_error_a_retry_does_not_fix_is_blocked(line):
     assert resume.classify(line + "\n" + FOOTER).state == "blocked"
+
+
+def test_the_screens_of_the_cut_turns_are_stalled_not_blocked():
+    """2026-10-15/16: both screens were `blocked` for hours; a retry is what they needed."""
+    stopped, slept = resume.classify(CUT_STOPPED), resume.classify(CUT_SLEEP)
+    assert stopped.state == "stalled" and stopped.error == "API Error: The response stopped arriving. The response above may be incomplete."
+    assert slept.state == "stalled" and slept.error.startswith("API Error: Your computer went to sleep mid-response.")
+
+
+def test_a_cut_turn_quoted_by_a_tool_is_not_an_error():
+    quoted = '⏺ Read(src/coding_agent/resume.py)\n  ⎿  r"response stopped arriving", r"socket hang up",\n' + FOOTER
+    assert resume.classify(quoted).state == "idle"
 
 
 def test_a_working_worker_is_not_stalled_even_with_an_error_on_screen():
@@ -160,6 +219,8 @@ class Workers:
     def __init__(self, repo: Path, monkeypatch: pytest.MonkeyPatch, screens: dict[str, str], statuses: dict[str, str] | None = None):
         self.screens = screens
         self.sent: list[tuple[str, str]] = []
+        self.messages: list[dict[str, str]] = []
+        self.reports: list[dict[str, str]] = []
         self.online = True
         self.tasks = [{"id": task_id, "status": (statuses or {}).get(task_id, "dispatched"), "task_title": f"Viec {task_id}"} for task_id in screens]
         for task_id in screens:
@@ -169,6 +230,12 @@ class Workers:
         monkeypatch.setattr(orca_cli, "screen_of", lambda handle: self.screens[handle.removeprefix("term_")])
         monkeypatch.setattr(orca_cli, "send_line", lambda handle, text: self.sent.append((handle, text)))
         monkeypatch.setattr(resume, "network_up", lambda timeout_s=0.0: self.online)
+        monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: self.reports)
+
+        def message(dispatch, *, subject, body, task_id, run=None):
+            self.messages.append({"dispatch": dispatch, "subject": subject, "body": body, "task_id": task_id})
+
+        monkeypatch.setattr(orca_cli, "send_message", message)
 
 
 def kinds(repo: Path) -> list[str]:
@@ -356,3 +423,230 @@ def test_worker_resume_sends_through_orca_terminal_send(repo, tmp_path, monkeypa
     assert f"{task_id} stalled, resumed" in capsys.readouterr().out
     sent = json.loads(state.read_text(encoding="utf-8"))["sent"]
     assert sent == [{"terminal": f"term_{task_id}", "text": resume.resume_text(task_id), "enter": True, "wait_submit": "20"}]
+
+
+# --- reminding silent workers ------------------------------------------------------------------------------------------
+
+AFTER = resume.SILENT_AFTER_S
+
+# A worker that answered the reminder with one more turn and went quiet again without sending worker_done.
+ANSWERED = """⏺ Da xong, cho lenh tiep theo.
+
+❯ Nhac viec: task task_1 chua co worker_done ma terminal da im.
+
+⏺ Con thieu mot buoc, dang lam tiep. Xong roi.
+
+✻ Worked for 1m 2s · done 9:50 PM
+""" + FOOTER
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """`time.time` under the test's control, so no test sleeps."""
+    now = [100_000.0]
+    monkeypatch.setattr(resume.time, "time", lambda: now[0])
+    return now
+
+
+def test_a_worker_idle_past_the_threshold_without_a_report_is_reminded_twice_at_most(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+    inbox_reads = []
+    monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: inbox_reads.append(run) or [])
+    assert [(item.state, item.action) for item in resume.scan(repo)] == [("idle", "")]
+    clock[0] += AFTER - 1
+    assert [(item.state, item.idle_s) for item in resume.scan(repo)] == [("idle", AFTER - 1)]
+    assert inbox_reads == [] and workers.sent == []
+
+    clock[0] += 1
+    first = resume.scan(repo)[0]
+    assert (first.state, first.action, first.attempt, first.idle_s) == ("silent", "nudged", 1, AFTER)
+    assert workers.messages == [{"dispatch": "ctx_task_1", "subject": "Nhac viec: chua co worker_done", "body": resume.nudge_text("task_1"),
+                                 "task_id": "task_1"}]
+    assert workers.sent == [("term_task_1", resume.nudge_text("task_1"))]
+    record = resume.history(repo)[-1]
+    assert (record["kind"], record["dispatch"], record["sent"], record["message"], record["idle_s"]) == ("nudge", "ctx_task_1", True, True, AFTER)
+    assert kinds(repo) == ["nudged"]
+
+    workers.screens["task_1"] = ANSWERED
+    clock[0] += 60
+    again = resume.scan(repo)[0]
+    assert (again.state, again.action, again.attempt) == ("silent", "nudge-wait", 1) and len(workers.sent) == 1
+    clock[0] += AFTER
+    assert [(item.action, item.attempt) for item in resume.scan(repo)] == [("nudged", 2)]
+    clock[0] += 10 * AFTER
+    assert [(item.action, item.attempt) for item in resume.scan(repo)] == [("nudge-limit", 2)]
+    assert len(workers.sent) == 2 and len(workers.messages) == 2
+
+
+def test_the_nudge_text_is_one_plain_line_that_asks_for_the_report():
+    text = resume.nudge_text("task_1")
+    assert text.isascii() and "\n" not in text and not set(text) & set('`$"\\>')
+    assert text.startswith(resume.NUDGE_MARK) and "task_1" in text and "commit" in text and "worker_done" in text and "lam tiep" in text
+
+
+def test_a_worker_that_reported_is_not_reminded(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE, "task_2": IDLE})
+    workers.reports = [{"task_id": "task_1", "dispatch": "ctx_task_1", "type": "worker_done", "outcome": "succeeded"},
+                       {"task_id": "task_2", "dispatch": "ctx_old_attempt", "type": "worker_done", "outcome": "failed"}]
+    resume.scan(repo)
+    clock[0] += AFTER
+    found = {item.task_id: item for item in resume.scan(repo)}
+    assert found["task_1"].state == "idle" and found["task_1"].action == ""
+    assert found["task_2"].action == "nudged" and [handle for handle, _ in workers.sent] == ["term_task_2"]
+
+
+def test_only_a_dispatched_task_with_an_unchanged_idle_screen_is_silent(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE, "task_2": IDLE, "task_3": WORKING}, statuses={"task_2": "ready"})
+    resume.scan(repo)
+    clock[0] += AFTER - 60
+    workers.screens["task_1"] = MOVED_ON
+    workers.screens["task_3"] = IDLE
+    resume.scan(repo)
+    clock[0] += 60
+    found = {item.task_id: (item.state, item.idle_s) for item in resume.scan(repo)}
+    assert found == {"task_1": ("idle", 60), "task_2": ("idle", AFTER), "task_3": ("idle", 60)}
+    assert workers.sent == [] and workers.messages == []
+
+
+def test_an_unreadable_screen_keeps_the_clock_and_a_working_one_resets_it(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+    resume.scan(repo)
+    clock[0] += AFTER / 2
+    workers.screens["task_1"] = ""
+    resume.scan(repo)
+    clock[0] += AFTER / 2
+    workers.screens["task_1"] = IDLE
+    assert resume.scan(repo)[0].action == "nudged"
+    workers.screens["task_1"] = WORKING
+    resume.scan(repo)
+    workers.screens["task_1"] = IDLE
+    clock[0] += 10 * AFTER
+    assert [(item.action, item.idle_s) for item in resume.scan(repo)] == [("nudge-wait", 0)]
+    clock[0] += AFTER
+    assert [(item.action, item.attempt) for item in resume.scan(repo)] == [("nudged", 2)]
+
+
+def test_the_threshold_comes_from_the_environment(repo, monkeypatch, clock):
+    assert resume.silent_after_s() == 600
+    monkeypatch.setenv("CODING_AGENT_SILENT_MINUTES", "2.5")
+    assert resume.silent_after_s() == 150
+    monkeypatch.setenv("CODING_AGENT_SILENT_MINUTES", "nonsense")
+    assert resume.silent_after_s() == 600
+    monkeypatch.setenv("CODING_AGENT_SILENT_MINUTES", "1")
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+    resume.scan(repo)
+    clock[0] += 60
+    assert resume.scan(repo)[0].action == "nudged"
+    for off in ("off", "0"):
+        monkeypatch.setenv("CODING_AGENT_SILENT_MINUTES", off)
+        assert resume.silent_after_s() is None
+        clock[0] += 100 * AFTER
+        assert [(item.state, item.action) for item in resume.scan(repo)] == [("idle", "")]
+    assert len(workers.sent) == 1
+
+
+def test_reminders_and_resumes_have_their_own_limits(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+    for _ in range(resume.MAX_NUDGES):
+        resume.scan(repo)
+        clock[0] += AFTER
+        workers.screens["task_1"] += " "
+        resume.scan(repo)
+        clock[0] += AFTER
+        workers.screens["task_1"] = IDLE + "\n⏺ lan " + str(clock[0]) + "\n" + FOOTER
+    workers.screens["task_1"] = STALLED
+    assert [(item.action, item.attempt) for item in resume.scan(repo)] == [("resumed", 1)]
+    assert [record["kind"] for record in resume.history(repo)] == ["nudge"] * resume.MAX_NUDGES + ["resume"]
+
+
+def test_a_reminder_goes_to_the_terminal_even_when_orca_refuses_the_message(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+
+    def refuse(*args, **kwargs):
+        raise orca_cli.OrcaError("consumer_fenced")
+
+    monkeypatch.setattr(orca_cli, "send_message", refuse)
+    resume.scan(repo)
+    clock[0] += AFTER
+    assert [(item.action, item.attempt) for item in resume.scan(repo)] == [("nudged", 1)] and len(workers.sent) == 1
+    assert resume.history(repo)[-1]["message"] is False
+
+    monkeypatch.setattr(orca_cli, "send_line", refuse)
+    workers.screens["task_1"] = ANSWERED
+    resume.scan(repo)
+    clock[0] += AFTER
+    assert [(item.action, item.attempt) for item in resume.scan(repo)] == [("nudge-failed", 1)]
+    assert kinds(repo) == ["nudged", "nudge-failed"]
+
+
+def test_nothing_is_reminded_while_the_inbox_cannot_be_read(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+
+    def unreadable(run=None):
+        raise orca_cli.OrcaError("orca check exited 3")
+
+    monkeypatch.setattr(orca_cli, "unread_reports", unreadable)
+    resume.scan(repo)
+    clock[0] += AFTER
+    assert [(item.state, item.action) for item in resume.scan(repo)] == [("silent", "inbox-unreadable")] and workers.sent == []
+
+
+def test_the_board_lists_silent_workers_apart_from_api_errors_with_their_reminders(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": STALLED, "task_2": IDLE, "task_3": WORKING})
+    first, _ = coordinator.read_board(repo, run="run_test")
+    assert not any("im lặng" in line for line in first)
+    clock[0] += AFTER
+    lines, error = coordinator.read_board(repo, run="run_test")
+    text = "\n".join(lines)
+    assert error is None and workers.sent[-1] == ("term_task_2", resume.nudge_text("task_2"))
+    assert lines[0] == "worker bị dừng vì lỗi API/mạng, không còn chạy (1):" and "task_2" not in lines[1]
+    assert "worker im lặng, chưa báo (1):\n  - task_2 [dispatched] Viec task_2: im 10 phút, chưa gửi worker_done, đã nhắc 1/2 lần: vừa tự nhắc" in text
+    assert "đang chạy (1):\n  - task_3 [dispatched]" in text
+    clock[0] += 10 * AFTER
+    later, _ = coordinator.read_board(repo, run="run_test")
+    assert "đã nhắc 1/2 lần: vừa tự nhắc" not in "\n".join(later)
+
+
+def test_worker_resume_dry_run_lists_stalled_and_silent_workers(repo, monkeypatch, capsys, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": STALLED, "task_2": IDLE, "task_3": WORKING})
+    assert cli.main(["--root", str(repo), "worker-resume", "--dry-run", "--run", "run_test"]) == 0
+    assert "task_2" not in capsys.readouterr().out
+    clock[0] += AFTER
+    assert cli.main(["--root", str(repo), "worker-resume", "--dry-run", "--run", "run_test"]) == 0
+    out = capsys.readouterr().out
+    assert "worker-resume: task_1 stalled, would be resumed (dry run, nothing sent)" in out
+    assert "worker-resume: task_2 silent for 10 min without worker_done, would be reminded (dry run, nothing sent)" in out
+    assert "task_3" not in out and workers.sent == [] and workers.messages == [] and resume.history(repo) == []
+
+
+def test_watch_reminds_a_worker_that_stays_silent_and_prints_only_changes(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+    said: list[str] = []
+    resume.watch(repo, "run_test", interval_s=AFTER, scans=6, sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds), out=said.append)
+    assert len(workers.sent) == resume.MAX_NUDGES
+    assert said == ["worker-resume: task_1 silent for 10 min without worker_done, reminded (reminder 1/2)",
+                    "worker-resume: task_1 silent for 20 min without worker_done, reminded (reminder 2/2)",
+                    "worker-resume: task_1 silent for 30 min without worker_done, 2 reminders sent already: needs a person"]
+
+
+def test_a_reminder_goes_through_orca_orchestration_send(repo, tmp_path, monkeypatch, capsys, clock):
+    """End to end against the fake CLI: the message is addressed to the dispatch and carries task and dispatch ids."""
+    state = tmp_path / "orca-state.json"
+    monkeypatch.setenv("CODING_AGENT_ORCA", str(FAKE))
+    monkeypatch.setenv("FAKE_ORCA_STATE", str(state))
+    monkeypatch.setenv("CODING_AGENT_ORCA_RUN", "run_test")
+    task_id = orca_cli.create_task(repo, project="demo-repo", t_id="T-n1", spec="x", title="Im lang")
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["tasks"][task_id]["status"] = "dispatched"
+    data["dispatches"] = {"dsp_0001": {"task": task_id, "status": "ready"}}
+    state.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setenv("FAKE_ORCA_SCREEN", IDLE)
+
+    assert cli.main(["--root", str(repo), "worker-resume"]) == 0
+    clock[0] += AFTER
+    assert cli.main(["--root", str(repo), "worker-resume"]) == 0
+    assert f"{task_id} silent for 10 min without worker_done, reminded (reminder 1/2)" in capsys.readouterr().out
+    data = json.loads(state.read_text(encoding="utf-8"))
+    assert data["orchestration_sent"] == [{"to": "dispatch:dsp_0001", "type": "status", "subject": "Nhac viec: chua co worker_done",
+                                           "body": resume.nudge_text(task_id), "task-id": task_id, "dispatch-id": "dsp_0001", "run": "run_test"}]
+    assert data["sent"] == [{"terminal": f"term_{task_id}", "text": resume.nudge_text(task_id), "enter": True, "wait_submit": "20"}]

@@ -26,6 +26,9 @@
   once the API host answers on TCP 443 (`CODING_AGENT_API_HOST`, default `api.anthropic.com`). `--dry-run` only prints;
   `--watch` repeats every `--interval` seconds (default 60) and prints a line when a worker's state changes. Exits 0
   when there is nothing to do. The board runs the same step each turn; `CODING_AGENT_AUTO_RESUME=off` turns that off.
+  The same scan reminds a silent worker (task `dispatched`, screen idle and unchanged for `CODING_AGENT_SILENT_MINUTES`,
+  default 10, and no `worker_done` in the inbox) through `orca orchestration send` and its terminal, twice at most;
+  `--dry-run` lists stalled and silent workers alike.
 - `worker-settle --task-id ID --basis B [--artifact PATH ...]`: abandon the task's active dispatch and mark it completed, once the coordinator
   has checked the result; for a worker whose `worker_done` Orca rejected.
 - `worktree-list`: worker worktrees whose task settled and that still hold work, and what removing each would lose.
@@ -220,9 +223,9 @@ def main(argv: list[str] | None = None) -> int:
     kick = sub.add_parser("worker-kick", help="send the task's worker its kick-off and record its worktree")
     kick.add_argument("--task-id", required=True)
     kick.add_argument("--run")
-    resumed = sub.add_parser("worker-resume", help="resume workers that stopped on a transient API error")
+    resumed = sub.add_parser("worker-resume", help="resume workers that stopped on a transient API error, remind silent ones")
     resumed.add_argument("--task-id", action="append", default=[], help="only this task's worker (repeatable; default: every running worker of the Run)")
-    resumed.add_argument("--dry-run", action="store_true", help="print what would be resumed and send nothing")
+    resumed.add_argument("--dry-run", action="store_true", help="print what would be resumed or reminded and send nothing")
     resumed.add_argument("--watch", action="store_true", help="keep scanning and resume when the network is back")
     resumed.add_argument("--interval", type=float, default=resume.WATCH_INTERVAL_S, help="seconds between scans with --watch (default 60)")
     resumed.add_argument("--run")

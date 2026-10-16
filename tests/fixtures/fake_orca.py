@@ -14,6 +14,7 @@ and `worker-abandon` read and change the dispatch records that `worker-start` cr
 folder project (the harness no longer asks for `new-child`). `FAKE_ORCA_UNKNOWN_REPO=1` makes `worktree create` answer `repo_not_found` until `repo add` registered
 the repository. `FAKE_ORCA_REAL_WORKTREE=1` makes `worktree create` add a real git worktree of the named repository.
 `terminal create` records `--worktree`, `--title`, and `--command` and answers `result.terminal.handle`.
+`orchestration send` records its options (without `--`) in `orchestration_sent`.
 `FAKE_ORCA_SCREEN` replaces what `terminal read` shows (lines separated by `\\n`). With `$CLAUDE_CONFIG_DIR` set,
 `worktree create` and `terminal create` copy `.claude.json` as it is at that moment to `$FAKE_ORCA_STATE.<word>-create.json`,
 so a test can see what was trusted when each call came.
@@ -163,6 +164,9 @@ def main(argv: list[str]) -> int:
             for m in messages:
                 m["delivery"] = "delivery_1"
             answer = {"ok": True, "result": {"runId": options.get("--run"), "messages": messages, "count": len(messages), "deliveryId": "delivery_1"}}
+    elif command == "send":
+        data.setdefault("orchestration_sent", []).append({key.removeprefix("--"): value for key, value in options.items()})
+        answer = {"ok": True, "result": {"message": {"id": f"msg_{len(data['orchestration_sent'])}"}}}
     elif command == "run-create":
         answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"run": {"id": "run_created", "objective": options.get("--objective", "")}}}
     elif command == "task-create":
