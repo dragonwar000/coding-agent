@@ -83,6 +83,7 @@ def test_the_role_environment_variable_overrides_detection(repo, monkeypatch):
     ("Bash", {"command": "git add -A && git merge worker-branch"}, False),
     ("Bash", {"command": "git reset --hard HEAD~1"}, True),
     ("Bash", {"command": "git checkout -- src/app.py"}, True),
+    ("Bash", {"command": "git push origin main && git checkout main"}, False),
     ("Bash", {"command": "rm -rf build"}, True),
     ("Bash", {"command": "pytest -q 2>&1"}, False),
     ("Bash", {"command": "git status && git log --oneline"}, False),
@@ -102,6 +103,82 @@ def test_the_role_environment_variable_overrides_detection(repo, monkeypatch):
 ])
 def test_the_guard_reason_covers_writes_and_mutating_shell(tool, tool_input, blocked):
     assert (coordinator.guard_reason(tool, tool_input) is not None) is blocked
+
+
+@pytest.mark.parametrize("command", [
+    "git push origin HEAD:main",
+    "git push -u origin feature",
+    "git fetch origin && git pull --rebase",
+    "git checkout main",
+    "git checkout -b feature",
+    "git switch -c feature",
+    "git branch feature && git branch -d merged",
+    "git rebase main",
+    "git stash push -u -m wip && git stash apply stash@{0}",
+    "git apply fix.patch",
+    "git restore --staged a.py",
+    "git rm old.py",
+    "git mv a.py b.py",
+    "git tag v1",
+    "git cherry-pick abc123",
+    "git worktree add ../w feature",
+    "git reset HEAD~1",
+    "git reset --soft HEAD~1",
+    "git clean -n",
+    "git -C sub push origin main",
+    "git add -A && git commit -m 'reset --hard later' && git push",
+    "sh -c 'git fetch && git rebase origin/main'",
+])
+def test_the_coordinator_runs_git_commands(command, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
+    assert coordinator.guard_reason("Bash", {"command": command}) is None
+
+
+@pytest.mark.parametrize("command, form", [
+    ("git push --force origin main", "git push --force"),
+    ("git push -f", "git push -f"),
+    ("git push -uf origin main", "git push -f"),
+    ("git push --force-with-lease origin main", "git push --force"),
+    ("git push --force-with-lease=main:abc origin main", "git push --force"),
+    ("git push origin +main", "git push +refspec"),
+    ("git reset --hard HEAD~1", "git reset --hard"),
+    ("git clean -f", "git clean -f"),
+    ("git clean -fd", "git clean -f"),
+    ("git clean -xdf", "git clean -f"),
+    ("git clean --force", "git clean -f"),
+    ("git checkout -- src/app.py", "git checkout -- <path>"),
+    ("git checkout main -- src/app.py", "git checkout -- <path>"),
+    ("git checkout .", "git checkout -- <path>"),
+    ("git restore a.py", "git restore"),
+    ("git restore --staged --worktree a.py", "git restore"),
+    ("git stash drop", "git stash drop"),
+    ("git stash clear", "git stash clear"),
+    ("git branch -D feature", "git branch -D"),
+    ("git branch --delete --force feature", "git branch -D"),
+    ("git -C sub reset --hard", "git reset --hard"),
+    ("git status && git reset --hard origin/main", "git reset --hard"),
+    ("git fetch; git push -f origin main", "git push -f"),
+    ("sh -c 'git fetch && git reset --hard origin/main'", "git reset --hard"),
+    ("bash -lc \"git clean -fdx\"", "git clean -f"),
+])
+def test_the_coordinator_guard_blocks_destructive_git(command, form, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
+    reason = coordinator.guard_reason("Bash", {"command": command})
+    assert reason is not None and form in reason
+    assert "phá huỷ" in reason and "CODING_AGENT_COORDINATOR_GIT=all" in reason
+
+
+def test_the_coordinator_git_environment_lifts_the_destructive_block(monkeypatch):
+    monkeypatch.setenv("CODING_AGENT_COORDINATOR_GIT", "all")
+    assert coordinator.guard_reason("Bash", {"command": "git reset --hard && git push -f"}) is None
+    assert coordinator.guard_reason("Bash", {"command": "git clean -fd && rm -rf build"}) is not None
+
+
+def test_the_coordinator_guard_still_blocks_writes_beside_git(monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
+    assert coordinator.guard_reason("Bash", {"command": "git log > out.txt"}) is not None
+    assert coordinator.guard_reason("Bash", {"command": "git pull && rm -rf build"}) is not None
+    assert coordinator.guard_reason("Bash", {"command": "cp .git/config backup"}) is not None
 
 
 def test_the_coordinator_guard_blocks_a_write_in_enforce_and_lets_a_worker_write(repo, tmp_path, monkeypatch):
@@ -435,7 +512,7 @@ def test_a_maintainer_session_is_let_through_and_logged(repo, monkeypatch):
     manifest(repo, verify=[])
     committed_repo(repo)
     assert coordinator.role_for(repo) == "maintainer"
-    result = call(repo, "coordinator-guard", {"session_id": "c32", "cwd": str(repo), **{"tool_name": "Bash", "tool_input": {"command": "git stash"}}}, mode="enforce")
+    result = call(repo, "coordinator-guard", {"session_id": "c32", "cwd": str(repo), **{"tool_name": "Bash", "tool_input": {"command": "git stash drop"}}}, mode="enforce")
     assert result.returncode == 0 and result.stdout == ""
     last = json.loads(events.log_path(repo).read_text(encoding="utf-8").splitlines()[-1])
     assert last["kind"] == "maintainer-allowed" and last["applied"] is False

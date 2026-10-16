@@ -5,8 +5,8 @@ Role is decided per session. The main worktree of the repository is the coordina
 overrides the detection; a maintainer session is not blocked, and what the guard would have blocked is still logged. A worker never gets the coordinator contract, and the coordinator guard does
 nothing in a worker.
 
-The guard blocks direct file writes and mutating shell commands in the coordinator, so the work goes to a
-worker. The contract and the task board are injected at session start and on every prompt, so the
+The guard blocks direct file writes, shell commands that change files, and destructive git forms in the
+coordinator, so the work goes to a worker. Every other git command is the coordinator's to run. The contract and the task board are injected at session start and on every prompt, so the
 coordinator keeps the user's question in view while workers run.
 """
 
@@ -26,12 +26,11 @@ ROLES = ("coordinator", "worker", "maintainer")
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 BOARD_LIMIT = 20
 
-# Shell forms that change file content or rewrite repository state. Read-only forms (git status/log/diff, ls, cat, grep),
-# the coding-agent CLI, and `git add/commit/merge` are not matched: integrating worker branches is the coordinator's job.
+# Shell forms that change file content. Read-only forms (ls, cat, grep) and the coding-agent CLI are not matched.
+# git commands are not matched here: the coordinator runs any git command except the destructive forms below.
 # A heuristic: what it misses is recorded by stop-gate as `direct-change`.
 MUTATING_BASH = re.compile(
     r"(\bsed\s+-i\b|\brm\s|\bmv\s|\bcp\s|\bmkdir\b|\btouch\b|\btee\b|\bchmod\b|\bln\s|"
-    r"\bgit\s+(push|reset|checkout|clean|rebase|stash|apply|restore|rm)\b|"
     r"\b(pip3?|npm|pnpm|yarn)\s+(install|add|i)\b|"
     r"(?<![0-9&])>{1,2}\s*(?![&]|/dev/null)\S)"
 )
@@ -96,6 +95,64 @@ def checked_shell(command: str) -> str:
     """
     shell = code_only(command)
     return command if SHELL_STRING.search(shell) else shell
+
+
+# One git invocation: `git` as a word of its own, up to the next separator or redirect.
+GIT_CALL = re.compile(r"(?<![^\s;&|(`'\"])git(?=\s|$)([^;&|\n()`>]*)")
+# `CODING_AGENT_COORDINATOR_GIT=all` lets the coordinator run the destructive git forms too.
+COORDINATOR_GIT_ENV = "CODING_AGENT_COORDINATOR_GIT"
+# Global options of git that take a value as the next word.
+GIT_OPTIONS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+
+
+def _short_flags(args: list[str], letter: str) -> bool:
+    """True when a short-flag cluster in `args` (`-f`, `-fd`, `-xdf`) contains `letter`."""
+    return any(re.fullmatch(r"-[A-Za-z]+", arg) and letter in arg for arg in args)
+
+
+def _destructive_form(sub: str, args: list[str]) -> str | None:
+    """The destructive git form `git <sub> <args>` is, or None when it loses nothing that cannot be recovered."""
+    if sub == "push":
+        if any(arg in ("--force", "--force-with-lease") or arg.startswith("--force-with-lease=") for arg in args):
+            return "git push --force"
+        if _short_flags(args, "f"):
+            return "git push -f"
+        if any(arg.startswith("+") for arg in args):
+            return "git push +refspec"
+    elif sub == "reset" and "--hard" in args:
+        return "git reset --hard"
+    elif sub == "clean" and ("--force" in args or _short_flags(args, "f")):
+        return "git clean -f"
+    elif sub == "checkout" and ("--" in args or "." in args):
+        return "git checkout -- <path>"
+    elif sub == "restore" and ("--staged" not in args and not _short_flags(args, "S")
+                               or "--worktree" in args or _short_flags(args, "W")):
+        return "git restore (bỏ thay đổi trong working tree)"
+    elif sub == "stash" and args[:1] in (["drop"], ["clear"]):
+        return f"git stash {args[0]}"
+    elif sub == "branch" and (_short_flags(args, "D") or ("--delete" in args or _short_flags(args, "d"))
+                              and ("--force" in args or _short_flags(args, "f"))):
+        return "git branch -D"
+    return None
+
+
+def destructive_git(shell: str) -> str | None:
+    """The first git form in `shell` that destroys data beyond recovery, or None.
+
+    Force pushes, `reset --hard`, `clean -f`, discarding working-tree changes (`checkout -- <path>`, `checkout .`,
+    `restore` without `--staged`), `stash drop/clear`, and `branch -D`. Every other git command is allowed.
+    """
+    for match in GIT_CALL.finditer(shell):
+        words = [word.strip("'\"") for word in match.group(1).split()]
+        words = [word for word in words if word]
+        i = 0
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in GIT_OPTIONS_WITH_VALUE else 1
+        if i < len(words):
+            form = _destructive_form(words[i], words[i + 1:])
+            if form:
+                return form
+    return None
 
 
 def _git(cwd: Path, *args: str) -> str | None:
@@ -211,7 +268,8 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python
     """Why the coordinator must not do this call itself, or None when the call is allowed.
 
     Allowed: read-only shell, a single `coding_agent.cli` command, and writing the plan file.
-    Refused: any other file write, a mutating shell command, and an in-process subagent, which would bypass the graph.
+    Refused: any other file write, a shell command that changes files, a destructive git form (unless
+    `CODING_AGENT_COORDINATOR_GIT=all`), and an in-process subagent, which would bypass the graph.
     Every refusal ends with the delegate command, with `python_src` in it when the caller knows the path.
     """
     data = tool_input if isinstance(tool_input, dict) else {}
@@ -227,8 +285,15 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python
         shell = checked_shell(command)
         if DELEGATE_CALL.search(command) and not CHAINING.search(shell):
             return None
-        if MUTATING_BASH.search(shell):
-            return f"[coordinator] lệnh shell này làm thay đổi file hoặc trạng thái repo. {how}"
+        if os.environ.get(COORDINATOR_GIT_ENV) != "all":
+            form = destructive_git(shell)
+            if form:
+                return (
+                    f"[coordinator] `{form}` là dạng git phá huỷ: làm mất dữ liệu không lấy lại được, nên bị chặn. "
+                    f"Muốn cho coordinator chạy cả dạng này: khởi động phiên với {COORDINATOR_GIT_ENV}=all. {how}"
+                )
+        if MUTATING_BASH.search(GIT_CALL.sub("git", shell)):
+            return f"[coordinator] lệnh shell này làm thay đổi file. {how}"
     return None
 
 
@@ -237,7 +302,7 @@ def contract(python_src: str) -> str:
     return "\n".join([
         "[coordinator] Bạn là coordinator của repo này. Vai trò: nhận yêu cầu, lập kế hoạch, giao việc, và trả lời người dùng.",
         "- Mọi thay đổi file đi qua graph: bạn viết plan, worker Orca làm từng node trong worktree riêng. Ở mode enforce, hook chặn sửa trực tiếp, lệnh shell ghi file, và subagent nội bộ.",
-        "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và gộp kết quả: `git add`, `git commit`, `git merge <nhánh worker>`.",
+        "- Bạn vẫn đọc file, chạy lệnh đọc, ghi đúng một file (.coding-agent/plan.yaml), và được chạy lệnh git (gộp nhánh worker, push, pull, checkout, rebase, stash, tag...), trừ các dạng phá huỷ: `git push --force`/`-f`/`+refspec`, `git reset --hard`, `git clean -f`, `git checkout -- <path>`/`git checkout .`, `git restore` không có `--staged`, `git stash drop/clear`, `git branch -D`.",
         "- Worker tách nhánh từ commit hiện tại: commit việc đang dở trước khi `plan-next`, nếu không worker sẽ không thấy nó.",
         "- Chỉ worker được ghi: mọi lần ghi file, script tạm, hay lệnh shell đổi trạng thái là việc của worker. Bạn không tự làm, và không viết lại lệnh bị chặn để lách guard.",
         "- Khi việc cần ghi, hoặc khi hook chặn một lệnh: giao ngay trong cùng lượt, bằng lệnh delegate (một việc nhỏ) hoặc graph (nhiều việc). Không xin phép người dùng, không kết thúc lượt để chờ. Chỉ hỏi người dùng khi quyết định thật sự là của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài), không hỏi \"có giao việc không\".",
