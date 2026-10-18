@@ -157,3 +157,27 @@ def test_only_the_selected_hosts_are_written_and_checked(tmp_path):
     assert not (tmp_path / ".codex" / "hooks.json").exists()
     assert gen.drift(manifest, ["claude_code"]) == []
     assert gen.drift(manifest, ["codex"]) and all("codex" in p for p in gen.drift(manifest, ["codex"]))
+
+
+def moved(tmp: Path, declared: str, on_disk: tuple[str, ...]) -> Path:
+    """A manifest naming `declared` as python_src, with only the `on_disk` directories created."""
+    for folder in on_disk:
+        (tmp / folder).mkdir(parents=True)
+    return write(tmp, BASE.replace("python_src: src", f"python_src: {declared}"))
+
+
+@pytest.mark.parametrize("declared, on_disk, expected", [
+    ("harness/coding-agent/src", (".harness/coding-agent/src",), ".harness/coding-agent/src"),
+    (".harness/coding-agent/src", ("harness/coding-agent/src",), "harness/coding-agent/src"),
+    ("harness/coding-agent/src", ("harness/coding-agent/src", ".harness/coding-agent/src"), "harness/coding-agent/src"),
+    ("harness/coding-agent/src", (), "harness/coding-agent/src"),
+    ("src", (), "src"),
+])
+def test_python_src_follows_the_harness_folder_when_it_was_moved_to_the_other_dot_layout(tmp_path, declared, on_disk, expected):
+    assert load(moved(tmp_path, declared, on_disk)).python_src == expected
+
+
+def test_hook_commands_use_the_moved_harness_folder(tmp_path):
+    manifest = load(moved(tmp_path, "harness/coding-agent/src", (".harness/coding-agent/src",)))
+    claude = commands(gen.render(manifest)["claude_code"])
+    assert claude and all('"$CLAUDE_PROJECT_DIR"/.harness/coding-agent/src ' in c for c in claude)

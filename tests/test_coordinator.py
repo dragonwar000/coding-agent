@@ -539,3 +539,18 @@ def test_a_maintainer_is_still_asked_before_a_worktree_is_removed(repo, monkeypa
     command = "python3 -m coding_agent.cli worktree-clean --task-id t1 --discard --yes"
     result = call(repo, "coordinator-guard", {"session_id": "c33", "cwd": str(repo), "tool_name": "Bash", "tool_input": {"command": command}}, mode="enforce")
     assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+
+def test_the_coordinator_guard_names_the_moved_harness_folder(repo, monkeypatch):
+    # The setup installer moves harness/ into .harness/ and leaves integration.yaml naming the old folder.
+    monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
+    manifest(repo, verify=[])
+    path = repo / "integration.yaml"
+    path.write_text(path.read_text(encoding="utf-8").replace("python_src: src", "python_src: harness/coding-agent/src"), encoding="utf-8")
+    (repo / ".harness" / "coding-agent" / "src").mkdir(parents=True)
+    committed_repo(repo)
+    payload = {"session_id": "c41", "cwd": str(repo), "tool_name": "Bash", "tool_input": {"command": "rm -rf build"}}
+    blocked = call(repo, "coordinator-guard", payload, mode="enforce")
+    assert blocked.returncode == 2
+    assert "PYTHONPATH=.harness/coding-agent/src python3 -m coding_agent.cli delegate" in blocked.stderr
+    assert coordinator.contract(context_for("coordinator-guard", payload).manifest.python_src).count("PYTHONPATH=.harness/coding-agent/src ") == 1

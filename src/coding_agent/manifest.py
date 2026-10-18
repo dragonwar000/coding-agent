@@ -172,6 +172,19 @@ def _hook(item: Any, seen: set[str]) -> Hook:
     return Hook(id=hook_id, host=host, event=event, matcher=matcher, mode=mode, assumption=str(assumption), timeout_s=timeout_s)
 
 
+def resolve_python_src(root: Path, python_src: str) -> str:
+    """`python_src`, or its other dot layout (`harness/x` <-> `.harness/x`) when only that folder exists under `root`."""
+    # Installer overstack don harness/ vao .harness/ (va nguoc lai) ma khong sua integration.yaml,
+    # nen python_src tro vao thu muc da mat: lenh delegate va lenh hook sinh ra deu ModuleNotFoundError.
+    # Chi doi khi ban goc khong ton tai ma ban doi-dau-cham ton tai; con lai giu nguyen gia tri goc.
+    parts = Path(python_src).parts
+    if not parts or (root / python_src).is_dir():
+        return python_src
+    first = parts[0]
+    other = Path(first[1:] if first.startswith(".") else "." + first, *parts[1:]).as_posix()
+    return other if (root / other).is_dir() else python_src
+
+
 def load(path: Path) -> Manifest:
     """Parse and validate one manifest file. PyYAML is imported here so a hook can import this module without it."""
     import yaml
@@ -192,6 +205,7 @@ def load(path: Path) -> Manifest:
     python_src = _require_str(raw.get("python_src"), "python_src")
     if python_src.startswith("/") or ".." in Path(python_src).parts:
         raise ManifestError("python_src must be a relative path inside the repository")
+    python_src = resolve_python_src(path.parent, python_src)
 
     verify = raw.get("verify") or {}
     verify_commands = _str_list(verify.get("commands", []), "verify.commands")
