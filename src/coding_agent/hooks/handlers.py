@@ -390,6 +390,11 @@ def coordinator_context(ctx: Context) -> HookResult:
         _remember_permission_mode(ctx, None)
     board, error = coordinator.read_board(ctx.root, session=ctx.session)
     text = coordinator.board_context(board, error)
+    if event == "UserPromptSubmit":
+        user_text = coordinator.split_orca_pointer(str(ctx.payload.get("prompt") or ""))
+        if user_text is not None:
+            ctx.note(guard="coordinator-context", kind="prompt-collision", applied=False, detail={"user_chars": len(user_text)})
+            text = coordinator.collision_context(user_text) + "\n" + text
     if event == "SessionStart":
         auto = autodecide.effective(ctx.root, ctx.manifest.auto_decide).enabled
         text = coordinator.contract(ctx.manifest.python_src, auto_decide=auto) + "\n" + text

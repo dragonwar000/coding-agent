@@ -244,6 +244,34 @@ def test_each_prompt_gets_the_board_but_not_the_contract(repo, fake_orca, monkey
     assert "bảng việc" in body["additionalContext"]
 
 
+POINTER = "You have 1 orchestration message. Run `orca orchestration check --run run_test`."
+
+
+@pytest.mark.parametrize("prompt, expected", [
+    (f"\n{POINTER}\n", None),  # Orca's wake-up alone
+    ("tiến độ?", None),  # the user alone
+    (f"sửa giúp tôi cái nút\n{POINTER}\n", "sửa giúp tôi cái nút"),  # Orca typed after the user's draft
+    (f"\n{POINTER}\nkiểm lại", "kiểm lại"),  # the user typed during Orca's 500 ms before Enter
+    ("làm A\nYou have 3 orchestration messages. Run `/opt/orca orchestration check`.", "làm A"),
+])
+def test_orca_mailbox_line_typed_into_the_users_draft_is_split_off(prompt, expected):
+    assert coordinator.split_orca_pointer(prompt) == expected
+
+
+def test_a_prompt_merged_with_orcas_mailbox_line_is_flagged_to_the_coordinator(repo, fake_orca, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
+    manifest(repo, verify=[])
+    committed_repo(repo)
+    payload = {"session_id": "c7", "cwd": str(repo), "hook_event_name": "UserPromptSubmit", "prompt": f"thêm nút xoá\n{POINTER}\n"}
+    body = json.loads(call(repo, "coordinator-board", payload, mode="shadow").stdout)["hookSpecificOutput"]
+    assert "Prompt này bị dính" in body["additionalContext"] and "«thêm nút xoá»" in body["additionalContext"]
+    assert "bảng việc" in body["additionalContext"]
+    kinds = [json.loads(line)["kind"] for line in events.log_path(repo).read_text(encoding="utf-8").splitlines()]
+    assert "prompt-collision" in kinds
+    alone = {**payload, "session_id": "c8", "prompt": f"\n{POINTER}\n"}
+    assert "bị dính" not in json.loads(call(repo, "coordinator-board", alone, mode="shadow").stdout)["hookSpecificOutput"]["additionalContext"]
+
+
 def test_a_worker_session_gets_no_coordinator_context(repo, tmp_path, fake_orca, monkeypatch):
     monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
     manifest(repo, verify=[])

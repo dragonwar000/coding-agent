@@ -439,6 +439,35 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
     return lines[:BOARD_LIMIT] + (["  ..."] if len(lines) > BOARD_LIMIT else [])
 
 
+# The line Orca types into an idle agent terminal when its mailbox gets mail (Orca 1.4: `\nYou have N orchestration
+# message(s). Run `orca orchestration check --run <id>`.\n`, then Enter 500 ms later). Orca does not look at the
+# Claude Code input box first, so text the user is typing at that moment is sent together with it, unfinished.
+ORCA_POINTER = re.compile(r"You have \d+ orchestration messages?\. Run `[^`\n]*orchestration check[^`\n]*`\.?")
+
+
+def split_orca_pointer(prompt: str) -> str | None:
+    """The user's own text when Orca's mailbox line was typed into the middle of it, else None.
+
+    None also when the prompt is only Orca's line (an ordinary mailbox wake-up) or has no Orca line.
+    """
+    if not ORCA_POINTER.search(prompt):
+        return None
+    rest = "\n".join(line.strip() for line in ORCA_POINTER.sub("\n", prompt).splitlines() if line.strip())
+    return rest or None
+
+
+def collision_context(user_text: str) -> str:
+    """What the coordinator is told when a prompt holds both the user's text and Orca's mailbox line."""
+    return (
+        "[coordinator] Prompt này bị dính: Orca tự gõ dòng \"You have N orchestration message(s). Run `orca orchestration check`\" "
+        "vào ô nhập đúng lúc người dùng đang gõ, rồi tự bấm Enter. Hai phần là hai tin khác nhau:\n"
+        "- Dòng của Orca: chỉ là thông báo hộp thư có tin mới (worker báo/hỏi). Xử lý theo bảng việc bên dưới như mọi lần.\n"
+        f"- Phần của người dùng (có thể đang gõ dở, chưa xong): «{user_text}».\n"
+        "Nói ngắn cho người dùng biết tin của họ bị gửi sớm do trùng thông báo của Orca. Nếu phần đó đã đủ ý thì làm theo; "
+        "nếu có vẻ dở dang thì đừng đoán, nhờ người dùng gõ nốt."
+    )
+
+
 def board_context(board: list[str], error: str | None) -> str:
     """The board block injected on each prompt. An unavailable Orca is reported, never hidden."""
     if error is not None:
