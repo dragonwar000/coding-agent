@@ -597,8 +597,15 @@ của repo, và worker sẽ thiếu việc mới nhất. Commit gốc của work
 
 ## Bộ nhớ của agent
 
-- Store là thư mục `<CODING_AGENT_ZEROMEM_HOME>/workspaces/<sha256(root)[:16]>` (mặc định
-  `~/.coding-agent/zeromem`). Mỗi repo một store, nên hai repo không đọc lẫn của nhau.
+- Store là thư mục `<CODING_AGENT_ZEROMEM_HOME>/workspaces/<sha256(project)[:16]>` (mặc định
+  `~/.coding-agent/zeromem`). Một project là một git repo: `project` là main checkout của repo, tìm từ
+  `git rev-parse --git-common-dir` (thư mục cha khi nó kết thúc bằng `.git`). Vì vậy main checkout, workspace Orca
+  và worktree của worker cùng một repo dùng chung một store, còn hai repo khác nhau không bao giờ chung, kể cả khi
+  nằm trong cùng một folder project. Thư mục không phải git là project của chính nó, theo đường dẫn.
+- Main checkout giữ nguyên key cũ (`sha256` của đường dẫn gốc repo), nên store đã có không mất.
+- Phiên ở gốc folder project (không phải git) không ghi lượt chạy bên trong một repo con: lượt đó ghi event
+  `memory` `other-project` và không vào store nào; worker của repo con ghi vào store của repo đó.
+- `recall`, `stats`, `report`, `forget` dùng cùng cách tìm project từ `--root` (mặc định thư mục hiện tại).
 - Mỗi lượt kết thúc, `stop-gate` ghi hội thoại và, khi lượt đổi file và verify đạt, một episode.
   Quy tắc lọc câu tạm thời và cắt độ dài theo memory-distill.
 - UUID suy ra từ số dòng transcript, nên ghi lại cùng lượt không tạo bản sao: zm bỏ qua UUID đã có.

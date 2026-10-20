@@ -405,6 +405,12 @@ def _remember(ctx: Context, turn: transcript.Turn, verdict: str, lines: int) -> 
     manifest = ctx.manifest
     if manifest is None or (turn.prompt is None and turn.response == ""):
         return
+    cwd = ctx.payload.get("cwd")
+    if cwd and zeromem.project_root(Path(str(cwd))) != zeromem.project_root(ctx.root):
+        # The turn ran inside another repository than the session's project (a member repository of a folder-project
+        # root): it belongs to that repository's own sessions, never to this project's store.
+        ctx.note(guard="memory", kind="other-project", applied=False, detail={"cwd": str(cwd)[:300]})
+        return
     try:
         store = zeromem.store_for(ctx.root, embedder=manifest.memory.embedder)
         zeromem.ensure_models(store)

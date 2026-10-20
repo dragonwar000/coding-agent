@@ -51,9 +51,39 @@ def zm_binary() -> str:
     return os.environ.get(ZM_ENV) or os.environ.get(ZM_FALLBACK_ENV) or "zm"
 
 
+# Variables that would make git answer for another repository than the one around the path.
+_GIT_CLEARED = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES")
+
+
+def project_root(path: Path) -> Path:
+    """The project a path belongs to: one git repository, whatever worktree the path is in.
+
+    Every worktree of a repository (the main checkout, Orca workspaces, worker worktrees) maps to the main checkout:
+    the parent of the common git directory when that ends in `.git`, otherwise the common directory itself. A path
+    outside git is its own project, so two repositories under one non-git folder never share it.
+    """
+    resolved = path.resolve()
+    env = {key: value for key, value in os.environ.items() if key not in _GIT_CLEARED}
+    try:
+        done = subprocess.run(["git", "-C", str(resolved), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                              capture_output=True, text=True, timeout=10, env=env, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return resolved
+    common = done.stdout.strip()
+    if done.returncode != 0 or not common:
+        return resolved
+    common_path = Path(common).resolve()
+    return common_path.parent if common_path.name == ".git" else common_path
+
+
+def store_key(path: Path) -> str:
+    """The store key of a path's project: sha256 of the project root, as the store layout has always used."""
+    return hashlib.sha256(str(project_root(path)).encode("utf-8")).hexdigest()[:16]
+
+
 def store_for(root: Path, *, embedder: str, base: Path | None = None, zm: str | None = None) -> Store:
-    """The store of one project root. `embedder: hash` runs zm with `--no-model`."""
-    key = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+    """The store of the project `root` belongs to (see `project_root`). `embedder: hash` runs zm with `--no-model`."""
+    key = store_key(root)
     home = (base or base_home()) / "workspaces" / key
     return Store(home=home, zm=zm or zm_binary(), no_model=embedder == "hash")
 
