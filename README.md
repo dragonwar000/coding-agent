@@ -22,6 +22,8 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/orca.py` | Quy tắc Orca thuần: completion cần bằng chứng, task thuộc một repo, bằng chứng `CLAIMED-DONE BUT ABSENT` |
 | `src/coding_agent/orca_cli.py` | Adapter tới `orca orchestration`: tạo task, claim, đổi trạng thái, liệt kê |
 | `src/coding_agent/autodecide.py` | Auto-decide: câu hỏi `AskUserQuestion` chờ N giây trong cửa sổ đếm ngược, hết giờ thì Fable hoặc phương án gợi ý chọn |
+| `src/coding_agent/ratchet.py` | Ratchet: giữ hoặc quay lại từng lần thử đã verify theo một lệnh metric, snapshot bằng git qua index tạm |
+| `src/coding_agent/evaluator.py` | Evaluator: một tiến trình `claude -p` mới chấm lượt theo rubric; grounding kiểm bằng chứng của từng tiêu chí |
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
@@ -101,6 +103,81 @@ golden nào.
 
 Định dạng `.last-sync.json`, `.last-sync-tree.json`, `stale.json` và `eval-baseline.json` (`wikieval-baseline/v1`)
 giữ nguyên như bản của `setup`, nên neo và baseline có sẵn dùng tiếp được.
+
+## Ratchet và evaluator
+
+Hai cơ chế từ bài "Graph Engineering: The Karpathy Loop" (§II và §V). Cả hai chạy trong `stop-gate`, sau khi lệnh
+verify đạt, và chỉ trong phiên tự ghi file: worker, maintainer, hoặc coordinator khi `coordinator-guard` không ở
+`enforce`. Chỉ chặn (tức là bắt lượt chạy tiếp) khi khối đó và `stop-gate` cùng ở `enforce`; `shadow` chỉ ghi event.
+
+### Ratchet
+
+Mỗi lần Stop có verify đạt là một lần thử. Lần đạt đầu tiên của lượt là baseline. Lần sau chạy lệnh `metric` (số ở
+dòng cuối stdout): tốt hơn điểm tốt nhất quá `min_delta` thì giữ, không thì cây file quay về bản đã giữ; metric lỗi
+hoặc không in số cũng quay về. Sau mỗi lần thử, model được nhắc thử thêm một thay đổi có lý do. Ratchet dừng sau
+`no_improve_stop` lần liên tiếp không cải thiện hoặc `max_trials_per_turn` lần thử, và để cây file ở bản tốt nhất.
+Lượt hết `max_continuations` mà verify vẫn đỏ thì cây file quay về bản tốt nhất đã giữ.
+
+```yaml
+ratchet:
+  mode: enforce
+  assumption: "Số in ở dòng cuối của lệnh metric đo đúng chất lượng của việc."
+  metric: "python3 scripts/score.py"
+  direction: max          # min khi số nhỏ hơn là tốt hơn
+  min_delta: 0
+  no_improve_stop: 3
+  max_trials_per_turn: 20
+  metric_timeout_s: 600
+```
+
+- Baseline là lần đạt đầu tiên của lượt, không phải trạng thái trước lượt: lượt chỉ hỏi đáp không tốn một lần chạy
+  metric, và trạng thái trước lượt có thể chưa qua verify.
+- Snapshot là commit git qua index tạm (`GIT_INDEX_FILE`): không đụng HEAD, nhánh, hay index của bạn. File trong
+  `.gitignore` và thư mục `.coding-agent/` nằm ngoài snapshot, nên không bị quay lại. Mỗi lần thử có ref dưới
+  `refs/coding-agent/ratchet/<session>/` (`kept` là bản đang giữ), nên lần bị quay lại vẫn xem được bằng `git show`.
+- Event `ratchet` trong `.coding-agent/events.jsonl`: `baseline`, `kept`, `reverted`, `crash`, `stopped` (lý do
+  `no-improve`, `max-trials`, `no-change`), `unavailable` (không phải git, hoặc git lỗi).
+- `metric` rỗng thì ratchet không chạy ở mọi mode.
+
+### Evaluator
+
+Sau verify (và ratchet đã dừng), một tiến trình `claude -p` mới chấm lượt. Nó không thấy hội thoại, chỉ nhận yêu cầu
+gần nhất của người dùng, `rubric` (rỗng thì nó tự viết 2 đến 6 tiêu chí), và các lệnh verify đã đạt; nó chỉ có
+`Read`, `Grep`, `Glob`, không MCP, không skill, không nạp cấu hình của dự án. Nó trả một báo cáo JSON:
+`verdict` (`ok`, `not-ok`, `impossible`, `unverifiable`) và từng tiêu chí `met`.
+
+```yaml
+evaluator:
+  mode: enforce
+  assumption: "Một evaluator mới, chỉ đọc workspace, phát hiện được việc chưa xong mà lệnh verify bỏ sót."
+  rubric:
+    - "Có test cho trường hợp lỗi mạng"
+  model: haiku
+  timeout_s: 180
+  grounding: enforce      # off | shadow | enforce
+```
+
+- `grounding` khác `off`: mỗi tiêu chí phải kèm `evidence` và `requiredEvidence`. Mỗi mục evidence của tiêu chí báo
+  đạt phải là đường dẫn có thật bên trong workspace, hoặc đúng nguyên văn một lệnh verify đã đạt. `enforce`: tiêu chí
+  báo đạt mà không có evidence, hoặc có mục không kiểm được, bị tính là chưa đạt.
+- `enforce`: lượt `not-ok` chạy tiếp với mỗi tiêu chí chưa đạt một dòng JSON
+  `{"decision":"revise","criterion":"c1","claim":"…","reason":"…","required_evidence":[…]}`, tối đa
+  `verify.max_continuations` vòng mỗi lượt. `impossible` và `unverifiable` chỉ ghi event, không chặn.
+- Event `evaluator`: `evaluator-verdict` (verdict, verdict có hiệu lực sau grounding, từng tiêu chí, chi phí),
+  `evaluator-error` (thiếu `claude`, hết giờ, báo cáo không đọc được; lượt kết thúc như thường), `budget-exhausted`.
+- Tiến trình con chạy với `CODING_AGENT_EVALUATOR_NESTED=1`, nên `stop-gate` trong phiên của nó không chạy lại.
+  Test dùng `CODING_AGENT_EVALUATOR_CLAUDE` để trỏ tới một `claude` giả.
+
+### Giới hạn
+
+- Mặc định cả hai ở `shadow`. Ratchet không chạy cho tới khi bạn đặt `metric`. Evaluator ở `shadow` vẫn gọi một
+  `claude -p` (Haiku) ở mỗi lượt có sửa file và verify đạt: tốn thời gian và quota. Đặt `mode: "off"` nếu không muốn.
+- Restore của ratchet quay cả thay đổi bạn tự sửa tay trong lúc agent đang chạy lượt đó.
+- Ref dưới `refs/coding-agent/ratchet/` không tự dọn: `git for-each-ref refs/coding-agent/ratchet` để xem,
+  `git update-ref -d <ref>` để xoá.
+- Lệnh git của ratchet chạy trực tiếp, không qua sandbox; lệnh metric chạy như lệnh verify.
+- Grounding chỉ kiểm bằng chứng có tồn tại, không kiểm nó chứng minh được tiêu chí.
+- Evaluator thêm lượt chạy tiếp sau khi ratchet đã dừng; các thay đổi đó không được ratchet đo lại trong lượt.
 
 ## Cài vào một dự án
 

@@ -25,6 +25,8 @@ VERIFY_SCOPES = ("root", "changed-repos")
 # auto-decide (FR-001): how long a question to the user waits, and how long Fable may take to decide it.
 AUTO_DECIDE_TIMEOUT_S = (10, 3600)
 FABLE_TIMEOUT_S = (10, 600)
+RATCHET_DIRECTIONS = ("max", "min")
+GROUNDING = ("off", "shadow", "enforce")
 
 
 class ManifestError(ValueError):
@@ -75,6 +77,34 @@ class AutoDecide:
 
 
 @dataclass(frozen=True)
+class Ratchet:
+    """Keep-or-revert loop over verified attempts (Karpathy ratchet). An empty `metric` leaves it inactive in every mode."""
+    mode: str = "off"
+    assumption: str = ""
+    metric: str = ""
+    direction: str = "max"
+    min_delta: float = 0.0
+    no_improve_stop: int = 3
+    max_trials_per_turn: int = 20
+    metric_timeout_s: int = 600
+
+    @property
+    def active(self) -> bool:
+        return self.mode != "off" and self.metric.strip() != ""
+
+
+@dataclass(frozen=True)
+class Evaluator:
+    """One fresh `claude -p` child that judges a verified turn against a rubric, optionally grounding each met criterion."""
+    mode: str = "off"
+    assumption: str = ""
+    rubric: tuple[str, ...] = ()
+    model: str = "haiku"
+    timeout_s: int = 180
+    grounding: str = "off"
+
+
+@dataclass(frozen=True)
 class Manifest:
     path: Path
     verified: bool
@@ -91,6 +121,8 @@ class Manifest:
     verify_scope: str = "root"
     hooks: tuple[Hook, ...] = field(default_factory=tuple)
     auto_decide: AutoDecide = field(default_factory=AutoDecide)
+    ratchet: Ratchet = field(default_factory=Ratchet)
+    evaluator: Evaluator = field(default_factory=Evaluator)
 
     @property
     def root(self) -> Path:
@@ -141,6 +173,74 @@ def auto_decide_from(raw: Any, where: str = "auto_decide") -> AutoDecide:
         timeout_s=_require_range(raw.get("timeout_s", 60), f"{where}.timeout_s", *AUTO_DECIDE_TIMEOUT_S),
         fable=fable,
         fable_timeout_s=_require_range(raw.get("fable_timeout_s", 90), f"{where}.fable_timeout_s", *FABLE_TIMEOUT_S),
+    )
+
+
+def _block_mode(raw: dict[str, Any], where: str) -> tuple[str, str]:
+    """The `mode` and `assumption` of a manifest block, validated like a hook's."""
+    mode = raw.get("mode", DEFAULT_MODE)
+    if mode is False:
+        raise ManifestError(f"{where}.mode is false: quote 'off' in YAML, since an unquoted off parses as false")
+    if mode not in MODES:
+        raise ManifestError(f"{where}.mode must be one of {', '.join(MODES)}")
+    assumption = raw.get("assumption", "")
+    if mode != "off" and not (isinstance(assumption, str) and assumption.strip()):
+        raise ManifestError(f"{where} runs in mode {mode!r} and needs a non-blank assumption")
+    return mode, str(assumption)
+
+
+def ratchet_from(raw: Any) -> Ratchet:
+    """The ratchet settings; a missing block is `off`, a wrong value raises ManifestError."""
+    if raw is None:
+        return Ratchet()
+    if not isinstance(raw, dict):
+        raise ManifestError("ratchet must be a mapping")
+    mode, assumption = _block_mode(raw, "ratchet")
+    metric = raw.get("metric", "")
+    if not isinstance(metric, str):
+        raise ManifestError("ratchet.metric must be a shell command string; empty leaves the ratchet inactive")
+    direction = raw.get("direction", "max")
+    if direction not in RATCHET_DIRECTIONS:
+        raise ManifestError(f"ratchet.direction must be one of {', '.join(RATCHET_DIRECTIONS)}")
+    min_delta = raw.get("min_delta", 0.0)
+    if isinstance(min_delta, bool) or not isinstance(min_delta, (int, float)) or min_delta < 0:
+        raise ManifestError("ratchet.min_delta must be a number >= 0")
+    return Ratchet(
+        mode=mode,
+        assumption=assumption,
+        metric=metric,
+        direction=direction,
+        min_delta=float(min_delta),
+        no_improve_stop=_require_int(raw.get("no_improve_stop", 3), "ratchet.no_improve_stop", 1),
+        max_trials_per_turn=_require_int(raw.get("max_trials_per_turn", 20), "ratchet.max_trials_per_turn", 1),
+        metric_timeout_s=_require_int(raw.get("metric_timeout_s", 600), "ratchet.metric_timeout_s", 1),
+    )
+
+
+def evaluator_from(raw: Any) -> Evaluator:
+    """The evaluator settings; a missing block is `off`, a wrong value raises ManifestError."""
+    if raw is None:
+        return Evaluator()
+    if not isinstance(raw, dict):
+        raise ManifestError("evaluator must be a mapping")
+    mode, assumption = _block_mode(raw, "evaluator")
+    model = raw.get("model", "haiku")
+    if not isinstance(model, str) or not PYTHON_NAME.fullmatch(model):
+        raise ManifestError("evaluator.model must be a model name such as haiku or sonnet: letters, digits, dots, dashes, underscores")
+    grounding = raw.get("grounding", "off")
+    if grounding is False:
+        raise ManifestError("evaluator.grounding is false: quote 'off' in YAML")
+    if grounding not in GROUNDING:
+        raise ManifestError(f"evaluator.grounding must be one of {', '.join(GROUNDING)}")
+    if grounding == "enforce" and mode != "enforce":
+        raise ManifestError("evaluator.grounding enforce needs evaluator.mode enforce")
+    return Evaluator(
+        mode=mode,
+        assumption=assumption,
+        rubric=_str_list(raw.get("rubric", []), "evaluator.rubric"),
+        model=model,
+        timeout_s=_require_int(raw.get("timeout_s", 180), "evaluator.timeout_s", 1),
+        grounding=grounding,
     )
 
 
@@ -274,4 +374,6 @@ def load(path: Path) -> Manifest:
         verify_scope=verify_scope,
         hooks=hooks,
         auto_decide=auto_decide_from(raw.get("auto_decide")),
+        ratchet=ratchet_from(raw.get("ratchet")),
+        evaluator=evaluator_from(raw.get("evaluator")),
     )

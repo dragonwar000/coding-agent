@@ -62,6 +62,35 @@ auto_decide:
   fable: true
   fable_timeout_s: 90
 
+# Ratchet (Graph Engineering §II, vòng autoresearch của Karpathy): trong phiên ghi file (worker, maintainer), mỗi lần
+# Stop có verify đạt là một lần thử. Lần đạt đầu tiên của lượt là baseline; lần sau được giữ khi `metric` tốt hơn điểm
+# tốt nhất quá `min_delta`, còn không thì cây file quay về bản đã giữ. Dừng sau `no_improve_stop` lần liên tiếp không
+# cải thiện hoặc `max_trials_per_turn` lần thử. Snapshot là commit git qua index tạm: không đụng HEAD, nhánh, index của
+# người dùng; mỗi lần thử có ref dưới `refs/coding-agent/ratchet/<session>/`. `metric` rỗng: ratchet không chạy ở mọi mode.
+# Chỉ quay cây file và yêu cầu chạy tiếp khi cả ratchet và stop-gate ở enforce.
+ratchet:
+  mode: shadow
+  assumption: "Số in ở dòng cuối của lệnh metric đo đúng chất lượng của việc; một lần thử có số kém hơn là thay đổi không đáng giữ."
+  metric: ""                  # ví dụ: "python3 scripts/score.py" in một số ở dòng cuối
+  direction: max              # max: số lớn hơn là tốt hơn; min: số nhỏ hơn là tốt hơn
+  min_delta: 0
+  no_improve_stop: 3          # ASSUMPTION: 3 lần liên tiếp không cải thiện là đủ để dừng thử
+  max_trials_per_turn: 20
+  metric_timeout_s: 600
+
+# Evaluator (Graph Engineering §V, §VI.A): sau khi verify (và ratchet) đạt, một tiến trình `claude -p` mới, không thấy
+# hội thoại, chấm lượt theo `rubric` (rỗng thì evaluator tự viết tiêu chí từ yêu cầu), chỉ dùng Read/Grep/Glob.
+# grounding: mỗi tiêu chí báo đạt phải dẫn bằng chứng harness kiểm được (đường dẫn có thật trong workspace, hoặc đúng
+# nguyên văn một lệnh verify đã đạt). enforce: tiêu chí chưa đạt hoặc thiếu bằng chứng làm lượt chạy tiếp, tối đa
+# verify.max_continuations vòng. Chỉ chặn khi cả evaluator và stop-gate ở enforce.
+evaluator:
+  mode: shadow
+  assumption: "Một evaluator mới, không thấy hội thoại và chỉ đọc workspace, phát hiện được việc chưa xong mà lệnh verify bỏ sót."
+  rubric: []
+  model: haiku
+  timeout_s: 180              # ASSUMPTION: 3 phút là đủ để Haiku đọc workspace và trả báo cáo
+  grounding: shadow
+
 # Hook. `mode` có ba giá trị: off (không chạy), shadow (ghi quyết định, không chặn), enforce (được chặn).
 # Mặc định là shadow (FR-010). Mọi hook không off bắt buộc có `assumption`: câu nêu điều hook giả định về model.
 # Chỉ hook đã khai enforce mới được chặn. Hiện orca-guard (FR-009), stop-gate (SC-002) và coordinator-guard (bắt buộc chia việc theo graph) ở enforce.

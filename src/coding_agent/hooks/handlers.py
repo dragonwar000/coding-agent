@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from coding_agent import autodecide, coordinator, events, orca, state, transcript
+from coding_agent import autodecide, coordinator, evaluator, events, orca, ratchet, state, transcript
 from coding_agent.hooks import Context, HookResult
 from coding_agent.manifest import Loop
 from coding_agent.memory import record, zeromem
@@ -126,7 +126,9 @@ def prompt_reset(ctx: Context) -> HookResult:
     if prompt:
         prompts.append({"ts": int(time.time()), "text": prompt[:4000]})
     data = state.expire_prompts({**data, "prompts": prompts[-20:]})
-    data.update({"sig_counts": {}, "calls_this_turn": 0, "continuations": 0})
+    data.update({"sig_counts": {}, "calls_this_turn": 0, "continuations": 0, "evaluator_rounds": 0})
+    # A new turn starts a new ratchet; the trial counter survives so every attempt keeps its own ref.
+    data["ratchet"] = {"seq": int((data.get("ratchet") or {}).get("seq", 0))}
     # Taken for every role: stop-gate compares against it to tell a turn that changed nothing.
     data["dirty_at_prompt"] = coordinator.dirty_paths(ctx.root)
     data["tree_at_prompt"] = coordinator.tree_fingerprint(ctx.root)
@@ -228,6 +230,9 @@ def _verify_turn(ctx: Context, turn: transcript.Turn) -> list[dict[str, Any]]:
 
 def stop_gate(ctx: Context) -> HookResult:
     """Verify at the end of a turn; in enforce mode a failing turn continues up to the budget; record the turn to memory."""
+    if os.environ.get(evaluator.NESTED_ENV):
+        # The evaluator's own child session: judging it would start another evaluator.
+        return HookResult()
     if ctx.manifest is None:
         ctx.note(guard="stop-gate", kind="no-manifest", applied=False)
         return HookResult()
@@ -258,11 +263,15 @@ def stop_gate(ctx: Context) -> HookResult:
             return HookResult(code=2, stderr=reason)
         kind = "budget-exhausted" if ctx.mode == "enforce" else "not-ok"
         ctx.note(guard="stop-gate", kind=kind, applied=False, detail={"command": failing["command"], "continuations": continuations})
+        _ratchet_give_up(ctx, data)
     else:
         if continuations:
             data["continuations"] = 0
             state.save(ctx.root, ctx.session, data)
         ctx.note(guard="stop-gate", kind=verdict, applied=False, detail={"commands": len(checks)})
+        follow = _after_verify(ctx, turn, data, verdict, checks, bool(path))
+        if follow is not None:
+            return follow
 
     if manifest.loop.max_denials_per_turn and turn.denials >= manifest.loop.max_denials_per_turn:
         ctx.note(guard="stop-gate", kind="denial-budget", applied=False, detail={"denials": turn.denials, "budget": manifest.loop.max_denials_per_turn})
@@ -270,6 +279,90 @@ def stop_gate(ctx: Context) -> HookResult:
     _note_direct_changes(ctx, data)
     _remember(ctx, turn, verdict, lines)
     return result
+
+
+def _writes_here(ctx: Context) -> bool:
+    """Whether this session changes files itself: a worker, a maintainer, or a coordinator the graph rule does not bind."""
+    guard = ctx.manifest.hook("coordinator-guard") if ctx.manifest is not None else None
+    return coordinator.role_for(_cwd(ctx)) != "coordinator" or guard is None or guard.mode != "enforce"
+
+
+def _after_verify(ctx: Context, turn: transcript.Turn, data: dict[str, Any], verdict: str,
+                  checks: list[dict[str, Any]], has_transcript: bool) -> HookResult | None:
+    """Run the ratchet, then the evaluator, on a turn whose verification passed. A result continues the turn."""
+    manifest = ctx.manifest
+    assert manifest is not None
+    if verdict == "no-change" or (verdict == "skipped" and not _turn_changed(ctx, turn, data, has_transcript)):
+        return None
+    if not _writes_here(ctx):
+        return None
+    stop_enforce = ctx.mode == "enforce"
+    config = manifest.ratchet
+    if config.active:
+        rs = data.setdefault("ratchet", {})
+        apply = stop_enforce and config.mode == "enforce"
+        outcomes = ratchet.step(ctx.root, ctx.session, rs, config, apply=apply)
+        state.save(ctx.root, ctx.session, data)
+        for outcome in outcomes:
+            applied = apply and (outcome.steer is not None or outcome.decision in ("reverted", "crash"))
+            events.record(ctx.root, guard="ratchet", kind=outcome.decision, mode=config.mode, applied=applied,
+                          session=ctx.session, detail=outcome.detail)
+        if outcomes and outcomes[-1].steer is not None:
+            return HookResult(code=2, stderr=outcomes[-1].steer)
+    return _evaluate(ctx, turn, data, checks, stop_enforce)
+
+
+def _evaluate(ctx: Context, turn: transcript.Turn, data: dict[str, Any], checks: list[dict[str, Any]], stop_enforce: bool) -> HookResult | None:
+    """One fresh evaluator child; in enforce, an unmet or ungrounded criterion continues the turn up to max_continuations."""
+    manifest = ctx.manifest
+    assert manifest is not None
+    config = manifest.evaluator
+    if config.mode == "off":
+        return None
+    rounds = int(data.get("evaluator_rounds", 0))
+    enforce = stop_enforce and config.mode == "enforce"
+    if enforce and rounds >= manifest.max_continuations:
+        events.record(ctx.root, guard="evaluator", kind="budget-exhausted", mode=config.mode, applied=False,
+                      session=ctx.session, detail={"rounds": rounds})
+        return None
+    passed = [str(check["command"]) for check in checks if check.get("exit") == 0]
+    prompts = [p for p in (data.get("prompts") or []) if isinstance(p, dict) and p.get("text")]
+    request = str(prompts[-1]["text"]) if prompts else turn.prompt
+    judgement = evaluator.judge(config, ctx.root, request, passed)
+    if judgement.report is None:
+        events.record(ctx.root, guard="evaluator", kind="evaluator-error", mode=config.mode, applied=False,
+                      session=ctx.session, detail={"error": judgement.error, "cost_usd": judgement.cost_usd})
+        return None
+    report = judgement.report
+    blocking = evaluator.unmet(report, grounding_enforced=config.grounding == "enforce")
+    effective = "not-ok" if report.verdict == "not-ok" or (report.verdict == "ok" and blocking) else report.verdict
+    apply = enforce and effective == "not-ok"
+    events.record(ctx.root, guard="evaluator", kind="evaluator-verdict", mode=config.mode, applied=apply, session=ctx.session,
+                  detail={"verdict": report.verdict, "effective": effective, "reason": report.reason, "grounding": config.grounding,
+                          "criteria": evaluator.summary(report), "round": rounds + 1, "cost_usd": judgement.cost_usd})
+    if not apply:
+        return None
+    data["evaluator_rounds"] = rounds + 1
+    state.save(ctx.root, ctx.session, data)
+    return HookResult(code=2, stderr=evaluator.steer(report, blocking, rounds + 1, manifest.max_continuations))
+
+
+def _ratchet_give_up(ctx: Context, data: dict[str, Any]) -> None:
+    """A turn that ends with verification still red goes back to the ratchet's best kept state, in enforce."""
+    manifest = ctx.manifest
+    rs = data.get("ratchet") or {}
+    if manifest is None or not manifest.ratchet.active or manifest.ratchet.mode != "enforce" or ctx.mode != "enforce" or rs.get("stopped"):
+        return
+    if rs.get("kept_tree") is None or not _writes_here(ctx):
+        return
+    try:
+        restored = ratchet.restore_kept(ctx.root, rs)
+    except ratchet.GitError as error:
+        events.record(ctx.root, guard="ratchet", kind="unavailable", mode="enforce", applied=False, session=ctx.session, detail={"reason": str(error)[:400]})
+        return
+    state.save(ctx.root, ctx.session, data)
+    events.record(ctx.root, guard="ratchet", kind="reverted", mode="enforce", applied=restored, session=ctx.session,
+                  detail={"reason": "verify-failed", "best": rs.get("best"), "commit": rs.get("kept_commit")})
 
 
 def _note_direct_changes(ctx: Context, data: dict[str, Any]) -> None:
