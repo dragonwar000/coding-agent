@@ -170,8 +170,10 @@ evaluator:
 
 ### Giới hạn
 
-- Mặc định cả hai ở `shadow`. Ratchet không chạy cho tới khi bạn đặt `metric`. Evaluator ở `shadow` vẫn gọi một
-  `claude -p` (Haiku) ở mỗi lượt có sửa file và verify đạt: tốn thời gian và quota. Đặt `mode: "off"` nếu không muốn.
+- Ratchet mặc định `shadow` nhưng không chạy cho tới khi bạn đặt `metric`. Evaluator mặc định `"off"`: khi bật (kể cả
+  `shadow`) nó gọi một `claude -p` (Haiku) ở mỗi lượt có sửa file và verify đạt, tốn thời gian và quota.
+- `stop-gate` khai `timeout_s: 900` vì Claude Code giết hook sau 60 giây theo mặc định; verify, metric và evaluator cùng
+  chạy trong hook đó. Tăng `metric_timeout_s` hay `evaluator.timeout_s` thì tăng `timeout_s` của `stop-gate` theo.
 - Restore của ratchet quay cả thay đổi bạn tự sửa tay trong lúc agent đang chạy lượt đó.
 - Ref dưới `refs/coding-agent/ratchet/` không tự dọn: `git for-each-ref refs/coding-agent/ratchet` để xem,
   `git update-ref -d <ref>` để xoá.

@@ -84,7 +84,8 @@ ratchet:
 # nguyên văn một lệnh verify đã đạt). enforce: tiêu chí chưa đạt hoặc thiếu bằng chứng làm lượt chạy tiếp, tối đa
 # verify.max_continuations vòng. Chỉ chặn khi cả evaluator và stop-gate ở enforce.
 evaluator:
-  mode: shadow
+  # "off" mặc định: mỗi lượt worker có sửa file sẽ gọi một `claude -p` (tốn quota và thời gian). Bật shadow/enforce khi muốn dùng.
+  mode: "off"
   assumption: "Một evaluator mới, không thấy hội thoại và chỉ đọc workspace, phát hiện được việc chưa xong mà lệnh verify bỏ sót."
   rubric: []
   model: haiku
@@ -115,6 +116,7 @@ hooks:
   - id: stop-gate
     host: [claude_code]
     event: Stop
+    timeout_s: 900              # verify + metric (tối đa metric_timeout_s) + evaluator (tối đa timeout_s); mặc định của Claude Code là 60 giây
     mode: enforce
     assumption: "Lệnh verify là bằng chứng đủ để một lượt được coi là xong; câu trả lời của model thì không."
   - id: pre-compact
