@@ -311,3 +311,38 @@ def test_worker_adopt_links_the_install_into_an_outside_worktree(parent, tmp_pat
     out = capsys.readouterr().out
     assert "worker-adopt: linked harness, integration.yaml" in out
     assert (wt / ".claude" / "settings.json").is_symlink() and coordinator.role_for(wt) == "worker"
+
+
+def test_a_worker_gets_a_coordinator_install_whose_package_is_a_live_link(parent, tmp_path):
+    # The coordinator installed with `--link`: its package is a symlink to a live checkout, not a copy.
+    live = tmp_path / "live" / "src" / "coding_agent"
+    live.mkdir(parents=True)
+    (live / "__init__.py").write_text("# live checkout\n", encoding="utf-8")
+    package = parent / "harness" / "coding-agent" / "src" / "coding_agent"
+    shutil.rmtree(package)
+    os.symlink(live, package, target_is_directory=True)
+    wt = add_worktree(parent, tmp_path)
+    results = {item["path"]: item["action"] for item in worktree_links.link_install(parent, wt)}
+    assert results["harness"] == "symlink"
+    worker_package = wt / "harness" / "coding-agent" / "src" / "coding_agent"
+    assert worker_package.resolve() == live.resolve()
+    assert (worker_package / "__init__.py").read_text(encoding="utf-8") == "# live checkout\n"
+    (live / "probe.py").write_text("edited\n", encoding="utf-8")
+    assert (worker_package / "probe.py").read_text(encoding="utf-8") == "edited\n"
+    worktree_links.unlink_install(wt)
+    assert not os.path.lexists(wt / "harness")
+    assert package.is_symlink() and sorted(p.name for p in live.iterdir()) == ["__init__.py", "probe.py"]
+
+
+def test_a_worker_linked_straight_to_a_package_symlink_reaches_the_live_checkout(tmp_path):
+    # When the linked path is itself the package symlink, the worker's link points at its resolved target.
+    live = tmp_path / "live" / "coding_agent"
+    live.mkdir(parents=True)
+    (live / "__init__.py").write_text("# live\n", encoding="utf-8")
+    via = tmp_path / "coordinator_package"
+    os.symlink(live, via, target_is_directory=True)
+    worker = tmp_path / "worker_package"
+    assert worktree_links._make_link(via.resolve(), worker) == "symlink"
+    assert worker.resolve() == live.resolve() and (worker / "__init__.py").is_file()
+    worktree_links.remove_link(worker)
+    assert not os.path.lexists(worker) and (live / "__init__.py").is_file() and via.is_symlink()

@@ -3,6 +3,7 @@
 #
 #   bash install.sh <project_root> [--vendor claude,codex] [--python-src harness/coding-agent/src]
 #                   [--verify "python3 -m pytest -q"] [--no-verify] [--no-ci] [--clean]
+#                   [--link <src-dir>]   # live link: package = symlink tới <src-dir>/coding_agent, không copy
 #   bash install.sh <project_root> --uninstall [--keep-core]
 #
 # Idempotent. Mọi việc thực hiện bởi `python3 -m coding_agent.project_install` (xem docstring của module).

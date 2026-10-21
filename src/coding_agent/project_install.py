@@ -6,20 +6,28 @@
 2. Detects the host vendors (`.claude/` → Claude Code, `.codex/` or `AGENTS.md` → Codex; default Claude Code),
    or takes `--vendor claude,codex`.
 3. Copies this package to `DIR/<python_src>/coding_agent`. An existing copy is replaced only when it still
-   carries the harness marker (FR-004), and a backup is kept.
+   carries the harness marker (FR-004), and a backup is kept. With `--link SRC` (live link mode) the package is not
+   copied: `DIR/<python_src>/coding_agent` becomes a link to `SRC/coding_agent`, so edits to that checkout (or a merge
+   to its branch) reach the project with no reinstall. The link is a symlink, a junction on Windows without the
+   symlink privilege, else a copy; the report names which, and a copy gets no live updates. An existing link is
+   repointed, never followed. Installing again without `--link` keeps an existing link (it is not silently replaced by
+   a copy); `--clean` removes it first and installs a copy.
 4. Writes `integration.yaml` only when the project has none. An existing manifest is never overwritten.
 5. Merges the harness hooks into the host files (`.claude/settings.json`, `.codex/hooks.json`), keeping the
    user's own hooks and settings, with a `.bak` of each file it changes.
 6. Writes a CI gate at `.github/workflows/coding-agent.yml` when none exists.
 7. Verifies the wiring: the gate, and the hook commands from the host file run against sample payloads.
 
-`--uninstall` reverses 2 to 6 and keeps `integration.yaml` (the user's own file). `--clean` uninstalls, then installs.
+`--uninstall` reverses 2 to 6 and keeps `integration.yaml` (the user's own file). A linked package is removed as a
+link: the checkout it points to is never touched (`--keep-core` keeps the link). `--clean` uninstalls, then installs.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +37,7 @@ import coding_agent
 from coding_agent import gate, gen
 from coding_agent import install as safe_install
 from coding_agent.manifest import ManifestError, load
+from coding_agent.worktree_links import _make_link, is_link, remove_link
 
 PACKAGE = Path(coding_agent.__file__).resolve().parent
 TEMPLATE = PACKAGE / "template.yaml"
@@ -300,12 +309,62 @@ def _ignore_state(project: Path, report: list[str]) -> None:
         report.append("gitignore: added .coding-agent/")
 
 
-def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str | None = None, vendors: str | None = None, run_verify: bool = True, ci: bool = True, add_new_hooks: bool = False, python: str | None = None) -> list[str]:
-    """Install into `project` and return one report line per step. Raises InstallError or NotOwned."""
+def link_source(src_dir: Path | str) -> Path:
+    """The absolute `coding_agent` package directory inside `src_dir`. Raises InstallError when it is not a package."""
+    src = Path(os.path.abspath(Path(src_dir).expanduser()))
+    package = src / "coding_agent"
+    if not (package / "__init__.py").is_file():
+        raise InstallError(f"--link {src}: no coding_agent/__init__.py there; pass the directory that contains coding_agent/ (e.g. <checkout>/src)")
+    return package
+
+
+def place_package(target: Path, rel: str, backups: Path, link: Path | None) -> list[str]:
+    """Step 3: put the package at `target`, as a copy of this package or, with `link`, as a link to it. Returns report lines.
+
+    A copy replaces only an owned copy (backup kept). An existing link is repointed with `link`, and kept as it is
+    without it; it is removed as a link, never followed.
+    """
+    if is_link(target):
+        if link is None:
+            pointed = os.path.realpath(target)
+            note = "" if target.exists() else " (its target is missing: pass --link SRC to repoint it)"
+            return [f"package: kept link {rel} -> {pointed}{note}; install without --link keeps a link, --clean replaces it with a copy"]
+        remove_link(target)
+        kind = _make_link(link, target)
+        return [_link_line(rel, link, kind, "repointed")]
+    if link is None:
+        kept = safe_install.safe_replace(target, PACKAGE, backup_root=backups)
+        return [f"package: {rel}" + (f" (previous copy kept at {kept})" if kept else "")]
+    if target.exists() and target.resolve() == link.resolve():
+        raise InstallError(f"--link points at {rel} itself; link from a different checkout")
+    safe_install._require_owned(target)
+    kept = safe_install.backup(target, backups) if target.exists() else None
+    if kept is not None:
+        shutil.rmtree(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    kind = _make_link(link, target)
+    if kind == "copy":
+        safe_install.mark_owned(target)
+    return [_link_line(rel, link, kind, "linked") + (f" (previous copy kept at {kept})" if kept else "")]
+
+
+def _link_line(rel: str, link: Path, kind: str, verb: str) -> str:
+    if kind == "copy":
+        return (f"package: {rel} could not be linked and was COPIED from {link} instead; live updates do NOT apply, "
+                "reinstall to pick up changes (on Windows, enable Developer Mode for symlinks)")
+    return f"package: {verb} {rel} -> {link} ({kind}); edits to that checkout reach this project with no reinstall"
+
+
+def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str | None = None, vendors: str | None = None, run_verify: bool = True, ci: bool = True, add_new_hooks: bool = False, python: str | None = None, link: Path | str | None = None) -> list[str]:
+    """Install into `project` and return one report line per step. Raises InstallError or NotOwned.
+
+    `link` is a directory that contains `coding_agent/`: the package is then linked to it instead of copied.
+    """
     if not project.is_dir():
         raise InstallError(f"{project} is not a directory")
     if python_src.startswith("/") or ".." in Path(python_src).parts:
         raise InstallError("python_src must be a relative path inside the project")
+    link_package = link_source(link) if link is not None else None
     report: list[str] = []
     ensure_pyyaml(report)
     hosts = detect_hosts(project, vendors)
@@ -313,8 +372,8 @@ def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str 
 
     backups = project / ".coding-agent" / "backups"
     backups.mkdir(parents=True, exist_ok=True)
-    kept = safe_install.safe_replace(project / python_src / "coding_agent", PACKAGE, backup_root=backups)
-    report.append(f"package: {python_src}/coding_agent" + (f" (previous copy kept at {kept})" if kept else ""))
+    package_path = project / python_src / "coding_agent"
+    report.extend(place_package(package_path, f"{python_src}/coding_agent", backups, link_package))
 
     manifest_path = project / "integration.yaml"
     if manifest_path.exists():
@@ -339,7 +398,10 @@ def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str 
         report.append(f"hooks: merged {path.relative_to(project)} (previous file kept as .bak)")
     record = project / ".coding-agent" / "installed.json"
     record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text(json.dumps({"hosts": hosts, "python_src": python_src}, indent=2) + "\n", encoding="utf-8")
+    installed: dict[str, Any] = {"hosts": hosts, "python_src": python_src}
+    if is_link(package_path):
+        installed["link"] = os.path.realpath(package_path)
+    record.write_text(json.dumps(installed, indent=2) + "\n", encoding="utf-8")
     _ignore_state(project, report)
 
     if ci:
@@ -403,7 +465,15 @@ def uninstall(project: Path, *, keep_core: bool = False, purge: bool = False, re
             pass
         record.unlink()
     package = project / python_src / "coding_agent"
-    if not keep_core and package.exists():
+    if is_link(package):
+        if keep_core:
+            report.append(f"package: kept link {python_src}/coding_agent (--keep-core)")
+        else:
+            pointed = os.path.realpath(package)
+            remove_link(package)
+            report.append(f"package: removed link {python_src}/coding_agent (its target {pointed} is left as it was)")
+            _remove_empty_parents(package, project)
+    elif not keep_core and package.exists():
         backups = project / ".coding-agent" / "backups"
         backups.mkdir(parents=True, exist_ok=True)
         try:
@@ -448,13 +518,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--python", help="interpreter command the hooks call, written to a new manifest (default: python3 where it exists, else python)")
     parser.add_argument("--no-verify", action="store_true", help="skip the wiring check after install")
     parser.add_argument("--no-ci", action="store_true", help="do not write the CI gate")
-    parser.add_argument("--clean", action="store_true", help="uninstall first, then install")
+    parser.add_argument("--link", type=Path, metavar="SRC", help="live link mode: link the package to SRC/coding_agent (SRC = a checkout's src/) instead of copying it")
+    parser.add_argument("--clean", action="store_true", help="uninstall first, then install (also replaces an existing link with a copy unless --link is given)")
     parser.add_argument("--add-new-hooks", action="store_true", help="append hooks this version ships that an existing manifest lacks")
-    parser.add_argument("--uninstall", action="store_true", help="remove the harness wiring and the package copy")
-    parser.add_argument("--keep-core", action="store_true", help="with --uninstall: keep the package copy")
+    parser.add_argument("--uninstall", action="store_true", help="remove the harness wiring and the package copy (a link is removed as a link)")
+    parser.add_argument("--keep-core", action="store_true", help="with --uninstall: keep the package copy or link")
     parser.add_argument("--purge", action="store_true", help="with --uninstall: also delete the .bak files and .coding-agent/")
     parser.add_argument("--remove-manifest", action="store_true", help="with --uninstall: also delete integration.yaml")
     args = parser.parse_args(argv)
+    if args.uninstall and args.link is not None:
+        parser.error("--link is an install option; --uninstall removes a link without it")
     project = args.project.resolve()
     try:
         if args.uninstall:
@@ -463,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
             lines = []
             if args.clean:
                 lines.extend(uninstall(project))
-            lines.extend(install(project, python_src=args.python_src, verify=args.verify, vendors=args.vendor, run_verify=not args.no_verify, ci=not args.no_ci, add_new_hooks=args.add_new_hooks, python=args.python))
+            lines.extend(install(project, python_src=args.python_src, verify=args.verify, vendors=args.vendor, run_verify=not args.no_verify, ci=not args.no_ci, add_new_hooks=args.add_new_hooks, python=args.python, link=args.link))
     except (InstallError, safe_install.NotOwned, gen.GenError, OSError) as error:
         print(f"project-install: {error}", file=sys.stderr)
         return 2

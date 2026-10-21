@@ -68,6 +68,21 @@ def _is_junction(path: Path) -> bool:
     return bool(check and check(path))
 
 
+def is_link(path: Path) -> bool:
+    """True when `path` is a symlink or a Windows junction, dangling or not."""
+    return path.is_symlink() or _is_junction(path)
+
+
+def remove_link(path: Path) -> None:
+    """Remove the symlink or junction at `path` itself; what it points to is never entered."""
+    if _is_junction(path):
+        os.rmdir(path)  # removes the junction itself, not the directory it points to
+    elif path.is_symlink():
+        (os.rmdir if sys.platform == "win32" and path.is_dir() else os.unlink)(path)
+    else:
+        raise OSError(f"{path} is not a link")
+
+
 def _make_link(source: Path, target: Path) -> str:
     """Link `target` to `source`; returns the kind made: `symlink`, `junction` or `copy`."""
     try:
@@ -173,10 +188,8 @@ def unlink_install(worktree: Path) -> list[str]:
         target = worktree / item["path"]
         kind = item.get("kind")
         try:
-            if kind == "symlink" and target.is_symlink():
-                (os.rmdir if sys.platform == "win32" and target.is_dir() else os.unlink)(target)
-            elif kind == "junction" and _is_junction(target):
-                os.rmdir(target)  # removes the junction itself, not the directory it points to
+            if (kind == "symlink" and target.is_symlink()) or (kind == "junction" and _is_junction(target)):
+                remove_link(target)
             elif kind == "copy" and _lexists(target) and not target.is_symlink() and not _is_junction(target):
                 shutil.rmtree(target) if target.is_dir() else target.unlink()
             else:

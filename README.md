@@ -205,7 +205,31 @@ bash install.sh <dự án>                           # cài: dò vendor, merge h
 bash install.sh <dự án> --vendor claude           # ép vendor (claude, codex, hoặc claude,codex)
 bash install.sh <dự án> --uninstall [--keep-core] # gỡ: hook của coding-agent, CI, bản copy package
 bash install.sh <dự án> --clean                   # gỡ rồi cài lại
+bash install.sh <dự án> --link <checkout>/src      # live link: package là symlink tới checkout, không copy
 ```
+
+### Live link mode
+
+Dự án có thể chạy coding-agent thẳng từ một checkout sống thay vì một bản copy: sửa coding-agent (hoặc merge vào
+`main` rồi `git pull` trong checkout đó) là dự án dùng ngay, không cần cài lại.
+
+```sh
+bash install.sh <dự án> --link ~/Documents/Development/coding-agent-live/src
+```
+
+- `<src-dir>` là thư mục chứa `coding_agent/` (thường là `<checkout>/src`). Installer đổi sang đường dẫn tuyệt đối và
+  dừng ngay (không đổi gì) nếu thiếu `<src-dir>/coding_agent/__init__.py`.
+- Bước 3 không chép package: `harness/coding-agent/src/coding_agent` thành symlink tới `<src-dir>/coding_agent`
+  (Windows không có quyền symlink: junction; không được nữa: copy). Báo cáo ghi rõ loại đã tạo. Nếu phải **copy** thì
+  báo cáo ghi `COPIED ... live updates do NOT apply`: khi đó phải cài lại mới nhận thay đổi (bật Developer Mode để có symlink).
+- Bản copy cũ chỉ bị thay khi còn dấu harness (giữ backup ở `.coding-agent/backups/`). Link cũ thì được trỏ lại; link
+  không bao giờ bị đi theo khi xoá.
+- Cài lại **không** có `--link` trên dự án đã link: link được **giữ nguyên** (không lặng lẽ đổi thành copy). Muốn quay
+  về bản copy: `bash install.sh <dự án> --clean`.
+- `--uninstall` xoá link như một link, checkout sống không bị đụng; `--uninstall --keep-core` giữ link.
+- Verify (chạy hook với payload mẫu) chạy qua link. Worker worktree nhận `harness/` của coordinator như thường, và
+  package trong đó vẫn trỏ về checkout sống.
+- Checkout sống nên nằm ở nhánh ổn định (`main`): mọi phiên của dự án chạy đúng code đang có trong đó.
 
 Gỡ khỏi dự án:
 

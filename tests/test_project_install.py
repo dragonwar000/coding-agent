@@ -1,6 +1,7 @@
 """Installing into a project like the setup harness (FR-001, FR-004): one command, detected vendors, merged wiring, verify, uninstall."""
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -288,3 +289,122 @@ def test_uninstalling_where_nothing_is_installed_says_so(tmp_path: Path):
     assert project_install.uninstall(project) == ["nothing to remove: coding-agent is not installed here"]
     with pytest.raises(project_install.InstallError, match="not a directory"):
         project_install.uninstall(tmp_path / "nowhere")
+
+
+# --- live link mode (--link) ---------------------------------------------------------------------------------------
+
+PACKAGE_REL = Path("harness") / "coding-agent" / "src" / "coding_agent"
+
+
+def live_checkout(tmp_path: Path, name: str = "live") -> Path:
+    """A checkout's `src/` holding a copy of this package, as `--link` expects."""
+    src = tmp_path / name / "src"
+    shutil.copytree(ROOT / "src" / "coding_agent", src / "coding_agent", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    return src
+
+
+def test_link_makes_the_package_a_symlink_and_verify_runs_through_it(tmp_path: Path):
+    project = git_project(tmp_path)
+    src = live_checkout(tmp_path)
+    report = project_install.install(project, link=src)
+    package = project / PACKAGE_REL
+    assert package.is_symlink() and package.resolve() == (src / "coding_agent").resolve()
+    assert any(line.startswith("package: linked harness/coding-agent/src/coding_agent ->") and "(symlink)" in line for line in report)
+    assert "verify: orca-guard (enforce) answered exit 2 to an invalid status" in report
+    assert not (src / "coding_agent" / install.MARKER).exists()  # the live checkout gets no harness marker
+    assert json.loads((project / ".coding-agent" / "installed.json").read_text(encoding="utf-8"))["link"] == str((src / "coding_agent").resolve())
+    # An edit in the live checkout reaches the project with no reinstall.
+    (src / "coding_agent" / "live_probe.py").write_text("VALUE = 1\n", encoding="utf-8")
+    assert (package / "live_probe.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_link_to_a_directory_without_the_package_fails_before_any_change(tmp_path: Path, capsys):
+    project = git_project(tmp_path)
+    (tmp_path / "empty" / "coding_agent").mkdir(parents=True)
+    with pytest.raises(project_install.InstallError, match="no coding_agent/__init__.py"):
+        project_install.install(project, link=tmp_path / "empty")
+    assert not (project / "harness").exists() and not (project / "integration.yaml").exists()
+    assert project_install.main(["--project", str(project), "--link", str(tmp_path / "nowhere")]) == 2
+    assert "no coding_agent/__init__.py" in capsys.readouterr().err
+
+
+def test_link_replaces_an_owned_copy_with_a_backup_and_refuses_an_unowned_one(tmp_path: Path):
+    project = git_project(tmp_path)
+    project_install.install(project, run_verify=False)
+    report = project_install.install(project, link=live_checkout(tmp_path), run_verify=False)
+    assert (project / PACKAGE_REL).is_symlink()
+    assert any("previous copy kept at" in line for line in report)
+
+    (tmp_path / "other").mkdir()
+    other = git_project(tmp_path / "other")
+    mine = other / PACKAGE_REL / "mine.py"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("keep me", encoding="utf-8")
+    with pytest.raises(install.NotOwned):
+        project_install.install(other, link=tmp_path / "live" / "src", run_verify=False)
+    assert mine.read_text(encoding="utf-8") == "keep me" and not mine.parent.is_symlink()
+
+
+def test_relink_repoints_the_link_and_leaves_the_old_target_intact(tmp_path: Path):
+    project = git_project(tmp_path)
+    first, second = live_checkout(tmp_path, "one"), live_checkout(tmp_path, "two")
+    project_install.install(project, link=first, run_verify=False)
+    report = project_install.install(project, link=second, run_verify=False)
+    assert (project / PACKAGE_REL).resolve() == (second / "coding_agent").resolve()
+    assert any(line.startswith("package: repointed") for line in report)
+    assert (first / "coding_agent" / "gate.py").is_file()
+
+
+def test_uninstall_removes_the_link_and_never_the_target(tmp_path: Path):
+    project = git_project(tmp_path)
+    src = live_checkout(tmp_path)
+    before = sorted(p.relative_to(src).as_posix() for p in src.rglob("*"))
+    project_install.install(project, link=src, run_verify=False)
+    report = project_install.uninstall(project, keep_core=True)
+    assert (project / PACKAGE_REL).is_symlink() and "package: kept link harness/coding-agent/src/coding_agent (--keep-core)" in report
+    project_install.install(project, link=src, run_verify=False)
+    report = project_install.uninstall(project)
+    assert not os.path.lexists(project / PACKAGE_REL) and not (project / "harness").exists()
+    assert any(line.startswith("package: removed link") for line in report)
+    assert sorted(p.relative_to(src).as_posix() for p in src.rglob("*")) == before
+
+
+def test_reinstall_without_link_keeps_the_link_and_clean_replaces_it_with_a_copy(tmp_path: Path, capsys):
+    project = git_project(tmp_path)
+    src = live_checkout(tmp_path)
+    project_install.install(project, link=src, run_verify=False)
+    report = project_install.install(project, run_verify=False)
+    assert (project / PACKAGE_REL).is_symlink()
+    assert any(line.startswith("package: kept link") and "--clean replaces it with a copy" in line for line in report)
+    assert project_install.main(["--project", str(project), "--no-verify", "--clean"]) == 0
+    assert not (project / PACKAGE_REL).is_symlink() and install.is_owned_intact(project / PACKAGE_REL)
+    assert (src / "coding_agent" / "gate.py").is_file()
+    capsys.readouterr()
+
+
+def test_link_into_the_package_itself_is_refused(tmp_path: Path):
+    src = live_checkout(tmp_path)
+    project = src.parent
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    with pytest.raises(project_install.InstallError, match="itself"):
+        project_install.install(project, python_src="src", link=src, run_verify=False)
+    assert (src / "coding_agent").is_dir() and not (src / "coding_agent").is_symlink()
+
+
+def test_link_with_uninstall_is_a_usage_error(tmp_path: Path):
+    with pytest.raises(SystemExit):
+        project_install.main(["--project", str(tmp_path), "--uninstall", "--link", str(tmp_path)])
+
+
+def test_a_link_that_falls_back_to_a_copy_says_live_updates_do_not_apply(tmp_path: Path, monkeypatch):
+    # Windows with neither symlink privilege nor junction support: `_make_link` copies.
+    def copy_link(source: Path, target: Path) -> str:
+        shutil.copytree(source, target, symlinks=True)
+        return "copy"
+
+    monkeypatch.setattr(project_install, "_make_link", copy_link)
+    project = git_project(tmp_path)
+    src = live_checkout(tmp_path)
+    report = project_install.install(project, link=src, run_verify=False)
+    assert any("COPIED" in line and "live updates do NOT apply" in line for line in report)
+    assert install.is_owned_intact(project / PACKAGE_REL) and not (src / "coding_agent" / install.MARKER).exists()
