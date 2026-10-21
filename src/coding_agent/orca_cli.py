@@ -466,10 +466,14 @@ def workers_ledger(root: Path) -> Path:
 
 
 def worker_records(root: Path) -> list[dict[str, str]]:
-    """The worker worktrees still in place: `{worktree, task_id, dispatch, base, repo}`, in the order they were started.
+    """The worker worktrees still in place: `{worktree, task_id, dispatch, base, repo, base_branch, head}`, in the order
+    they were started.
 
-    `repo` is the repository the worktree belongs to, or an empty string in a record written before it was kept.
-    A later `removed` line for a worktree drops its earlier record.
+    `base` is the commit the worktree started from. `repo` is the repository the worktree belongs to, `base_branch` the
+    full ref of the branch the worker was started from (`refs/heads/develop`, given as `--base-branch` or a plan
+    node's `base:`), and `head` the worker's last commit the cleanup saw (`record_head`); each is an empty string when
+    unknown or in a record written before it was kept. A later line for a worktree replaces its earlier record, and a
+    later `removed` line drops it.
     """
     path = workers_ledger(root)
     if not path.exists():
@@ -486,7 +490,8 @@ def worker_records(root: Path) -> list[dict[str, str]]:
             live.pop(record["worktree"], None)
         else:
             live[record["worktree"]] = {"worktree": record["worktree"], "task_id": str(record.get("task_id") or ""), "dispatch": str(record.get("dispatch") or ""),
-                                        "base": str(record.get("base") or ""), "repo": str(record.get("repo") or "")}
+                                        "base": str(record.get("base") or ""), "repo": str(record.get("repo") or ""),
+                                        "base_branch": str(record.get("base_branch") or ""), "head": str(record.get("head") or "")}
     return list(live.values())
 
 
@@ -538,10 +543,13 @@ def remove_worktree(path: str, *, force: bool = False) -> None:
     _call_tool("worktree", "rm", "--worktree", f"path:{path}", *(["--force"] if force else []))
 
 
-def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str) -> None:
+def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str, base_ref: str | None = None) -> None:
     """Add a worker worktree to the ledger, with the commit it starts from.
 
     The start commit is what later tells the worker's own commits apart from the difference between branches.
+    `base_ref` is the ref the worker was started from (`--base-branch`, a plan node's `base:`); when it names a branch,
+    its full ref is kept as `base_branch`, because the coordinator merges such a worker into that branch rather than
+    into its own (`cleanup._unmerged`). A commit id, or no `base_ref`, records no branch.
     A worktree of another repository than `root` (a child repository of a folder project) is recorded twice: in that
     repository's ledger, which is what makes a session in the worktree a worker, and in the root's, which is what the
     coordinator's board and cleanup read.
@@ -550,8 +558,39 @@ def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str) -> 
     repo = _repo_path(resolved) if resolved.is_dir() else None
     record = {"worktree": str(resolved), "task_id": task_id, "dispatch": dispatch, "base": _head(resolved) if resolved.is_dir() else None,
               "repo": str(repo) if repo is not None else None}
+    branch = branch_ref(resolved, base_ref) if base_ref and resolved.is_dir() else None
+    if branch is not None:
+        record["base_branch"] = branch
     for path in _ledgers(root, repo):
         _append(path, record)
+
+
+def record_head(root: Path, record: dict[str, str], head: str) -> None:
+    """Keep `head` as the last commit seen in a recorded worker worktree: the record is written again with it.
+
+    A whole record, not a partial line, so a reader that does not know `head` still reads the worker as it was. The
+    cleanup uses it to check a worktree whose git registration was lost (`cleanup._orphan_is_merged`).
+    """
+    repo = Path(record["repo"]) if record.get("repo") else None
+    for path in _ledgers(root, repo):
+        _append(path, {**record, "head": head})
+
+
+def branch_ref(cwd: Path, ref: str) -> str | None:
+    """The full ref of the branch `ref` names in the repository `cwd` is in: `refs/heads/<ref>`, else
+    `refs/remotes/<ref>`, or `ref` itself when it already is such a full ref; None for a commit id, a tag, `HEAD`, or a
+    name that is no branch."""
+    names = [ref] if ref.startswith("refs/") else [f"refs/heads/{ref}", f"refs/remotes/{ref}"]
+    for name in names:
+        if not name.startswith(("refs/heads/", "refs/remotes/")):
+            continue
+        try:
+            run = subprocess.run(["git", "-C", str(cwd), "show-ref", "--verify", "--quiet", name], capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if run.returncode == 0:
+            return name
+    return None
 
 
 def _repo_path(root: Path) -> Path | None:
@@ -882,7 +921,7 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     install = worktree_links.source_for(root, repo)
     separate = bool(permission_mode) or (claude and trust.sharing_enabled()) or install is not None
     path, terminal = _create_worktree(repo, name, base_args, None if separate else agent)
-    record_worker(root, worktree=path, task_id=task_id, dispatch="")
+    record_worker(root, worktree=path, task_id=task_id, dispatch="", base_ref=base)
     if install is not None:
         link_worker_install(root, Path(path), repo, session=session, task_id=task_id)
     trust_note = _share_trust(root, [repo, Path(path)], session) if claude else None
@@ -952,7 +991,7 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
     dispatch = dispatch_id_of(answer)
     worktree = created or worktree_of(answer) or find_worktree(target or root, name)
     if worktree is not None:
-        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch)
+        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch, base_ref=base)
     events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
                   detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree, "name": name,
                           "turn_start": "unobserved" if turn_unobserved(answer) else "observed"})

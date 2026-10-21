@@ -63,7 +63,7 @@ def test_a_folder_root_with_repo_starts_the_worker_through_worktree_create(folde
     assert coordinator.role_for(worktree) == "worker" and coordinator.role_for(app) == "coordinator"
     # The coordinator root sees the same worker, with the repository it belongs to.
     assert orca_cli.worker_records(folder) == [{"worktree": str(worktree), "task_id": out["task_id"], "dispatch": out["dispatch"],
-                                                "base": git(app, "rev-parse", "HEAD"), "repo": str(app)}]
+                                                "base": git(app, "rev-parse", "HEAD"), "repo": str(app), "base_branch": "", "head": ""}]
     assert orca_cli.workers_ledger(folder) == folder / ".coding-agent" / "workers.jsonl"
 
 
@@ -117,11 +117,13 @@ def test_a_base_ref_is_passed_to_the_new_worktree(repo, folder, fake_orca, capsy
     git(repo, "branch", "release")
     assert cli.main(["--root", str(repo), "delegate", "--title", "On main", "--spec", "x", "--base-branch", "release"]) == 0
     assert orca_state(fake_orca)["create_calls"] == [{"base": "release", "no_parent": True}]
+    assert [record["base_branch"] for record in orca_cli.worker_records(repo)] == ["refs/heads/release"]
     app = folder / "vgps" / "app"
     git(app, "branch", "old")
     task_id = orca_cli.create_task(folder, project="sdk", t_id="T-f5", spec="x", title="From old")
     assert cli.main(["--root", str(folder), "worker-start", "--task-id", task_id, "--repo", str(app), "--base-branch", "old"]) == 0
     assert orca_state(fake_orca)["create_calls"][1:] == [{"base": "old", "no_parent": True}]
+    assert [record["base_branch"] for record in orca_cli.worker_records(folder)] == ["refs/heads/old"]
 
 
 def test_worker_start_on_a_folder_root_without_repo_names_the_repositories(folder, fake_orca, capsys):

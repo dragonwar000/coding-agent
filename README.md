@@ -474,7 +474,8 @@ tasks:
 - Root không phải repo git mà thiếu `--repo`: lệnh dừng **trước khi tạo task** và liệt kê các repo git tìm thấy dưới root
   (sâu tối đa 3 cấp, bỏ thư mục ẩn, `node_modules`, `venv`, `build`, `dist`). `plan-apply` kiểm mọi node trước khi tạo task nào.
 - Worker được ghi ở hai nơi: danh sách của repo đích (để session trong worktree là worker) và danh sách của root (để bảng việc,
-  `worktree-list`, `worktree-clean` của coordinator thấy nó). "Commit chưa gộp" được so với HEAD của repo đích.
+  `worktree-list`, `worktree-clean` của coordinator thấy nó). "Commit chưa gộp" được so với HEAD của repo đích (và nhánh base
+  của task trong repo đó).
 - **Giới hạn đã biết:** worktree tạo từ repo con không mang hook harness và `integration.yaml` của thư mục cha. Worker ở đó
   chạy không có `stop-gate`, không có verify và không có guard của harness, trừ khi repo con tự cài coding-agent. Coordinator
   phải tự kiểm kết quả (đọc diff, chạy verify trong worktree) trước khi gộp.
@@ -598,19 +599,30 @@ và không có `worker-resume --watch` chạy nền thì không ai quét.
 
 ## Dọn worktree của worker
 
-Khi task của worker đã `completed` hoặc `failed` và worktree **sạch, đã gộp** (không file chưa commit, không commit nào mà HEAD
-của coordinator chưa có), coding-agent **tự xoá** nó, không hỏi ai. Việc tự dọn chạy khi dựng bảng việc (mỗi prompt của
+Khi task của worker đã `completed` hoặc `failed` và worktree **sạch, đã gộp** (không file chưa commit, không commit nào của
+worker mà cả HEAD của coordinator lẫn nhánh base của task đều chưa có), coding-agent **tự xoá** nó, không hỏi ai. Nhánh base là
+nhánh worker được tạo từ đó (`delegate --base-branch`, `base:` của node plan), kèm nhánh upstream remote-tracking của nó; sổ worker
+ghi nó thành `base_branch`. Nhánh khác không tính: nhánh tách từ nhánh của một worker chứa commit của worker đó mà không gộp.
+Bản ghi cũ chưa có `base_branch`, hoặc nhánh base đã bị xoá, thì chỉ so với HEAD. Việc tự dọn chạy khi dựng bảng việc (mỗi prompt của
 coordinator) và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`; mỗi worktree xoá được in một dòng
 `auto-clean: removed <tên> (<task>)` và ghi event `worktree-auto-removed`. Lỗi khi tự dọn chỉ là cảnh báo, không đổi mã thoát
 của lệnh. Đặt `CODING_AGENT_AUTO_CLEAN=off` để tắt.
 
 Worktree đã kiểm là an toàn được xoá với force: file runtime của harness (`.coding-agent/`) và nhiễu bit thực thi trên Windows
-làm `git worktree remove` từ chối dù không còn việc gì trong đó. Thư mục rỗng không còn là worktree git (sót lại khi Orca dừng
-giữa chừng sau khi git đã xoá worktree) coi như đã mất: bản ghi được đánh dấu đã xoá và thư mục rỗng bị xoá; thư mục còn file
-thì để nguyên.
+làm `git worktree remove` từ chối dù không còn việc gì trong đó. Thư mục sót lại khi việc xoá dừng giữa chừng
+(`Directory not empty`):
 
-Worker đã báo xong mà nhánh chưa gộp thì worktree được giữ để coordinator còn kiểm; gộp nhánh vào HEAD xong thì lần chạy sau
-tự xoá nó. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit.
+- Chỉ còn rác của hệ điều hành (`.DS_Store`, `Thumbs.db`, `desktop.ini`, và thư mục chỉ chứa chúng) hoặc rỗng: coi như đã mất,
+  bản ghi được đánh dấu đã xoá và thư mục bị xoá.
+- Còn nguyên checkout nhưng file `.git` trỏ tới git dir không còn (đăng ký worktree đã mất): chỉ xoá khi chứng minh được không
+  mất gì — file trong thư mục khớp đúng một commit đã gộp (commit cuối của worker mà lần dọn trước thấy, sổ worker ghi thành
+  `head`; đỉnh nhánh trùng tên thư mục; hoặc commit nó bắt đầu từ), so bằng object store của repo chính với một index tạm,
+  bỏ qua file bị `.gitignore` (như `node_modules`), rác hệ điều hành và file runtime của harness. Không chứng minh được thì
+  giữ và ghi `đăng ký worktree đã mất, cần kiểm tay`.
+- Còn thứ khác: để nguyên. Khi xoá không bao giờ đi theo symlink hay junction ra ngoài thư mục.
+
+Worker đã báo xong mà nhánh chưa gộp thì worktree được giữ để coordinator còn kiểm; gộp nhánh vào HEAD hoặc vào nhánh base của
+task xong thì lần chạy sau tự xoá nó. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit.
 
 ```sh
 python3 -m coding_agent.cli worktree-list                                   # tự dọn trước, rồi liệt kê worktree còn việc
@@ -622,7 +634,8 @@ python3 -m coding_agent.cli worktree-clean --task-id <id> --discard --yes   # b�
 - Không cần `--yes` để xoá worktree sạch, đã gộp. Chỉ `--discard` mới cần `--yes`: thiếu thì lệnh từ chối. Hook
   `coordinator-guard` trả `ask` cho `worktree-clean --discard`, nên Claude Code hỏi người dùng xác nhận trước khi lệnh chạy, ở
   mọi mode trừ `off` và trừ khi phiên đang `bypassPermissions`. Coordinator vẫn phải hỏi người dùng trong hội thoại trước.
-- Worktree còn file chưa commit, hoặc còn commit của worker mà nhánh của coordinator chưa có, được **giữ lại**. Với
+- Worktree còn file chưa commit, hoặc còn commit của worker mà cả nhánh của coordinator lẫn nhánh base của task đều chưa có,
+  được **giữ lại**. Gộp nghĩa là commit tới được từ nhánh đó: squash hay rebase merge vẫn để commit của worker là chưa gộp. Với
   `--task-id` thì lệnh thoát 1; với `--all` thì đó là chủ ý và lệnh thoát 0. Nếu git không so sánh được, worktree cũng được giữ.
 - File harness tự ghi vào worktree (`.coding-agent/events.jsonl`, `.coding-agent/state/`, `orca-run`, `links.jsonl`,
   `workers.jsonl`, `plan.json`, `installed.json`, `backups/`, `roots.json`, `acked.jsonl`, `worktree-links.json`) không tính là việc; `.coding-agent/plan.yaml` thì có. Trên Windows,
