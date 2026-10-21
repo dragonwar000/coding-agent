@@ -229,3 +229,19 @@ def test_a_rejected_worker_done_gets_the_settle_hint_in_the_inbox(repo, fake_orc
 def test_the_contract_names_both_recovery_commands():
     text = coordinator.contract("src")
     assert "worker-kick --task-id" in text and "worker-settle --task-id" in text and "Rejected worker_done" in text
+
+
+def test_worker_kick_links_the_coordinator_install_into_the_worktree(committed, tmp_path, fake_orca, capsys):
+    from test_worktree_links import install_into
+
+    install_into(committed)
+    task_id = orca_cli.create_task(committed, project="demo-repo", t_id="T-k5", spec="x", title="Kick linked")
+    orca_cli._call("worker-start", "--task", task_id, "--agent", "claude", "--worktree", "new-child", "--name", "kick-linked", "--run", "run_test")
+    path = placed_worktree(committed, tmp_path, "kick-linked")
+    assert cli.main(["--root", str(committed), "worker-kick", "--task-id", task_id]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "integration.yaml" in out["linked"] and "harness" in out["linked"]
+    assert (path / ".claude" / "settings.json").is_symlink()
+    # a second kick finds the links in place and makes none
+    assert cli.main(["--root", str(committed), "worker-kick", "--task-id", task_id]) == 0
+    assert json.loads(capsys.readouterr().out)["linked"] == []

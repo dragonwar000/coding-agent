@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from coding_agent import events, orca, state, trust
+from coding_agent import events, orca, state, trust, worktree_links
 
 BIN_ENV = "CODING_AGENT_ORCA"
 RUN_ENV = "CODING_AGENT_ORCA_RUN"
@@ -853,6 +853,12 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     detected and reported as before. Another agent, or `CODING_AGENT_SHARE_TRUST=off` without a `permission_mode`,
     keeps `worktree create --agent`; the skipped trust step is logged (`guard=folder-trust kind=skipped`).
 
+    When the coordinator's checkout (`root`, else `repo`) holds a coding-agent install that is not committed
+    (`integration.yaml`, `harness/`, `.claude/settings.json`, ...), every agent takes the separate path: the install is
+    linked into the new worktree (`link_worker_install`) before the agent starts, because Claude Code and Codex read
+    their hook files only at start. The agent command carries `CODING_AGENT_ROLE=worker` on macOS and Linux
+    (`agent_command`), so the hooks treat the session as a worker's even without the ledger.
+
     Measured on 2026-10-10 with Orca and Claude Code 2.1.296 on Windows: `claude --permission-mode bypassPermissions`
     in a new worktree still shows the folder trust dialog when that folder is not trusted yet; the trust prompt is per
     folder and the mode does not skip it. Once the folder was trusted there was no separate bypass confirmation dialog:
@@ -873,12 +879,15 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     else:
         base_args = _base_args(repo, base)
     claude = agent == "claude"
-    separate = bool(permission_mode) or (claude and trust.sharing_enabled())
+    install = worktree_links.source_for(root, repo)
+    separate = bool(permission_mode) or (claude and trust.sharing_enabled()) or install is not None
     path, terminal = _create_worktree(repo, name, base_args, None if separate else agent)
     record_worker(root, worktree=path, task_id=task_id, dispatch="")
+    if install is not None:
+        link_worker_install(root, Path(path), repo, session=session, task_id=task_id)
     trust_note = _share_trust(root, [repo, Path(path)], session) if claude else None
     if separate:
-        command = f"{agent} --permission-mode {permission_mode}" if permission_mode else agent
+        command = agent_command(agent, permission_mode)
         terminal = terminal_handle_of(_call_tool("terminal", "create", "--worktree", f"path:{path}", "--title", display, "--command", command))
         if terminal is None:
             raise OrcaError(f"the terminal create answer for worktree {path} has no terminal handle, so no task was dispatched")
@@ -886,6 +895,36 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
         return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
     _wait_agent_ready(terminal, path, trust_note=trust_note)
     return _call("worker-start", "--task", task_id, "--terminal", terminal, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
+
+
+ROLE_PREFIX = "CODING_AGENT_ROLE=worker "
+
+
+def agent_command(agent: str, permission_mode: str | None = None, *, windows: bool | None = None) -> str:
+    """The command a worker's terminal starts its agent with: `agent`, `--permission-mode MODE` when given, and on
+    macOS and Linux a `CODING_AGENT_ROLE=worker` prefix.
+
+    Orca types `--command` into the login shell of the terminal, where `NAME=value command` sets the variable for the
+    agent and the hooks it runs, so `coordinator.role_for` reads `worker` even without the workers ledger. On Windows
+    the shell may be PowerShell or cmd, which do not take that form; there the ledger alone marks the worker.
+    """
+    command = f"{agent} --permission-mode {permission_mode}" if permission_mode else agent
+    windows = sys.platform == "win32" if windows is None else windows
+    return command if windows else f"{ROLE_PREFIX}{command}"
+
+
+def link_worker_install(root: Path, worktree: Path, repo: Path | None = None, *, session: str = "cli",
+                        task_id: str = "") -> dict[str, Any]:
+    """Give a worker worktree the coordinator's untracked coding-agent install (`worktree_links.prepare_worker`),
+    taken from `root`, else from `repo`, and log what was done (`guard=worker-install kind=linked|skipped`)."""
+    prepared = worktree_links.prepare_worker(worktree, root, repo)
+    made = worktree_links.made_links(prepared)
+    try:
+        events.record(root, guard="worker-install", kind="linked" if made else "skipped", mode="enforce", applied=made, session=session,
+                      detail={"task_id": task_id, "worktree": str(worktree), **prepared})
+    except OSError:
+        pass
+    return prepared
 
 
 def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli", title: str | None = None,
@@ -1122,15 +1161,20 @@ def worktree_for_task(root: Path, task_id: str, run: str | None = None) -> str |
 
 
 def kick_by_hand(root: Path, *, task_id: str, run: str | None = None, session: str = "cli") -> dict[str, Any]:
-    """`worker-kick`: record the task's worktree as a worker's (if not yet) and send the kick-off to its terminal."""
+    """`worker-kick`: record the task's worktree as a worker's (if not yet), link the coordinator's install into it
+    (`link_worker_install`, for a worktree Orca created without it) and send the kick-off to its terminal."""
     dispatch = dispatch_of(task_id)["id"]
     worktree = worktree_for_task(root, task_id, run)
     recorded = False
+    linked: list[str] = []
     if worktree is not None and Path(worktree).resolve() not in {Path(w) for w in worker_worktrees(root)}:
         record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch)
         recorded = True
+    if worktree is not None and Path(worktree).is_dir():
+        prepared = link_worker_install(root, Path(worktree), _repo_path(Path(worktree)), session=session, task_id=task_id)
+        linked = [item["path"] for item in prepared["links"] if item["action"] in ("symlink", "junction", "copy")]
     seen = kick_worker(root, task_id=task_id, dispatch=dispatch, session=session)
-    return {"task_id": task_id, "dispatch": dispatch, "worktree": worktree, "recorded": recorded, "kicked": seen}
+    return {"task_id": task_id, "dispatch": dispatch, "worktree": worktree, "recorded": recorded, "linked": linked, "kicked": seen}
 
 
 def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: str | None = None, session: str = "cli",

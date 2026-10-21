@@ -180,7 +180,7 @@ def test_worktree_then_trust_then_terminal(repo: Path, fake_orca: Path, claude_c
     answer, path = orca_cli._start_in_new_worktree(repo, _task(repo), "claude", "fix", "Fix", "run_test", permission_mode=mode)
     orca = _orca(fake_orca)
     assert orca["created_worktrees"][0]["agent"] is None
-    assert orca["created_terminals"][0]["command"] == ("claude" if mode is None else f"claude --permission-mode {mode}")
+    assert orca["created_terminals"][0]["command"] == orca_cli.agent_command("claude", mode)
     assert orca["dispatches"][answer["result"]["dispatchId"]]["terminal"] == orca["created_terminals"][0]["handle"]
     # trust was written after the worktree existed and before the agent started
     assert not _trusted_in(Path(f"{fake_orca}.worktree-create.json"), Path(path))

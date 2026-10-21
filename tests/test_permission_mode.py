@@ -125,7 +125,7 @@ def test_claude_worker_gets_its_own_terminal_with_the_mode(repo: Path, fake_orca
     orca = _orca(fake_orca)
     assert orca["created_worktrees"][0]["agent"] is None
     terminal = orca["created_terminals"][0]
-    assert terminal["command"] == "claude --permission-mode bypassPermissions"
+    assert terminal["command"] == orca_cli.agent_command("claude", "bypassPermissions")
     assert terminal["worktree"] == orca["dispatches"][dispatch]["worktree"]
     assert orca["dispatches"][dispatch]["terminal"] == terminal["handle"] and orca["dispatches"][dispatch]["agent"] == "claude"
     started = [e for e in _events(repo, "permission-mode") if e["kind"] == "worker-started"]
@@ -136,7 +136,7 @@ def test_claude_worker_gets_its_own_terminal_with_the_mode(repo: Path, fake_orca
 def test_session_mode_reaches_the_worker(repo: Path, fake_orca: Path) -> None:
     state.save_permission_mode(repo, "acceptEdits", "coord")
     orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x")
-    assert _orca(fake_orca)["created_terminals"][0]["command"] == "claude --permission-mode acceptEdits"
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "acceptEdits")
 
 
 def _child_repo(parent: Path) -> Path:
@@ -153,7 +153,7 @@ def test_root_inside_the_coordinator_project_reads_the_parent_record(repo: Path,
     child = _child_repo(repo)
     assert orca_cli.worker_permission_mode(child, None) == ("bypassPermissions", "session")
     orca_cli.worker_start(child, task_id=_task(child), agent="claude", title="x")
-    assert _orca(fake_orca)["created_terminals"][0]["command"] == "claude --permission-mode bypassPermissions"
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "bypassPermissions")
     detail = [e for e in _events(child, "permission-mode") if e["kind"] == "worker-started"][-1]["detail"]
     assert detail["permission_mode"] == "bypassPermissions" and detail["source"] == "session"
     assert detail["origin"] == "parent" and detail["recorded_by"] == "coord"
@@ -167,7 +167,7 @@ def test_claude_project_dir_is_read_when_root_has_no_record(tmp_path: Path, repo
     state.save_permission_mode(other, "acceptEdits", "coord")
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))
     orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x")
-    assert _orca(fake_orca)["created_terminals"][0]["command"] == "claude --permission-mode acceptEdits"
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "acceptEdits")
     detail = [e for e in _events(repo, "permission-mode") if e["kind"] == "worker-started"][-1]["detail"]
     assert detail["source"] == "session" and detail["origin"] == "CLAUDE_PROJECT_DIR"
     assert detail["state_dir"] == (other.resolve() / ".coding-agent" / "state").as_posix()

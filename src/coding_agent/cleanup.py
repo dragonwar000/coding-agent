@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from coding_agent import events, orca, orca_cli, roots
+from coding_agent import events, orca, orca_cli, roots, worktree_links
 
 SETTLED = ("completed", "failed")
 AUTO_ENV = "CODING_AGENT_AUTO_CLEAN"
@@ -90,11 +90,14 @@ HARNESS_RUNTIME = (
     ".coding-agent/backups/",        # project_install package backups
     ".coding-agent/roots.json",      # orca_cli.ROOTS_FILE: repositories the coordinator delegated into
     ".coding-agent/acked.jsonl",     # orca_cli.ACKED_FILE: reports acknowledged one task at a time
+    ".coding-agent/worktree-links.json",  # worktree_links.RECORD: the install links made in a worker worktree
 )
 
 
-def _harness_owned(path: str) -> bool:
-    return any(path.startswith(item) if item.endswith("/") else path == item for item in HARNESS_RUNTIME)
+def _harness_owned(path: str, links: tuple[str, ...] = ()) -> bool:
+    """True for a harness runtime file, or for a path under one of `links` (the install `worktree_links` linked in)."""
+    return (any(path.startswith(item) if item.endswith("/") else path == item for item in HARNESS_RUNTIME)
+            or any(path == link or path.startswith(link + "/") for link in links))
 
 
 def _status_args(windows: bool) -> list[str]:
@@ -112,12 +115,14 @@ def _status_args(windows: bool) -> list[str]:
 def _dirty(worktree: Path) -> int:
     """Changed or untracked files in the worktree, or UNKNOWN when git cannot say.
 
-    Not counted: mode-only changes on Windows (see `_status_args`) and the harness's own runtime files
-    (`HARNESS_RUNTIME`), which hooks write into every worker's worktree whether or not the worker did anything.
+    Not counted: mode-only changes on Windows (see `_status_args`), the harness's own runtime files
+    (`HARNESS_RUNTIME`), which hooks write into every worker's worktree whether or not the worker did anything, and
+    the coordinator's install linked in by `worktree_links` (normally hidden by `info/exclude` already).
     """
     out = _git(worktree, *_status_args(WINDOWS))
     if out is None:
         return UNKNOWN
+    links = tuple(worktree_links.linked_paths(worktree))
     fields = out.split("\0")
     count = 0
     index = 0
@@ -128,7 +133,7 @@ def _dirty(worktree: Path) -> int:
             continue
         if entry[0] in "RC":
             index += 1  # the next field is the rename/copy source
-        if not _harness_owned(entry[3:]):
+        if not _harness_owned(entry[3:], links):
             count += 1
     return count
 
@@ -207,6 +212,8 @@ def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session
                 except orca_cli.OrcaError:
                     pass  # already released, or Orca no longer tracks it; the worktree removal below is what matters
             if item.exists:
+                # The install links go first, as links: no removal below ever walks into the coordinator's install.
+                worktree_links.unlink_install(Path(item.worktree))
                 # A safe worktree is removed with force too: `_dirty`/`_unmerged` already found no work in it, and
                 # what is left (harness runtime files, Windows mode-only noise) makes `git worktree remove` refuse.
                 orca_cli.remove_worktree(item.worktree, force=item.safe or discard)

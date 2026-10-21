@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -36,7 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", type=Path, default=Path("integration.yaml"))
     args = parser.parse_args(argv)
     try:
-        manifest = load(args.manifest.resolve())
+        # Absolute, not resolved: in a worker worktree `integration.yaml` is a link to the coordinator's, and the
+        # files to check are the worktree's own (`worktree_links`).
+        manifest = load(Path(os.path.abspath(args.manifest)))
     except (ManifestError, OSError) as error:
         print(f"gate: {error}", file=sys.stderr)
         return 2

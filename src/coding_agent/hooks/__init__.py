@@ -58,7 +58,8 @@ def _manifest(root: Path) -> tuple[Manifest | None, str | None]:
     if not path.exists():
         return None, None
     try:
-        return load(path.resolve()), None
+        # Absolute, not resolved: a worker worktree's `integration.yaml` can link to the coordinator's (`worktree_links`).
+        return load(Path(os.path.abspath(path))), None
     except ImportError as error:
         return None, f"PyYAML is not importable by this python3 ({error}); install pyyaml into the interpreter that runs the hooks"
     except (ManifestError, OSError, ValueError) as error:

@@ -336,7 +336,7 @@ Nó không tự sửa file.
   lượt (`delegate` cho một việc nhỏ, graph cho nhiều việc), không xin phép người dùng và không viết lại lệnh để lách guard.
   Chưa có Orca Run thì nó tự chạy `run-init`. Lời từ chối của guard kèm sẵn lệnh `delegate`. Nó chỉ hỏi người dùng về
   quyết định thật sự của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài).
-- **Ai là worker:** chỉ session chạy trong worktree mà `worker-start` của coding-agent tạo ra. Danh sách nằm ở
+- **Ai là worker:** chỉ session chạy trong worktree mà `worker-start` của coding-agent tạo ra (hoặc `worker-adopt` ghi sổ). Danh sách nằm ở
   `<git-common-dir>/coding-agent-workers.jsonl`, dùng chung cho mọi worktree. Session ở worktree khác (kể cả workspace
   Orca) là coordinator. Root không phải repo git (folder project) giữ danh sách ở `<root>/.coding-agent/workers.jsonl`. `CODING_AGENT_ROLE=coordinator|worker|maintainer` ghi đè.
 - **Maintainer:** khởi động phiên với `CODING_AGENT_ROLE=maintainer` cho việc không phải code (pull repo, sinh tài liệu).
@@ -549,6 +549,28 @@ và không có `worker-resume --watch` chạy nền thì không ai quét.
   của `worker-start` / `delegate` / `plan-next`, rồi `CODING_AGENT_WORKER_PERMISSION_MODE`, rồi mode đã ghi (tìm ở `--root`,
   `$CLAUDE_PROJECT_DIR`, thư mục làm việc, rồi các thư mục cha của `--root`). Agent khác (codex) giữ cách khởi động của nó và
   việc bỏ qua được ghi event `permission-mode`.
+- **Chung bộ cài coding-agent với coordinator:** cài bằng `install.sh` không commit gì, nên `harness/`, `integration.yaml`,
+  `.claude/settings.json`, `.codex/hooks.json` và `.coding-agent/installed.json` chỉ có ở checkout của coordinator; worktree Orca
+  tạo từ commit thì thiếu, và worker không chạy hook nào (không stop-gate, verify, ratchet, evaluator). Vì vậy ngay sau khi worktree
+  có và trước khi agent khởi động (Claude Code và Codex chỉ đọc file hook lúc khởi động), coding-agent tạo link trong worktree trỏ
+  về checkout của coordinator (`--root`, không có bộ cài thì repo chính): symlink trên macOS/Linux; trên Windows symlink nếu tài
+  khoản được phép, không thì junction cho `harness/` và bản sao cho file. Đường dẫn worktree đã có (file, thư mục hay link), đường
+  dẫn git đang track, hay đường dẫn coordinator không có thì để nguyên, không bao giờ ghi đè. Một bộ cài dùng chung cho mọi worker,
+  nên nâng cấp bộ cài của coordinator là worker có ngay. Link đã tạo được ghi ở `.coding-agent/worktree-links.json` trong worktree.
+  Có bộ cài thì mọi agent (cả codex) đi đường tạo worktree không kèm agent rồi mở agent trong terminal riêng. Event
+  `worker-install` (`linked` / `skipped`). `worker-adopt` và `worker-kick` cũng link vào worktree chúng ghi sổ; agent đang chạy ở đó
+  đọc hook ở lần khởi động sau.
+- **Không commit nhầm bộ cài:** các đường dẫn trên, cùng `.claude/settings.json.bak` (installer tạo) và
+  `.coding-agent/worktree-links.json`, được thêm vào `<git-common-dir>/info/exclude` (một khối mở đầu bằng
+  `# coding-agent: install linked into worker worktrees`), file mọi worktree của repo cùng đọc, kể cả checkout của coordinator.
+  Mẫu neo ở gốc và không có `/` cuối (`/harness`), để khớp cả symlink. Nên `git status` không hiện chúng và `git add -A` của
+  worker không commit chúng. Đường dẫn git đang track thì không thêm.
+- **Worker biết mình là worker:** worktree được ghi vào sổ worker trước khi agent khởi động, và trên macOS/Linux lệnh mở agent
+  là `CODING_AGENT_ROLE=worker claude ...` (Orca gõ `--command` vào login shell). Nên `stop-gate` coi phiên là phiên tự ghi
+  (`_writes_here`) và chạy ratchet, evaluator; `coordinator-guard` không chặn worker. Trên Windows shell có thể là PowerShell
+  hoặc cmd, không nhận dạng đó, nên chỉ dựa vào sổ worker.
+- **Gate trong worktree đọc file của worktree:** `coding_agent.gate --manifest integration.yaml` và các hook nạp manifest theo
+  đường dẫn tuyệt đối, không theo đích của link, nên trong worker chúng so file hook của chính worktree.
 
 ## Dọn worktree của worker
 
@@ -579,10 +601,13 @@ python3 -m coding_agent.cli worktree-clean --task-id <id> --discard --yes   # b�
 - Worktree còn file chưa commit, hoặc còn commit của worker mà nhánh của coordinator chưa có, được **giữ lại**. Với
   `--task-id` thì lệnh thoát 1; với `--all` thì đó là chủ ý và lệnh thoát 0. Nếu git không so sánh được, worktree cũng được giữ.
 - File harness tự ghi vào worktree (`.coding-agent/events.jsonl`, `.coding-agent/state/`, `orca-run`, `links.jsonl`,
-  `workers.jsonl`, `plan.json`, `installed.json`, `backups/`, `roots.json`, `acked.jsonl`) không tính là việc; `.coding-agent/plan.yaml` thì có. Trên Windows,
+  `workers.jsonl`, `plan.json`, `installed.json`, `backups/`, `roots.json`, `acked.jsonl`, `worktree-links.json`) không tính là việc; `.coding-agent/plan.yaml` thì có. Trên Windows,
   thay đổi chỉ ở bit thực thi (repo clone bằng git của WSL/Linux) cũng không tính.
 - Tự dọn chỉ thấy task của Run đang dùng (`CODING_AGENT_ORCA_RUN`, hoặc Run đã lưu); worktree của task thuộc Run cũ phải xoá tay.
-- Xoá gồm: nhả terminal của worker, `orca worktree rm` (xoá cả nhánh), và ghi `removed` vào sổ worker.
+- Xoá gồm: nhả terminal của worker, gỡ link bộ cài (xem "Khởi động worker"), `orca worktree rm` (xoá cả nhánh), và ghi
+  `removed` vào sổ worker. Link được gỡ trước, như link: symlink và junction bị xoá mà không đi vào thư mục chúng trỏ tới, bản sao
+  chỉ bị xoá khi vẫn là file thường trong worktree, và đường dẫn không còn là thứ harness tạo thì để nguyên. Bộ cài ở checkout
+  của coordinator không bị đụng. Link bộ cài cũng không tính là việc khi kiểm worktree sạch.
 
 Worker bắt đầu từ commit hiện tại của coordinator (`--base-branch`). Không truyền thì Orca tạo worktree từ nhánh gốc mặc định
 của repo, và worker sẽ thiếu việc mới nhất. Commit gốc của worktree được ghi vào sổ để chỉ đếm commit do worker thêm.

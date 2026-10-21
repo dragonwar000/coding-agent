@@ -29,6 +29,12 @@ from pathlib import Path
 STATUSES = {"pending", "ready", "dispatched", "completed", "failed", "blocked"}
 
 
+
+def _program(command: str) -> str:
+    """The program a terminal command runs: its first word after any leading `NAME=value` assignments, as a shell reads it."""
+    words = command.split()
+    return next((word for word in words if "=" not in word), words[0] if words else "")
+
 def _options(argv: list[str]) -> dict[str, str]:
     found: dict[str, str] = {}
     for index, token in enumerate(argv):
@@ -203,7 +209,7 @@ def main(argv: list[str]) -> int:
             worktree = selector[5:] if selector.startswith("path:") else os.path.join(os.path.dirname(str(state_path)), "worktrees", options["--name"])
             # A dispatch to an agent terminal runs the agent its worktree was created with.
             agent = (options.get("--agent") or next((w["agent"] for w in data.get("created_worktrees", []) if f"term_wt_{w['name']}" == options.get("--terminal")), None)
-                     or next((t["command"].split()[0] for t in data.get("created_terminals", []) if t["handle"] == options.get("--terminal")), None))
+                     or next((_program(t["command"]) for t in data.get("created_terminals", []) if t["handle"] == options.get("--terminal")), None))
             data["dispatches"][dispatch_id] = {"task": task["id"], "agent": agent, "terminal": options.get("--terminal"), "worktree": selector, "name": options.get("--name", os.path.basename(worktree)),
                                                "display": options.get("--display-name"), "base": options.get("--base-branch")}
             task["status"] = "dispatched"

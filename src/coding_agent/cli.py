@@ -19,8 +19,10 @@
   `.coding-agent/state/permission-mode` (under `--root`, else `$CLAUDE_PROJECT_DIR`, the working directory, or a parent
   of `--root`). Without one, or for another agent, the worker starts as the agent's default.
   The mode a worker started in is logged in `.coding-agent/events.jsonl` (`guard: permission-mode`, `kind: worker-started`).
-- `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator.
-- `worker-kick --task-id ID`: record the task's worktree as a worker's and send the kick-off to its terminal, for a worker that never received its task.
+- `worker-adopt --worktree PATH`: record a worktree started outside coding-agent as a worker's, so its session is not treated as the coordinator,
+  and link the coordinator's untracked install (`harness/`, `integration.yaml`, `.claude/settings.json`, ...) into it (`worktree_links`).
+- `worker-kick --task-id ID`: record the task's worktree as a worker's, link the install into it as `worker-adopt` does, and send the kick-off to
+  its terminal, for a worker that never received its task.
 - `worker-resume [--task-id ID ...] [--dry-run] [--watch [--interval SECONDS]]`: find the Run's workers that stopped at an
   empty prompt under a transient API error (lost network, overloaded API, rate limit) and send each one line to go on,
   once the API host answers on TCP 443 (`CODING_AGENT_API_HOST`, default `api.anthropic.com`). `--dry-run` only prints;
@@ -385,6 +387,10 @@ def _command(args: argparse.Namespace, root: Path) -> int:
                 return 1
             orca_cli.record_worker(root, worktree=str(args.worktree), task_id=args.task_id, dispatch="adopted")
             print(f"worker-adopt: recorded {args.worktree.resolve()}")
+            prepared = orca_cli.link_worker_install(root, args.worktree.resolve(), orca_cli._repo_path(args.worktree.resolve()), task_id=args.task_id)
+            linked = [item["path"] for item in prepared["links"] if item["action"] in ("symlink", "junction", "copy")]
+            if linked:
+                print(f"worker-adopt: linked {', '.join(linked)} from {prepared['source']} (a running agent reads them at its next start)")
             return 0
         if args.command == "worker-kick":
             outcome = orca_cli.kick_by_hand(root, task_id=args.task_id, run=args.run)
