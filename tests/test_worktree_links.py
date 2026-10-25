@@ -66,7 +66,10 @@ def snapshot(root: Path) -> dict[str, str]:
     return out
 
 
-EXCLUDE_LINES = ["/harness", "/integration.yaml", "/.claude/settings.json", "/.codex/hooks.json", "/.coding-agent/installed.json",
+# The paths `install_into` creates: every install path but the dot layout `.harness`.
+PRESENT = [rel for rel in worktree_links.LINKED if rel != ".harness"]
+
+EXCLUDE_LINES = ["/harness", "/.harness", "/integration.yaml", "/.claude/settings.json", "/.codex/hooks.json", "/.coding-agent/installed.json",
                  "/.claude/settings.json.bak", "/.coding-agent/worktree-links.json"]
 
 
@@ -76,13 +79,43 @@ EXCLUDE_LINES = ["/harness", "/integration.yaml", "/.claude/settings.json", "/.c
 def test_every_untracked_install_path_is_linked_into_the_worktree(parent, tmp_path):
     wt = add_worktree(parent, tmp_path)
     results = worktree_links.link_install(parent, wt)
-    assert {item["path"]: item["action"] for item in results} == {rel: "symlink" for rel in worktree_links.LINKED}
-    for rel in worktree_links.LINKED:
+    present = PRESENT  # this install uses the `harness/` layout
+    assert {item["path"]: item["action"] for item in results} == {**{rel: "symlink" for rel in present}, ".harness": "missing"}
+    for rel in present:
         assert (wt / rel).is_symlink() and (wt / rel).resolve() == (parent / rel).resolve()
+    assert not os.path.lexists(wt / ".harness")
     assert (wt / "harness" / "coding-agent" / "src" / "coding_agent" / "__init__.py").read_text(encoding="utf-8") == "# parent copy\n"
     record = json.loads((wt / worktree_links.RECORD).read_text(encoding="utf-8"))
-    assert [item["path"] for item in record["links"]] == list(worktree_links.LINKED)
-    assert worktree_links.linked_paths(wt) == list(worktree_links.LINKED)
+    assert [item["path"] for item in record["links"]] == present
+    assert worktree_links.linked_paths(wt) == present
+
+
+def test_a_dot_harness_install_is_linked_so_the_worker_hooks_import(repo, tmp_path):
+    # Measured 2026-10-26: projects installed as `.harness/coding-agent/src` (thoai-dialog, bonbon-ai-frontend, ...)
+    # gave every worker `No module named 'coding_agent'` on each hook, because only `harness/` was linked.
+    (repo / "README.md").write_text("demo\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "init")
+    package = repo / ".harness" / "coding-agent" / "src" / "coding_agent"
+    shutil.copytree(Path(__file__).resolve().parents[1] / "src" / "coding_agent", package,
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (repo / "harness").mkdir()  # an unrelated `harness/` beside the dot-layout install
+    (repo / "harness" / "notes.md").write_text("other tooling\n", encoding="utf-8")
+    text = SHIPPED.read_text(encoding="utf-8").replace("python_src: src", "python_src: .harness/coding-agent/src", 1)
+    (repo / "integration.yaml").write_text(text, encoding="utf-8")
+    gen.write(load(repo / "integration.yaml"), apply=True)
+    wt = add_worktree(repo, tmp_path)
+    prepared = worktree_links.prepare_worker(wt, repo)
+    actions = {item["path"]: item["action"] for item in prepared["links"]}
+    assert actions[".harness"] == "symlink" and actions["harness"] == "symlink"
+    assert "/.harness" in prepared["excluded"]
+    command = next(hook["command"] for entry in json.loads((wt / ".claude" / "settings.json").read_text(encoding="utf-8"))["hooks"]["Stop"]
+                   for hook in entry["hooks"] if "coding_agent.hooks" in hook["command"])
+    assert '"$CLAUDE_PROJECT_DIR"/.harness/coding-agent/src' in command
+    probe = subprocess.run([sys.executable, "-c", "import coding_agent.hooks"], cwd=wt, capture_output=True, text=True,
+                           env={**os.environ, "PYTHONPATH": str(wt / ".harness" / "coding-agent" / "src")})
+    assert probe.returncode == 0, probe.stderr
+    assert git(wt, "status", "--porcelain", "--untracked-files=all") == ""
 
 
 def test_an_existing_file_in_the_worktree_is_not_overwritten(parent, tmp_path):
@@ -164,7 +197,7 @@ def test_unlink_removes_only_the_links_and_leaves_the_parent_install_intact(pare
     wt = add_worktree(parent, tmp_path)
     worktree_links.prepare_worker(wt, parent)
     removed = worktree_links.unlink_install(wt)
-    assert removed == list(worktree_links.LINKED)
+    assert removed == PRESENT
     assert not any(os.path.lexists(wt / rel) for rel in worktree_links.LINKED)
     assert not (wt / worktree_links.RECORD).exists() and not (wt / ".claude").exists() and not (wt / ".codex").exists()
     assert snapshot(parent) == before
@@ -237,7 +270,7 @@ def test_without_symlinks_files_are_copied_and_cleanup_deletes_only_the_copies(p
     assert results["harness"] in ("junction", "copy")
     assert (wt / "integration.yaml").read_text(encoding="utf-8") == (parent / "integration.yaml").read_text(encoding="utf-8")
     monkeypatch.setattr(worktree_links.sys, "platform", sys.platform)
-    assert set(worktree_links.unlink_install(wt)) == set(worktree_links.LINKED)
+    assert set(worktree_links.unlink_install(wt)) == set(PRESENT)
     assert not any(os.path.lexists(wt / rel) for rel in worktree_links.LINKED)
     assert snapshot(parent) == before
 
@@ -283,7 +316,7 @@ def test_worker_start_links_the_install_before_the_agent_starts(parent, tmp_path
         calls.append(args)
         if args[:2] == ("terminal", "create"):
             path = Path(args[args.index("--worktree") + 1][5:])
-            linked_at_start.append(all((path / rel).is_symlink() for rel in worktree_links.LINKED))
+            linked_at_start.append(all((path / rel).is_symlink() for rel in PRESENT))
         return real(*args)
 
     monkeypatch.setattr(orca_cli, "_call_tool", watch)

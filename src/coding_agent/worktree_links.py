@@ -1,6 +1,6 @@
 """Give a worker worktree the coordinator's coding-agent install, so the worker's session runs the same hooks.
 
-A project installs coding-agent without committing it: `harness/`, `integration.yaml`, `.claude/settings.json` and
+A project installs coding-agent without committing it: `harness/` (or `.harness/`), `integration.yaml`, `.claude/settings.json` and
 `.codex/hooks.json` stay untracked (or gitignored) in the checkout the installer ran in. Orca creates a worker's
 worktree from a commit, so those files are not in it, and a worker session runs no hooks at all: no stop-gate, no
 verify, no ratchet, no evaluator.
@@ -8,7 +8,7 @@ verify, no ratchet, no evaluator.
 `link_install` runs right after the worktree exists and before the worker's agent starts. For each path in `LINKED`
 that the source checkout has, the worktree does not have, and git does not track in the worktree, it puts a link in
 the worktree that points at the source: a symlink on macOS and Linux; on Windows a symlink when the account may make
-one, else a directory junction (`harness/`) or a copy (a file). An existing file, a tracked path, or a path the source
+one, else a directory junction (`harness/`, `.harness/`) or a copy (a file). An existing file, a tracked path, or a path the source
 lacks is never touched. One copy of the install serves every worker, so an upgrade of the coordinator's install
 reaches them too. What was made is recorded in the worktree (`RECORD`), which is what `unlink_install` removes before
 the worktree is deleted; it removes only links it made (and copies it made), never anything they point to.
@@ -30,8 +30,12 @@ from pathlib import Path
 from typing import Any
 
 # Paths, relative to the checkout root, that make up an untracked install. `harness` is the default `python_src`
-# parent (`harness/coding-agent/src`); `.coding-agent/installed.json` tells the gate which hosts the installer wrote.
-LINKED = ("harness", "integration.yaml", ".claude/settings.json", ".codex/hooks.json", ".coding-agent/installed.json")
+# parent (`harness/coding-agent/src`); `.harness` is the same install in the dot layout (`.harness/coding-agent/src`),
+# which the overstack installer uses and `manifest.resolve_python_src` accepts. A checkout may hold both (an unrelated
+# `harness/` beside the `.harness/` install), so both are linked when present; without `.harness` a worker of a
+# dot-layout project ran hooks whose `PYTHONPATH` did not exist (`No module named 'coding_agent'`).
+# `.coding-agent/installed.json` tells the gate which hosts the installer wrote.
+LINKED = ("harness", ".harness", "integration.yaml", ".claude/settings.json", ".codex/hooks.json", ".coding-agent/installed.json")
 RECORD = Path(".coding-agent") / "worktree-links.json"
 EXCLUDED = (*LINKED, ".claude/settings.json.bak", RECORD.as_posix())
 EXCLUDE_MARK = "# coding-agent: install linked into worker worktrees (worktree_links.py)"

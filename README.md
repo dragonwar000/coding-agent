@@ -574,12 +574,12 @@ và không có `worker-resume --watch` chạy nền thì không ai quét.
   của `worker-start` / `delegate` / `plan-next`, rồi `CODING_AGENT_WORKER_PERMISSION_MODE`, rồi mode đã ghi (tìm ở `--root`,
   `$CLAUDE_PROJECT_DIR`, thư mục làm việc, rồi các thư mục cha của `--root`). Agent khác (codex) giữ cách khởi động của nó và
   việc bỏ qua được ghi event `permission-mode`.
-- **Chung bộ cài coding-agent với coordinator:** cài bằng `install.sh` không commit gì, nên `harness/`, `integration.yaml`,
+- **Chung bộ cài coding-agent với coordinator:** cài bằng `install.sh` không commit gì, nên `harness/` (hoặc `.harness/`), `integration.yaml`,
   `.claude/settings.json`, `.codex/hooks.json` và `.coding-agent/installed.json` chỉ có ở checkout của coordinator; worktree Orca
   tạo từ commit thì thiếu, và worker không chạy hook nào (không stop-gate, verify, ratchet, evaluator). Vì vậy ngay sau khi worktree
   có và trước khi agent khởi động (Claude Code và Codex chỉ đọc file hook lúc khởi động), coding-agent tạo link trong worktree trỏ
   về checkout của coordinator (`--root`, không có bộ cài thì repo chính): symlink trên macOS/Linux; trên Windows symlink nếu tài
-  khoản được phép, không thì junction cho `harness/` và bản sao cho file. Đường dẫn worktree đã có (file, thư mục hay link), đường
+  khoản được phép, không thì junction cho `harness/`, `.harness/` và bản sao cho file. Cả hai layout `harness/` và `.harness/` đều được link khi checkout có: thiếu `.harness/` thì worker của dự án cài kiểu dấu chấm chạy hook với `PYTHONPATH` không tồn tại (`No module named 'coding_agent'`, đo 2026-10-26). Đường dẫn worktree đã có (file, thư mục hay link), đường
   dẫn git đang track, hay đường dẫn coordinator không có thì để nguyên, không bao giờ ghi đè. Một bộ cài dùng chung cho mọi worker,
   nên nâng cấp bộ cài của coordinator là worker có ngay. Link đã tạo được ghi ở `.coding-agent/worktree-links.json` trong worktree.
   Có bộ cài thì mọi agent (cả codex) đi đường tạo worktree không kèm agent rồi mở agent trong terminal riêng. Event
