@@ -187,10 +187,21 @@ def role_for(cwd: Path | None) -> str:
     return "worker" if str(Path(top).resolve()) in orca_cli.worker_worktrees(cwd) else "coordinator"
 
 
+def worker_record(cwd: Path | None) -> dict[str, Any] | None:
+    """The workers-ledger record of the worktree `cwd` is in (`orca_cli.worker_records`), or None outside one."""
+    if cwd is None:
+        return None
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if top is None:
+        return None
+    resolved = str(Path(top).resolve())
+    return next((record for record in orca_cli.worker_records(cwd) if record["worktree"] == resolved), None)
+
+
 PLAN_FILE = Path(".coding-agent") / "plan.yaml"
 DELEGATING_TOOLS = frozenset({"Agent", "Task"})
 HOW = (
-    "Chia việc theo graph: (1) ghi plan vào .coding-agent/plan.yaml (tasks: id, title, spec, deps); "
+    "Chia việc theo graph: (1) ghi plan vào .coding-agent/plan.yaml (tasks: id, title, spec, deps; tuỳ chọn model, verify); "
     "(2) `python3 -m coding_agent.cli run-init --objective \"...\"` nếu chưa có Run; "
     "(3) `python3 -m coding_agent.cli plan-apply .coding-agent/plan.yaml`; "
     "(4) `python3 -m coding_agent.cli plan-next .coding-agent/plan.yaml`. Xem graph: `plan-status`."
@@ -302,6 +313,19 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python
     return None
 
 
+# The two rules the user set on 2026-11-04: the coordinator decides each task's tests and each worker's model.
+TEST_RULE = (
+    "Test: bạn quyết định. Việc có code chạy được → khai `--verify` / `verify:` bằng lệnh test hợp với việc đó "
+    "(vd `go test ./pkg/...`, `npm test -- path`); việc chỉ đổi tài liệu/hạ tầng → không cần verify, tự kiểm kết quả. "
+    "Stop-gate của phiên bạn không chạy test; stop-gate của worker chỉ chạy đúng lệnh verify của task đó."
+)
+MODEL_RULE = (
+    "Model: chọn theo độ khó — `haiku` cho việc máy móc (đổi chữ, sao chép, tra cứu), `sonnet` cho việc thường, "
+    "`opus` cho việc khó/rủi ro cao (bảo mật, prod, thiết kế). Không ghi → model mặc định. "
+    "Ghi bằng `--model` / `model:` (claude nhận `--model`, codex nhận `-m`)."
+)
+
+
 AUTO_DECIDE_LINE = (
     "- Auto-decide đang bật: khi cần người dùng quyết (kể cả câu hỏi worker leo thang), hỏi bằng tool AskUserQuestion, "
     "không hỏi bằng văn bản rồi kết thúc lượt. Đặt phương án bạn gợi ý lên đầu, nhãn kết thúc bằng \"(Recommended)\". "
@@ -320,7 +344,9 @@ def contract(python_src: str, auto_decide: bool = False) -> str:
         "- Chỉ worker được ghi: mọi lần ghi file, script tạm, hay lệnh shell đổi trạng thái là việc của worker. Bạn không tự làm, và không viết lại lệnh bị chặn để lách guard.",
         "- Khi việc cần ghi, hoặc khi hook chặn một lệnh: giao ngay trong cùng lượt, bằng lệnh delegate (một việc nhỏ) hoặc graph (nhiều việc). Không xin phép người dùng, không kết thúc lượt để chờ. Chỉ hỏi người dùng khi quyết định thật sự là của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài), không hỏi \"có giao việc không\".",
         "- Chưa có Orca Run: tự chạy `run-init --objective \"...\"` với mục tiêu một dòng, rồi giao việc. Không nhờ người dùng chạy.",
-        f"- Giao việc bằng: {delegate_command(python_src)} [--agent claude|codex]",
+        f"- Giao việc bằng: {delegate_command(python_src)} [--agent claude|codex] [--model M] [--verify CMD]",
+        "- " + TEST_RULE,
+        "- " + MODEL_RULE,
         "- Folder project (root không phải repo git, chứa nhiều repo con): mọi lệnh delegate phải có `--repo <đường dẫn repo>`, và mỗi node trong plan đặt `repo:`. Worker tách nhánh từ HEAD của repo đó; đổi bằng `--base-branch` / `base:`.",
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
@@ -374,8 +400,10 @@ def question_lines(questions: list[dict[str, Any]], owners: dict[str, str] | Non
 def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: str, others: frozenset[str] | set[str] = frozenset(),
                 questions: list[dict[str, Any]] | None = None, heard: dict[str, str] | None = None,
                 now: datetime | None = None, run: str | None = None, stalled: dict[str, str] | None = None,
-                silent: dict[str, str] | None = None) -> list[str]:
+                silent: dict[str, str] | None = None, models: dict[str, str] | None = None) -> list[str]:
     """The task board for this repository, one line per task, grouped by state.
+
+    `models` maps a task to the model its worker started with (`worker_models`); the task's line ends with `[model]`.
 
     `others` are the repositories this coordinator delegated into; their tasks are listed too, each with its repository.
     `questions` (`orca_cli.open_questions`) come first: a task waiting on an answer is not listed as running. `heard`
@@ -401,7 +429,8 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
     def row(task: dict[str, Any]) -> str:
         title = task.get("task_title") or task.get("title") or ""
         repo = f" (repo {task['project']})" if task.get("project") != project else ""
-        return f"  - {task.get('id')} [{task.get('status')}] {title}".rstrip() + repo
+        model = (models or {}).get(str(task.get("id")))
+        return f"  - {task.get('id')} [{task.get('status')}] {title}".rstrip() + (f" [{model}]" if model else "") + repo
 
     halted = [task for task in mine if str(task.get("id")) in stalled]
     quiet = [task for task in mine if str(task.get("id")) in silent]
@@ -530,7 +559,8 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
 
     found = resume.auto(root, tasks, run, session)
     lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]}, questions, heard,
-                        run=orca_cli.run_id(run), stalled=resume.board_notes(found), silent=resume.silent_notes(found))
+                        run=orca_cli.run_id(run), stalled=resume.board_notes(found), silent=resume.silent_notes(found),
+                        models=worker_models(roots))
     if activity_error:
         lines.append(f"câu hỏi của worker không đọc được: {activity_error}")
     try:
@@ -553,6 +583,15 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
     except orca_cli.OrcaError as error:
         lines.append(f"danh sách worktree chờ dọn không đọc được: {str(error)[:160]}")
     return lines, None, None
+
+
+def worker_models(roots: list[Path]) -> dict[str, str]:
+    """Orca task id to the model its worker started with, from the workers ledgers of `roots`; the first root's wins."""
+    models: dict[str, str] = {}
+    for root in reversed(roots):
+        models.update({record["task_id"]: record["model"] for record in orca_cli.worker_records(root)
+                       if record.get("model") and record.get("task_id")})
+    return models
 
 
 def repo_owners(roots: list[Path]) -> dict[str, str]:

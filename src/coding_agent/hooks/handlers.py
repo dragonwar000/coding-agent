@@ -27,6 +27,10 @@ WRITE_TOOLS_FOR_LOOP = ("Write", "Edit", "MultiEdit", "Bash")
 TAIL_CHARS = 2000
 RESTORE_PROMPTS = 3
 RESTORE_CHARS = 1000
+# pytest exits 5 when it collected no test: nothing was checked, so that command is `skipped`, never a failure.
+PYTEST = re.compile(r"\bpytest\b")
+PYTEST_NO_TESTS = 5
+COORDINATOR_DECIDES = "coordinator decides tests"
 
 
 def _inject(event: str, text: str) -> str:
@@ -154,20 +158,65 @@ def _remember_permission_mode(ctx: Context, data: dict[str, Any] | None) -> None
     state.save_permission_mode(ctx.root, mode, ctx.session)
 
 
+def _failed(check: dict[str, Any]) -> bool:
+    """A check that failed: a non-zero exit (or a timeout) that is not pytest's `no tests ran`."""
+    return check.get("exit") != 0 and not check.get("skipped")
+
+
 def _verify(commands: tuple[str, ...], cwd: str, timeout: int) -> list[dict[str, Any]]:
-    """Run the verification commands in order and stop at the first failure. A timeout counts as a failure."""
+    """Run the verification commands in order and stop at the first failure. A timeout counts as a failure.
+
+    A pytest command that exits 5 collected no test: it is marked `skipped` and the next command runs.
+    """
     checks: list[dict[str, Any]] = []
     for command in commands:
         try:
             run = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
             output = (run.stdout + run.stderr)[-TAIL_CHARS:]
             checks.append({"command": command, "exit": run.returncode, "output": output})
+            if run.returncode == PYTEST_NO_TESTS and PYTEST.search(command):
+                checks[-1]["skipped"] = True
         except subprocess.TimeoutExpired as error:
             tail = ((error.stdout or b"").decode("utf-8", "replace") if isinstance(error.stdout, bytes) else (error.stdout or ""))[-TAIL_CHARS:]
             checks.append({"command": command, "exit": None, "output": tail + "\n[timed out]"})
-        if checks[-1]["exit"] != 0:
+        if _failed(checks[-1]):
             break
     return checks
+
+
+def _verdict(checks: list[dict[str, Any]]) -> str:
+    """`not-ok` when a check failed, `ok` when at least one passed, else `skipped` (every command ran no test)."""
+    if not checks or any(_failed(check) for check in checks):
+        return "not-ok"
+    return "ok" if any(check.get("exit") == 0 for check in checks) else "skipped"
+
+
+def _graph_bound(ctx: Context) -> bool:
+    """Whether the coordinator rule applies here: coordinator-guard is declared and not `off`."""
+    guard = ctx.manifest.hook("coordinator-guard") if ctx.manifest is not None else None
+    return guard is not None and guard.mode != "off"
+
+
+def _session_verify(ctx: Context) -> tuple[tuple[str, ...], str, str | None]:
+    """The verify commands of this session, where they come from, and why there are none.
+
+    The coordinator (`coordinator.role_for`, as coordinator-guard decides it, while that guard is not `off`) runs no
+    verification: it decides the tests of each task. A worker runs the commands its task declared (`delegate --verify`,
+    a plan node's `verify:`, kept in the workers ledger); a task that declared none is `skipped`. Any other session
+    (a maintainer, a repository without coordinator-guard, or a worker marked only by `CODING_AGENT_ROLE` whose
+    worktree has no ledger record, so no task is known) runs `verify.commands` of the manifest.
+    """
+    manifest = ctx.manifest
+    assert manifest is not None
+    cwd = _cwd(ctx)
+    role = coordinator.role_for(cwd)
+    if role == "coordinator" and _graph_bound(ctx):
+        return (), "coordinator", COORDINATOR_DECIDES
+    record = coordinator.worker_record(cwd) if role == "worker" else None
+    if record is not None:
+        commands = tuple(record.get("verify") or ())
+        return commands, "task", None if commands else "task declares no verify"
+    return manifest.verify_commands, "manifest", None if manifest.verify_commands else "verify.commands is empty"
 
 
 def _turn_changed(ctx: Context, turn: transcript.Turn, data: dict[str, Any], has_transcript: bool) -> bool:
@@ -211,19 +260,19 @@ def _changed_repos(root: Path, paths: list[str]) -> list[Path]:
     return sorted(repos)
 
 
-def _verify_turn(ctx: Context, turn: transcript.Turn) -> list[dict[str, Any]]:
+def _verify_turn(ctx: Context, turn: transcript.Turn, commands: tuple[str, ...]) -> list[dict[str, Any]]:
     """Run the verification commands where the manifest's scope says: the root, or each changed repository."""
     manifest = ctx.manifest
     assert manifest is not None
     places = _changed_repos(ctx.root, list(turn.changes)) if manifest.verify_scope == "changed-repos" else []
     if not places:
-        return _verify(manifest.verify_commands, str(ctx.root), manifest.verify_timeout_s)
+        return _verify(commands, str(ctx.root), manifest.verify_timeout_s)
     checks: list[dict[str, Any]] = []
     for place in places:
-        found = _verify(manifest.verify_commands, str(place), manifest.verify_timeout_s)
+        found = _verify(commands, str(place), manifest.verify_timeout_s)
         label = place.relative_to(ctx.root.resolve()).as_posix()
         checks.extend({**check, "command": f"{check['command']} (in {label})"} for check in found)
-        if found and found[-1]["exit"] != 0:
+        if found and _failed(found[-1]):
             break
     return checks
 
@@ -242,19 +291,21 @@ def stop_gate(ctx: Context) -> HookResult:
     lines = _line_count(path)
     data = state.load(ctx.root, ctx.session)
 
-    if not manifest.verify_commands:
+    commands, source, why_none = _session_verify(ctx)
+    if not commands:
         checks, verdict = [], "skipped"
     elif manifest.verify_when == "changed" and not _turn_changed(ctx, turn, data, bool(path)):
         checks, verdict = [], "no-change"
     else:
-        checks = _verify_turn(ctx, turn)
-        verdict = "ok" if checks and all(c["exit"] == 0 for c in checks) else "not-ok"
+        checks = _verify_turn(ctx, turn, commands)
+        verdict = _verdict(checks)
+        why_none = "pytest ran no tests (exit 5)" if verdict == "skipped" else None
 
     continuations = int(data.get("continuations", 0))
     result = HookResult()
 
     if verdict == "not-ok":
-        failing = next((c for c in checks if c["exit"] != 0), checks[-1] if checks else {"command": "", "output": ""})
+        failing = next((c for c in checks if _failed(c)), checks[-1] if checks else {"command": "", "output": ""})
         reason = f"[stop-gate] verification failed: {failing['command']}\n{failing['output']}"
         if ctx.mode == "enforce" and continuations < manifest.max_continuations:
             data["continuations"] = continuations + 1
@@ -268,7 +319,8 @@ def stop_gate(ctx: Context) -> HookResult:
         if continuations:
             data["continuations"] = 0
             state.save(ctx.root, ctx.session, data)
-        ctx.note(guard="stop-gate", kind=verdict, applied=False, detail={"commands": len(checks)})
+        ctx.note(guard="stop-gate", kind=verdict, applied=False,
+                 detail={"commands": len(checks), "source": source, **({"reason": why_none} if verdict == "skipped" and why_none else {})})
         follow = _after_verify(ctx, turn, data, verdict, checks, bool(path))
         if follow is not None:
             return follow

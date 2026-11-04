@@ -67,7 +67,7 @@ def manifest_text(python_src: str, verify: str, python: str = "python3") -> str:
     """
     text = TEMPLATE.read_text(encoding="utf-8")
     for old, new in (("python: python3\n", f"python: {python}\n"), ("python_src: src\n", f"python_src: {python_src}\n"),
-                     ('    - "python3 -m pytest -q"\n', f'    - "{verify}"\n')):
+                     ("  commands: []\n", f'  commands:\n    - "{verify}"\n')):
         if text.count(old) != 1:
             raise InstallError(f"template.yaml has no unique line {old.strip()!r}; the installer cannot set it")
         text = text.replace(old, new)

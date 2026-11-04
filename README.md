@@ -258,7 +258,7 @@ Cài lại là an toàn: lệnh giống nhau cho cùng kết quả. Gỡ giữ n
 installer in tên các hook đó. Thêm `--add-new-hooks` để bổ sung chúng vào cuối manifest (giữ `integration.yaml.bak`).
 Các giá trị bạn đã sửa trong manifest không bị đổi.
 
-Cần có: Python 3.11 trở lên, git, và lệnh verify trong manifest chạy được trong PATH (mặc định `python3 -m pytest -q`).
+Cần có: Python 3.11 trở lên, git, và lệnh verify trong manifest chạy được trong PATH (installer ghi mặc định `python3 -m pytest -q`; chỉ phiên maintainer hoặc repo không có `coordinator-guard` chạy nó).
 Hook chạy bằng `python3` trên PATH, nên `python3` đó cũng phải có PyYAML.
 
 Kiểm tra trạng thái sau khi cài:
@@ -328,7 +328,11 @@ trong PATH (chạy từ PowerShell mà Git Bash không nằm trong PATH), instal
 
 - Đổi lệnh Python sau khi cài: sửa `python:` trong `integration.yaml` rồi chạy lại lệnh cài. Giá trị chỉ là tên lệnh
   (`python`, `python3`, `py`), không nhận đường dẫn có dấu cách hay tham số.
-- Lệnh verify mặc định là `<python> -m pytest -q`. Đổi trong `integration.yaml` cho hợp dự án.
+- Test do coordinator quyết theo từng việc (xem "Coordinator: test và model theo việc"). Phiên coordinator không chạy
+  verify (event `skipped`, lý do `coordinator decides tests`); phiên worker chạy đúng lệnh `--verify` / `verify:` của task,
+  task không khai thì `skipped`, không chặn. `verify.commands` trong manifest chỉ dùng cho phiên khác (maintainer, repo không có
+  `coordinator-guard`, hoặc worker chỉ đánh dấu bằng `CODING_AGENT_ROLE` mà sổ worker không có): repo này để `[]`; installer ghi `<python> -m pytest -q` cho dự án mới (đổi bằng `--verify`).
+  Danh sách rỗng là `skipped`, không chặn. Lệnh pytest thoát mã 5 (không thu được test nào) tính là `skipped`, không phải lỗi.
 - `verify.when: changed` (mặc định) bỏ qua verify khi lượt không sửa file: không có `Write`/`Edit` thành công trong transcript
   và cây làm việc của gốc không đổi so với đầu lượt (commit của `HEAD`, cùng trạng thái, kích thước và giờ sửa của từng file bẩn). Ngoài git, chỉ transcript làm bằng chứng. Không chắc thì vẫn verify.
   Event là `no-change`. Đặt `when: always` để verify mọi lượt như trước.
@@ -370,18 +374,39 @@ Nó không tự sửa file.
   event `direct-change` nếu cây của coordinator có file mới đổi. Đây là phát hiện, không hoàn tác. Sửa tay của người dùng
   trong lúc đó cũng bị tính.
 - **Hợp đồng và bảng việc** được nạp đầu phiên, sau nén ngữ cảnh, và mỗi prompt.
+- **Test và model theo việc:** xem mục dưới.
 - **Nới lỏng:** đổi `coordinator-guard` sang `mode: shadow` trong `integration.yaml` rồi cài lại. Khi đó hook chỉ nhắc.
 
 Lưu ý khi dùng:
 - Worker tách nhánh từ commit hiện tại của coordinator. Việc chưa commit ở cây chính thì worker không thấy.
-- Worktree mới chưa có phụ thuộc đã cài (ví dụ `node_modules`), nên lệnh verify ở `stop-gate` của worker sẽ fail cho tới khi
-  worker cài. Cấu hình setup của repo trong Orca để tránh.
+- Worktree mới chưa có phụ thuộc đã cài (ví dụ `node_modules`), nên lệnh `--verify` của task ở `stop-gate` của worker sẽ fail
+  cho tới khi worker cài. Cấu hình setup của repo trong Orca để tránh.
 - Orca đánh task `completed` khi worker tự báo xong. Bảng việc xếp nó vào "báo xong nhưng chưa có bằng chứng"; node phụ
   thuộc vẫn được giao tiếp. Kiểm kết quả trước khi báo người dùng.
 - Sửa một dòng cũng phải qua graph. Không có ngoại lệ cho việc nhỏ.
 
 Đã kiểm với Orca cài trên máy (2026-10-04): `run-init`, `plan-apply`, `plan-next`, `board` chạy trọn một graph 2 node,
 node sau chỉ được giao khi node trước xong. Chưa kiểm: `task-update` qua `orca-status`.
+
+### Coordinator: test và model theo việc
+
+Hợp đồng in ở đầu phiên coordinator có hai luật:
+
+- **Test: bạn quyết định.** Việc có code chạy được → khai `--verify` / `verify:` bằng lệnh test hợp với việc đó
+  (vd `go test ./pkg/...`, `npm test -- path`); việc chỉ đổi tài liệu/hạ tầng → không cần verify, tự kiểm kết quả.
+- **Model: chọn theo độ khó** — `haiku` cho việc máy móc (đổi chữ, sao chép, tra cứu), `sonnet` cho việc thường,
+  `opus` cho việc khó/rủi ro cao (bảo mật, prod, thiết kế). Không ghi → model mặc định.
+
+```sh
+python3 -m coding_agent.cli delegate --title "..." --spec "..." [--agent claude|codex] [--model M] [--verify CMD]
+```
+
+- `--verify` lặp được; lệnh được ghi vào sổ worker (`coding-agent-workers.jsonl`, trường `verify`), và `stop-gate` của phiên
+  worker chạy đúng các lệnh đó trong worktree. Task không khai → `skipped`, không chặn. Phiên coordinator không chạy verify.
+- `--model`: Claude chạy `claude --model M`, Codex chạy `codex -m M`; agent khác bỏ qua và ghi event `model` / `not-applied`.
+  Có model thì agent được mở trong terminal riêng như khi có permission mode. Không có model → lệnh khởi động mặc định của agent.
+  Model được ghi vào event `delegated` và `worker-started`, vào sổ worker, và hiện trên bảng việc ở cuối dòng task (`[sonnet]`).
+- Node của plan dùng `model:` và `verify:` (danh sách lệnh); `plan-next` truyền xuống worker. `worker-start` cũng nhận `--model`, `--verify`.
 
 ## Chia việc theo graph
 
@@ -398,6 +423,9 @@ tasks:
     spec: Room actor, transport
     deps: [protocol]
     agent: codex        # tuỳ chọn
+    model: sonnet       # tuỳ chọn; claude --model / codex -m. Không ghi → model mặc định
+    verify:             # tuỳ chọn; lệnh stop-gate của worker chạy. Không ghi → skipped
+      - go test ./server/...
 ```
 
 ```sh

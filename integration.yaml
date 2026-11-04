@@ -16,10 +16,13 @@ python: python3
 # Thư mục chứa package, tính từ gốc repo (nơi đặt manifest này). Đường dẫn tương đối, không tuyệt đối.
 python_src: src
 
-# Lệnh verify chạy ở sự kiện Stop. Rỗng nghĩa là không có bằng chứng nào: phán quyết là `skipped`, không bao giờ `ok`.
+# Lệnh verify chạy ở sự kiện Stop. Rỗng nghĩa là không có bằng chứng nào: phán quyết là `skipped` (không chặn), không bao giờ `ok`.
+# Coordinator quyết định test cho từng việc: phiên coordinator không chạy verify; phiên worker chạy đúng lệnh verify của
+# task (`delegate --verify CMD`, `verify:` của node trong plan.yaml), task không khai thì `skipped`. Danh sách dưới đây
+# chỉ dùng cho phiên khác (maintainer, repo không có coordinator-guard, worker không có trong sổ worker). pytest thoát mã 5
+# (không có test) là `skipped`.
 verify:
-  commands:
-    - "python3 -m pytest -q"
+  commands: []
   timeout_s: 300
   max_continuations: 3
   # changed: chỉ verify lượt có sửa file (theo transcript và git status). always: mọi lượt.

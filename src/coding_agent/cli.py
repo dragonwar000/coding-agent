@@ -10,10 +10,13 @@
 - `claim --task-id ID [--project NAME]`: refuse a task owned by another repository and log the refusal (FR-008).
 - `orca-check --tasks FILE [--strict]`: report `CLAIMED-DONE BUT ABSENT`; `--strict` exits 1 when any is found (SC-002).
 - `status`: this repository's Orca tasks by state, read from the live Orca CLI (FR-014, SC-001).
-- `delegate --title ... --spec ... [--agent claude|codex] [--t-id T-x] [--repo PATH] [--base-branch REF] [--permission-mode M]`: create a task and start an Orca worker on it
+- `delegate --title ... --spec ... [--agent claude|codex] [--model M] [--verify CMD ...] [--t-id T-x] [--repo PATH] [--base-branch REF] [--permission-mode M]`: create a task and start an Orca worker on it
   in its own worktree (coordinator). `--repo` names the git repository the worktree is created in; a root outside git requires it.
+  `--model` starts the worker on that model (`claude --model M`, `codex -m M`; another agent ignores it, logged as
+  `guard: model`, `kind: not-applied`); without it the agent starts on its default. `--verify` (repeatable) are the
+  commands the worker session's stop-gate runs; a task without any is `skipped` and never blocked.
 - `board`: the task board the coordinator sees on each prompt.
-- `worker-start --task-id ID [--agent A] [--repo PATH] [--base-branch REF] [--permission-mode M]`: start a worker on an existing task, recorded as a worker worktree.
+- `worker-start --task-id ID [--agent A] [--model M] [--verify CMD ...] [--repo PATH] [--base-branch REF] [--permission-mode M]`: start a worker on an existing task, recorded as a worker worktree.
   A Claude worker runs in the coordinator session's permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`):
   `--permission-mode`, else `CODING_AGENT_WORKER_PERMISSION_MODE`, else the mode the hooks last recorded in
   `.coding-agent/state/permission-mode` (under `--root`, else `$CLAUDE_PROJECT_DIR`, the working directory, or a parent
@@ -58,7 +61,8 @@
 - `roots-list`: the repositories `all_roots` reads, each with where it comes from (`own`, `tree`, `roots.json`).
 - `roots-add PATH...`: register repositories outside the tree by hand. Both act on `--root`, else the coordinator's directory.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
-- `plan-apply FILE`, `plan-next FILE [--max N] [--permission-mode M]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`).
+- `plan-apply FILE`, `plan-next FILE [--max N] [--permission-mode M]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`);
+  a node's `model:` and `verify:` go to its worker as `--model` and `--verify` do.
 - `auto-decide [on|off|status] [--timeout N] [--fable|--no-fable] [--fable-timeout N]`: turn auto-decide on or off and set how
   long a question to the user waits (10 to 3600 s) before Fable or the suggested option decides it. Stored in
   `.coding-agent/state/auto-decide.json`, which wins over `auto_decide:` in integration.yaml.
@@ -129,6 +133,12 @@ def _status(root: Path, run: str | None) -> int:
 def _target_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--repo", help="git repository the worker's worktree is created in, relative to the root or absolute (required when the root is not a git repository)")
     command.add_argument("--base-branch", help="ref the worktree starts from (default: the target repository's HEAD)")
+
+
+def _task_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--model", help="the worker's model, e.g. haiku, sonnet, opus (claude --model, codex -m; default: the agent's own)")
+    command.add_argument("--verify", action="append", default=[], metavar="CMD",
+                         help="a command the worker's stop-gate runs before its turn may end (repeatable; none: verification is skipped)")
 
 
 def _permission_option(command: argparse.ArgumentParser) -> None:
@@ -272,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--run")
     _target_options(start)
     _permission_option(start)
+    _task_options(start)
     adopt = sub.add_parser("worker-adopt", help="record an existing worktree as a worker's")
     adopt.add_argument("--worktree", required=True, type=Path)
     adopt.add_argument("--task-id", default="adopted")
@@ -323,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     delegate.add_argument("--run", help="Orca Run id (default: CODING_AGENT_ORCA_RUN or the bound Run)")
     _target_options(delegate)
     _permission_option(delegate)
+    _task_options(delegate)
 
     check = sub.add_parser("orca-check", help="find tasks that claim completion while an artifact is missing")
     check.add_argument("--tasks", required=True, type=Path)
@@ -386,7 +398,8 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             agent = args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude")
             print(json.dumps({"task_id": args.task_id, "dispatch": orca_cli.worker_start(root, task_id=args.task_id, agent=agent, run=args.run,
                                                                                               repo=args.repo, base=args.base_branch,
-                                                                                              permission_mode=args.permission_mode)}))
+                                                                                              permission_mode=args.permission_mode,
+                                                                                              model=args.model, verify=tuple(args.verify))}))
             return 0
         if args.command == "worker-adopt":
             if not args.worktree.is_dir():
@@ -482,6 +495,8 @@ def _command(args: argparse.Namespace, root: Path) -> int:
                 repo=args.repo,
                 base=args.base_branch,
                 permission_mode=args.permission_mode,
+                model=args.model,
+                verify=tuple(args.verify),
             )
             print(json.dumps({"task_id": task_id, "dispatch": dispatch}, ensure_ascii=False))
             return 0

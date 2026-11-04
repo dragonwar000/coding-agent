@@ -43,8 +43,10 @@ def claude_config_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pyt
 
 @pytest.fixture(autouse=True)
 def no_session_project(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
-    """No test sees the real session's project: no CLAUDE_PROJECT_DIR, and an empty working directory."""
+    """No test sees the real session's project: no CLAUDE_PROJECT_DIR, no inherited CODING_AGENT_ROLE (a worker
+    terminal sets it), and an empty working directory."""
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
     monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
 
 

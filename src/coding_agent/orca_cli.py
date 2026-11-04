@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -472,10 +473,12 @@ def workers_ledger(root: Path) -> Path:
     return common / "coding-agent-workers.jsonl" if common is not None else root / FOLDER_LEDGER
 
 
-def worker_records(root: Path) -> list[dict[str, str]]:
+def worker_records(root: Path) -> list[dict[str, Any]]:
     """The worker worktrees still in place: `{worktree, task_id, dispatch, base, repo, base_branch, head, run, at}`, in
     the order they were started.
 
+    `model` (the model the worker started with, `--model`/`model:`) and `verify` (the task's own verify commands, a
+    list, `--verify`/`verify:`) are present only when the task named them.
     `base` is the commit the worktree started from. `repo` is the repository the worktree belongs to, `base_branch` the
     full ref of the branch the worker was started from (`refs/heads/develop`, given as `--base-branch` or a plan
     node's `base:`), `head` the worker's last commit the cleanup saw (`record_head`), `run` the Orca Run the task was
@@ -501,6 +504,12 @@ def worker_records(root: Path) -> list[dict[str, str]]:
                                         "base": str(record.get("base") or ""), "repo": str(record.get("repo") or ""),
                                         "base_branch": str(record.get("base_branch") or ""), "head": str(record.get("head") or ""),
                                         "run": str(record.get("run") or ""), "at": str(record.get("at") or "")}
+            # Kept only when the task named them, so records written without them read as before.
+            if record.get("model"):
+                live[record["worktree"]]["model"] = str(record["model"])
+            verify = record.get("verify")
+            if isinstance(verify, list) and verify:
+                live[record["worktree"]]["verify"] = [str(command) for command in verify if isinstance(command, str) and command.strip()]
     return list(live.values())
 
 
@@ -612,7 +621,7 @@ def remove_worktree(path: str, *, force: bool = False) -> None:
 
 
 def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str, base_ref: str | None = None,
-                  run: str | None = None) -> None:
+                  run: str | None = None, model: str | None = None, verify: tuple[str, ...] = ()) -> None:
     """Add a worker worktree to the ledger, with the commit it starts from, the Run its task is in, and the time.
 
     The start commit is what later tells the worker's own commits apart from the difference between branches.
@@ -624,6 +633,8 @@ def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str, bas
     A worktree of another repository than `root` (a child repository of a folder project) is recorded twice: in that
     repository's ledger, which is what makes a session in the worktree a worker, and in the root's, which is what the
     coordinator's board and cleanup read.
+    `model` and `verify` are the task's model and verify commands, kept when given: the board shows the model, and the
+    worker session's stop-gate runs exactly those commands (`hooks.handlers.stop_gate`).
     """
     resolved = Path(worktree).resolve()
     repo = _repo_path(resolved) if resolved.is_dir() else None
@@ -635,11 +646,15 @@ def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str, bas
     branch = branch_ref(resolved, base_ref) if base_ref and resolved.is_dir() else None
     if branch is not None:
         record["base_branch"] = branch
+    if model:
+        record["model"] = model
+    if verify:
+        record["verify"] = list(verify)
     for path in _ledgers(root, repo):
         _append(path, record)
 
 
-def record_head(root: Path, record: dict[str, str], head: str) -> None:
+def record_head(root: Path, record: dict[str, Any], head: str) -> None:
     """Keep `head` as the last commit seen in a recorded worker worktree: the record is written again with it.
 
     A whole record, not a partial line, so a reader that does not know `head` still reads the worker as it was. The
@@ -942,7 +957,7 @@ def worker_permission_mode(root: Path, explicit: str | None = None, session: str
 
 def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, display: str, run: str | None, *,
                            repo: Path | None = None, base: str | None = None, permission_mode: str | None = None,
-                           session: str = "cli") -> tuple[Any, str]:
+                           model: str | None = None, verify: tuple[str, ...] = (), session: str = "cli") -> tuple[Any, str]:
     """Start a worker in a new worktree, dispatching only once the agent is ready for input. Returns the worker-start
     answer and the worktree's path.
 
@@ -964,7 +979,8 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     check` dialog: the worktree is created without an agent (`worktree create` with no `--agent`) to learn its path,
     the main repository folder and the worktree are marked trusted in Claude Code's config, and only then is the agent
     started in a terminal of its own (`terminal create --command "claude"`, or `"claude --permission-mode MODE"` with a
-    `permission_mode`, which the caller passes only for Claude and only when it is not `default`; handle at
+    `permission_mode`, which the caller passes only for Claude and only when it is not `default`, and with the
+    agent's model flag when the caller passes a `model`, which it does only for Claude and Codex; handle at
     `result.terminal.handle`). Orca still opens its plain startup shell in that worktree, which stays idle. Trust is
     written only while the coordinator's folder is trusted itself; when it is not, nothing is written and the dialog is
     detected and reported as before. Another agent, or `CODING_AGENT_SHARE_TRUST=off` without a `permission_mode`,
@@ -997,16 +1013,17 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
         base_args = _base_args(repo, base)
     claude = agent == "claude"
     install = worktree_links.source_for(root, repo)
-    separate = bool(permission_mode) or (claude and trust.sharing_enabled()) or install is not None
+    # A model, like a permission mode, is a flag on the agent's command, which only a terminal of its own can carry.
+    separate = bool(permission_mode) or bool(model) or (claude and trust.sharing_enabled()) or install is not None
     path, terminal = _create_worktree(repo, name, base_args, None if separate else agent)
-    record_worker(root, worktree=path, task_id=task_id, dispatch="", base_ref=base, run=run)
+    record_worker(root, worktree=path, task_id=task_id, dispatch="", base_ref=base, run=run, model=model, verify=verify)
     dispatching = False
     try:
         if install is not None:
             link_worker_install(root, Path(path), repo, session=session, task_id=task_id)
         trust_note = _share_trust(root, [repo, Path(path)], session) if claude else None
         if separate:
-            command = agent_command(agent, permission_mode)
+            command = agent_command(agent, permission_mode, model)
             terminal = terminal_handle_of(_call_tool("terminal", "create", "--worktree", f"path:{path}", "--title", display, "--command", command))
             if terminal is None:
                 raise OrcaError(f"the terminal create answer for worktree {path} has no terminal handle, so no task was dispatched")
@@ -1046,18 +1063,38 @@ def _drop_new_worktree(root: Path, path: str, task_id: str, error: BaseException
 
 
 ROLE_PREFIX = "CODING_AGENT_ROLE=worker "
+# The flag each agent takes a model name with. Another agent has no known flag: its model is not applied (and logged).
+MODEL_FLAGS = {"claude": "--model", "codex": "-m"}
+# A model name: an alias (`haiku`, `sonnet`, `opus`) or a full id (`claude-opus-5-5`, `gpt-5.1-codex`, `opus[1m]`).
+MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,99}")
 
 
-def agent_command(agent: str, permission_mode: str | None = None, *, windows: bool | None = None) -> str:
-    """The command a worker's terminal starts its agent with: `agent`, `--permission-mode MODE` when given, and on
-    macOS and Linux a `CODING_AGENT_ROLE=worker` prefix.
+def check_model(model: str | None) -> str | None:
+    """`model` stripped, or None when not given. A name with spaces or shell characters raises OrcaError, because the
+    name is typed into the worker terminal's shell (`agent_command`)."""
+    if model is None or not model.strip():
+        return None
+    model = model.strip()
+    if not MODEL_NAME.fullmatch(model):
+        raise OrcaError(f"model {model!r} is not a model name (letters, digits, and . _ : / @ [ ] -)")
+    return model
+
+
+def agent_command(agent: str, permission_mode: str | None = None, model: str | None = None, *, windows: bool | None = None) -> str:
+    """The command a worker's terminal starts its agent with: `agent`, `--permission-mode MODE` when given, the
+    agent's model flag (`claude --model NAME`, `codex -m NAME`) when a model is given, and on macOS and Linux a
+    `CODING_AGENT_ROLE=worker` prefix. Another agent takes no model flag; the caller logs that (`worker_start`).
 
     Orca types `--command` into the login shell of the terminal, where `NAME=value command` sets the variable for the
     agent and the hooks it runs, so `coordinator.role_for` reads `worker` even without the workers ledger. On Windows
     the shell may be PowerShell or cmd, which do not take that form; there the ledger alone marks the worker.
     """
-    command = f"{agent} --permission-mode {permission_mode}" if permission_mode else agent
     windows = sys.platform == "win32" if windows is None else windows
+    command = f"{agent} --permission-mode {permission_mode}" if permission_mode else agent
+    flag = MODEL_FLAGS.get(agent)
+    if model and flag:
+        # zsh expands `[...]` (as in `opus[1m]`) as a glob, so the name is quoted outside Windows.
+        command += f" {flag} {model if windows else shlex.quote(model)}"
     return command if windows else f"{ROLE_PREFIX}{command}"
 
 
@@ -1076,7 +1113,8 @@ def link_worker_install(root: Path, worktree: Path, repo: Path | None = None, *,
 
 
 def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None, session: str = "cli", title: str | None = None,
-                 repo: str | Path | None = None, base: str | None = None, permission_mode: str | None = None) -> str:
+                 repo: str | Path | None = None, base: str | None = None, permission_mode: str | None = None,
+                 model: str | None = None, verify: tuple[str, ...] = ()) -> str:
     """Start one supervised worker on `task_id` in a new worktree, and return the dispatch id.
 
     The worktree and its branch are named from the task title, and Orca shows the title on the worker's row.
@@ -1085,7 +1123,12 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
     `root` is outside git); `base` is the ref it starts from, by default the commit that repository has checked out.
     A Claude worker runs in the permission mode `worker_permission_mode` picks; `default`, no mode, or another agent
     keeps the agent's own start command (another agent's skip is logged).
+    `model` starts the worker on that model (`claude --model`, `codex -m`); another agent starts on its default and the
+    skip is logged (`guard=model kind=not-applied`); no model keeps the agent's own start command. `verify` are the
+    task's verify commands, which the worker session's stop-gate runs. Both are kept in the workers ledger.
     """
+    model = check_model(model)
+    verify = tuple(command.strip() for command in verify if command and command.strip())
     target = target_repo(root, repo)
     title = title if title is not None else _title_of(task_id, run)
     name = worktree_name(title, task_id)
@@ -1095,18 +1138,25 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
         events.record(root, guard="permission-mode", kind="not-applied", mode="enforce", applied=False, session=session,
                       detail={"task_id": task_id, "agent": agent, "permission_mode": mode, "source": source,
                               "reason": "--permission-mode is a Claude Code flag; this agent starts with its own default"})
+    applied_model = model if model is not None and agent in MODEL_FLAGS else None
+    if model is not None and applied_model is None:
+        events.record(root, guard="model", kind="not-applied", mode="enforce", applied=False, session=session,
+                      detail={"task_id": task_id, "agent": agent, "model": model,
+                              "reason": "only claude (--model) and codex (-m) take a model flag; this agent starts on its own default"})
     answer, created = _start_in_new_worktree(root, task_id, agent, name, (title or name)[:DISPLAY_LIMIT], run, repo=target, base=base,
-                                             permission_mode=applied, session=session)
+                                             permission_mode=applied, model=applied_model, verify=verify, session=session)
     dispatch = dispatch_id_of(answer)
     worktree = created or worktree_of(answer) or find_worktree(target or root, name)
     if worktree is not None:
-        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch, base_ref=base, run=run)
+        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch, base_ref=base, run=run, model=applied_model, verify=verify)
+    shown_model = applied_model or "agent-default"
     events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
                   detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree, "name": name,
+                          "model": shown_model, "verify": list(verify),
                           "turn_start": "unobserved" if turn_unobserved(answer) else "observed"})
     events.record(root, guard="permission-mode", kind="worker-started", mode="enforce", applied=applied is not None, session=session,
                   detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "permission_mode": applied or "agent-default",
-                          "resolved": mode, "source": source, **_session_origin(root, source)})
+                          "model": shown_model, "resolved": mode, "source": source, **_session_origin(root, source)})
     if turn_unobserved(answer):
         kick_worker(root, task_id=task_id, dispatch=dispatch, session=session)
     return dispatch
@@ -1326,15 +1376,18 @@ def kick_by_hand(root: Path, *, task_id: str, run: str | None = None, session: s
 
 
 def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: str | None = None, session: str = "cli",
-             repo: str | Path | None = None, base: str | None = None, permission_mode: str | None = None) -> tuple[str, str]:
+             repo: str | Path | None = None, base: str | None = None, permission_mode: str | None = None,
+             model: str | None = None, verify: tuple[str, ...] = ()) -> tuple[str, str]:
     """Create a task for this repository and start a worker on it. Returns (task id, dispatch id).
 
-    The target repository is resolved first, so a folder project without `repo` fails before any task exists.
+    The target repository and the model name are checked first, so a folder project without `repo`, or a malformed
+    model, fails before any task exists. `model` and `verify` go to `worker_start`.
     """
+    check_model(model)
     target_repo(root, repo)
     task_id = create_task(root, project=orca.project_name(root), t_id=t_id, spec=spec, title=title, run=run)
     return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session, title=title, repo=repo, base=base,
-                                 permission_mode=permission_mode)
+                                 permission_mode=permission_mode, model=model, verify=verify)
 
 
 def _reports(answer: Any) -> list[dict[str, Any]]:

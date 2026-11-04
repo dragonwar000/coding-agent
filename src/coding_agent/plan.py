@@ -13,6 +13,9 @@ Plan file (YAML):
         agent: codex        # optional; default is the delegate default
         repo: services/api  # optional; the git repository the worker's worktree is created in (required in a folder project)
         base: develop       # optional; the ref the worktree starts from (default: that repository's HEAD)
+        model: sonnet       # optional; the worker's model (claude --model, codex -m); default: the agent's own
+        verify:             # optional; the commands the worker's stop-gate runs; none: verification is `skipped`
+          - go test ./server/...
 
 `apply` creates one Orca task per node, in dependency order, passing Orca the ids of the tasks it depends on.
 The mapping from plan id to Orca task id is kept in `.coding-agent/plan.json`, so applying twice creates nothing new.
@@ -46,6 +49,8 @@ class Node:
     agent: str | None
     repo: str | None = None
     base: str | None = None
+    model: str | None = None
+    verify: tuple[str, ...] = ()
 
 
 def _text(value: Any, where: str) -> str:
@@ -69,7 +74,17 @@ def parse(raw: Any) -> list[Node]:
         deps = item.get("deps", [])
         if not isinstance(deps, list) or not all(isinstance(dep, str) and dep.strip() for dep in deps):
             raise PlanError(f"tasks[{node_id}].deps must be a list of task ids")
-        agent, repo, base = item.get("agent"), item.get("repo"), item.get("base")
+        agent, repo, base, model = item.get("agent"), item.get("repo"), item.get("base"), item.get("model")
+        verify = item.get("verify", [])
+        if isinstance(verify, str):
+            verify = [verify]
+        if not isinstance(verify, list) or not all(isinstance(command, str) and command.strip() for command in verify):
+            raise PlanError(f"tasks[{node_id}].verify must be a list of commands")
+        if model is not None:
+            try:
+                model = orca_cli.check_model(_text(model, f"tasks[{node_id}].model"))
+            except orca_cli.OrcaError as error:
+                raise PlanError(f"tasks[{node_id}].model: {error}") from error
         nodes[node_id] = Node(
             id=node_id,
             title=_text(item.get("title"), f"tasks[{node_id}].title"),
@@ -78,6 +93,8 @@ def parse(raw: Any) -> list[Node]:
             agent=_text(agent, f"tasks[{node_id}].agent") if agent is not None else None,
             repo=_text(repo, f"tasks[{node_id}].repo") if repo is not None else None,
             base=_text(base, f"tasks[{node_id}].base") if base is not None else None,
+            model=model,
+            verify=tuple(command.strip() for command in verify),
         )
     for node in nodes.values():
         for dep in node.deps:
@@ -173,7 +190,8 @@ def dispatch_ready(root: Path, nodes: list[Node], *, default_agent: str, run: st
     started: list[tuple[str, str, str]] = []
     for node in ready(nodes, states(root, nodes, run=run))[:max(limit, 0)]:
         dispatch = orca_cli.worker_start(root, task_id=mapping[node.id], agent=node.agent or default_agent, run=run, title=node.title,
-                                         repo=node.repo, base=node.base, permission_mode=permission_mode)
+                                         repo=node.repo, base=node.base, permission_mode=permission_mode,
+                                         model=node.model, verify=node.verify)
         started.append((node.id, mapping[node.id], dispatch))
     return started
 
