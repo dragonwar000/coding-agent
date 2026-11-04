@@ -38,8 +38,11 @@
   worktrees go and nothing needs confirming; `--discard` also removes unmerged or uncommitted work, so it needs `--yes`
   after the user confirmed.
 - After `plan-next`, `plan-status`, `inbox`, `delegate` and `worktree-list`, merged, clean worktrees of settled workers
-  are removed without asking (`cleanup.auto_clean`), one `auto-clean: removed <name> (<task>)` line each.
-  `CODING_AGENT_AUTO_CLEAN=off` turns that off. An auto-clean error is a warning and does not change the exit code.
+  are removed without asking (`cleanup.auto_clean`), one `auto-clean: removed <name> (<task>)` line each; so are the
+  clean worktrees of workers whose `worker-start` failed. Each worker's task is read in the Run it was dispatched in.
+  `CODING_AGENT_AUTO_CLEAN=off` turns that off. An auto-clean error, a Run whose task list cannot be read (its
+  worktrees are skipped, the other Runs' are still cleaned) and a worker terminal that cannot be closed are each an
+  `auto-clean: warning:` line and do not change the exit code.
 - `inbox [--ack [--task-id ID ...]]`: worker reports the coordinator has not handled; `--ack` acknowledges them and prints
   each one (task, repository, subject). With `--task-id` (repeatable) only those tasks' reports are acknowledged.
   Without `--ack` it first prints the worker questions nobody answered, each with its `orca orchestration reply` command.
@@ -143,11 +146,15 @@ TERMINAL_RUN = frozenset({"orca-create", "orca-status", "claim", "status", "work
 
 def _auto_clean(root: Path, run: str | None) -> None:
     """Remove merged, clean worktrees of settled workers and say so. Never fails the command it follows."""
+    warnings: list[str] = []
     try:
-        results = cleanup.auto_clean(root, run)
+        results = cleanup.auto_clean(root, run, warnings=warnings)
     except (orca_cli.OrcaError, OSError) as error:
         print(f"auto-clean: warning: {str(error)[:200]}", file=sys.stderr)
         return
+    finally:
+        for warning in warnings:
+            print(f"auto-clean: warning: {warning}", file=sys.stderr)
     for item, outcome in results:
         if outcome == "removed":
             print(f"auto-clean: removed {Path(item.worktree).name} ({item.task_id})")
@@ -412,13 +419,14 @@ def _command(args: argparse.Namespace, root: Path) -> int:
         if args.command in ("worktree-list", "worktree-clean"):
             if args.command == "worktree-list":
                 _auto_clean(root, args.run)
-                lines = cleanup.board_lines(cleanup.candidates(root, args.run))
+                lines = cleanup.board_lines(cleanup.candidates(root, args.run))  # warnings were printed by the auto-clean above
                 print("\n".join(lines[:-1]) if lines else "worktree-list: no settled worker worktree left")
                 return 0
             if args.discard and not args.yes:
                 print("worktree-clean: refused. --discard loses unmerged work: ask the user to confirm, then pass --yes.", file=sys.stderr)
                 return 2
-            found = cleanup.candidates(root, args.run)
+            warnings: list[str] = []
+            found = cleanup.candidates(root, args.run, warnings=warnings)
             if not args.all and not args.task_id:
                 print("worktree-clean: name the worktrees with --task-id, or pass --all.", file=sys.stderr)
                 return 2
@@ -426,9 +434,11 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             unknown = [] if args.all else [task for task in args.task_id if task not in {item.task_id for item in found}]
             for task in unknown:
                 print(f"worktree-clean: {task} has no settled worker worktree", file=sys.stderr)
-            results = cleanup.clean(root, chosen, discard=args.discard)
+            results = cleanup.clean(root, chosen, discard=args.discard, warnings=warnings)
             for item, outcome in results:
                 print(f"{outcome}: {Path(item.worktree).name} ({item.task_id})")
+            for warning in warnings:
+                print(f"worktree-clean: warning: {warning}", file=sys.stderr)
             # `--all` keeps unsafe worktrees by design; a named one that was kept, or any Orca failure, is an error.
             missed = [outcome for _item, outcome in results if outcome.startswith("failed") or (outcome.startswith("kept") and not args.all)]
             return 1 if unknown or missed else 0

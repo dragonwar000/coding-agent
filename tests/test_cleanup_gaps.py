@@ -49,7 +49,7 @@ def orca(monkeypatch: pytest.MonkeyPatch) -> dict:
 
     monkeypatch.setattr(orca_cli, "list_tasks", lambda run=None: [{"id": k, "status": v, "title": k} for k, v in fake["tasks"].items()])
     monkeypatch.setattr(orca_cli, "remove_worktree", remove)
-    monkeypatch.setattr(orca_cli, "release_worker", lambda dispatch: fake["released"].append(dispatch))
+    monkeypatch.setattr(orca_cli, "release_worker", lambda dispatch, worktree=None: fake["released"].append(dispatch))
     return fake
 
 

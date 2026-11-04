@@ -608,6 +608,22 @@ coordinator) và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-
 `auto-clean: removed <tên> (<task>)` và ghi event `worktree-auto-removed`. Lỗi khi tự dọn chỉ là cảnh báo, không đổi mã thoát
 của lệnh. Đặt `CODING_AGENT_AUTO_CLEAN=off` để tắt.
 
+- **Theo Run của từng worker:** sổ worker ghi Run của task (`run`) lúc worker được tạo, nên task được đọc trong đúng Run đó dù
+  coordinator đã chuyển sang Run mới (`run-init` lại sau khi bị fence); mỗi Run chỉ đọc `task-list` một lần. Bản ghi cũ chưa có
+  `run` thì đọc trong Run hiện tại.
+- **Run không đọc được** (ví dụ `consumer_fenced`): chỉ bỏ qua các worktree của Run đó, in `auto-clean: warning: ...` và ghi
+  event `worktree-run-unread`; các Run khác vẫn được dọn, và bản ghi của Run đó mà thư mục đã mất vẫn được đánh dấu đã xoá.
+- **Dispatch hỏng:** khi tạo worker mà bước sau `worktree create` lỗi (hộp thoại trust, agent không sẵn sàng, `worker-start` bị
+  từ chối như `consumer_fenced`), worktree vừa tạo được gỡ ngay (`worktree rm --force`), bản ghi bị bỏ, rồi lỗi gốc được báo
+  (event `worker-start-failed`). `worker-start` không trả lời gì (treo, crash) thì có thể worker đã chạy, nên worktree được giữ.
+  Worktree còn sót kiểu này (bản ghi không có dispatch, task không `dispatched`/`running` hoặc không còn, ghi đã quá 15 phút)
+  được tự dọn khi sạch và không có commit nào sau commit nó bắt đầu.
+- **Terminal của worker:** `worker-release` trả `state: retained` (`external_terminal`) cho worker chạy trong terminal Orca
+  thường và không đóng gì, nên khi đó các terminal có thư mục đúng bằng worktree của worker được đóng
+  (`orca terminal list` + `orca terminal close`; event `worker-terminals-closed`). Không đóng terminal nào ngoài worktree đó.
+  Release bị từ chối hay terminal không đóng được là cảnh báo (`worker-release-failed`, `worker-terminal-close-failed`), không
+  chặn việc xoá worktree.
+
 Worktree đã kiểm là an toàn được xoá với force: file runtime của harness (`.coding-agent/`) và nhiễu bit thực thi trên Windows
 làm `git worktree remove` từ chối dù không còn việc gì trong đó. Thư mục sót lại khi việc xoá dừng giữa chừng
 (`Directory not empty`):

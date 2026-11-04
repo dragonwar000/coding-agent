@@ -544,9 +544,12 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
     try:
         from coding_agent import cleanup
 
-        found = cleanup.candidates(root, run)
-        removed = {item.worktree for item, outcome in cleanup.auto_clean(root, run, session=session, found=found) if outcome == "removed"}
+        warnings: list[str] = []
+        found = cleanup.candidates(root, run, warnings=warnings, session=session)
+        removed = {item.worktree for item, outcome in cleanup.auto_clean(root, run, session=session, found=found, warnings=warnings)
+                   if outcome == "removed"}
         lines = lines + cleanup.board_lines([item for item in found if item.worktree not in removed])
+        lines = lines + [f"dọn worktree, cảnh báo: {warning}" for warning in warnings]
     except orca_cli.OrcaError as error:
         lines.append(f"danh sách worktree chờ dọn không đọc được: {str(error)[:160]}")
     return lines, None, None

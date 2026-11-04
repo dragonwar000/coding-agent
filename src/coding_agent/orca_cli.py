@@ -48,6 +48,13 @@ class OrcaError(RuntimeError):
     """The Orca CLI failed, printed no JSON, or answered `ok: false`."""
 
 
+class OrcaRefused(OrcaError):
+    """Orca answered `ok: false`: it read the command and refused it, so the command changed nothing.
+
+    Every other OrcaError (no JSON, a crash, a timeout) leaves open whether Orca acted.
+    """
+
+
 @dataclass(frozen=True)
 class Transition:
     """What happened to a status request: `sent` says whether Orca was called, `decision` is the status applied or `unverified`."""
@@ -316,7 +323,7 @@ def _run_orca(*words: str, timeout: float = TIMEOUT_S) -> Any:
             raise OrcaError(f"orca {args[0]} exited {run.returncode}: {(run.stderr or run.stdout).strip()[:400]}") from error
         raise OrcaError(f"orca {args[0]} printed no JSON") from error
     if isinstance(answer, dict) and answer.get("ok") is False:
-        raise OrcaError(f"orca {args[0]} answered ok:false: {_error_message(answer)}")
+        raise OrcaRefused(f"orca {args[0]} answered ok:false: {_error_message(answer)}")
     if run.returncode != 0:
         if isinstance(answer, dict) and answer.get("ok") is True:
             answer[EXIT_KEY] = run.returncode
@@ -466,14 +473,15 @@ def workers_ledger(root: Path) -> Path:
 
 
 def worker_records(root: Path) -> list[dict[str, str]]:
-    """The worker worktrees still in place: `{worktree, task_id, dispatch, base, repo, base_branch, head}`, in the order
-    they were started.
+    """The worker worktrees still in place: `{worktree, task_id, dispatch, base, repo, base_branch, head, run, at}`, in
+    the order they were started.
 
     `base` is the commit the worktree started from. `repo` is the repository the worktree belongs to, `base_branch` the
     full ref of the branch the worker was started from (`refs/heads/develop`, given as `--base-branch` or a plan
-    node's `base:`), and `head` the worker's last commit the cleanup saw (`record_head`); each is an empty string when
-    unknown or in a record written before it was kept. A later line for a worktree replaces its earlier record, and a
-    later `removed` line drops it.
+    node's `base:`), `head` the worker's last commit the cleanup saw (`record_head`), `run` the Orca Run the task was
+    dispatched in, and `at` when the record was written (seconds since the epoch); each is an empty string when unknown
+    or in a record written before it was kept. A later line for a worktree replaces its earlier record, and a later
+    `removed` line drops it.
     """
     path = workers_ledger(root)
     if not path.exists():
@@ -491,7 +499,8 @@ def worker_records(root: Path) -> list[dict[str, str]]:
         else:
             live[record["worktree"]] = {"worktree": record["worktree"], "task_id": str(record.get("task_id") or ""), "dispatch": str(record.get("dispatch") or ""),
                                         "base": str(record.get("base") or ""), "repo": str(record.get("repo") or ""),
-                                        "base_branch": str(record.get("base_branch") or ""), "head": str(record.get("head") or "")}
+                                        "base_branch": str(record.get("base_branch") or ""), "head": str(record.get("head") or ""),
+                                        "run": str(record.get("run") or ""), "at": str(record.get("at") or "")}
     return list(live.values())
 
 
@@ -533,9 +542,68 @@ def mark_removed(root: Path, worktree: str) -> None:
         _append(path, {"worktree": worktree, "removed": True})
 
 
-def release_worker(dispatch: str) -> None:
-    """Release the terminal of one settled worker."""
-    _call("worker-release", "--dispatch", dispatch)
+@dataclass(frozen=True)
+class Release:
+    """What `release_worker` did: Orca's `state` and `reason`, the terminals closed, and what could not be done."""
+
+    state: str
+    reason: str
+    closed: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+def release_worker(dispatch: str, worktree: str | None = None) -> Release:
+    """Release one settled worker, and close its terminals when Orca keeps them.
+
+    Measured on Orca 1.4.222 over 98 workers: `worker-release --dispatch <id>` answers `ok: true` with
+    `result: {state: retained, reason: external_terminal, processAction: none}` for a worker running in an ordinary
+    Orca terminal, and stops nothing. So when the state is still `retained`, the terminals Orca lists in `worktree`
+    (`close_worktree_terminals`) are closed; no other terminal is touched. A terminal that cannot be closed is a
+    warning in the answer, not an error. An error from `worker-release` itself is raised.
+    """
+    answer = _call("worker-release", "--dispatch", dispatch)
+    result = answer.get("result") if isinstance(answer, dict) else None
+    result = result if isinstance(result, dict) else {}
+    state, reason = str(result.get("state") or ""), str(result.get("reason") or "")
+    if state != "retained" or not worktree:
+        return Release(state=state, reason=reason)
+    closed, warnings = close_worktree_terminals(worktree)
+    return Release(state=state, reason=reason, closed=tuple(closed), warnings=tuple(warnings))
+
+
+def _same_dir(left: str, right: str) -> bool:
+    return os.path.normcase(os.path.realpath(left)) == os.path.normcase(os.path.realpath(right))
+
+
+def close_worktree_terminals(worktree: str) -> tuple[list[str], list[str]]:
+    """Close every terminal Orca lists whose worktree is `worktree` (`terminal list`, then `terminal close --terminal`).
+
+    Returns the handles closed and a warning per failure. A terminal of any other directory, a subdirectory included,
+    is never closed. `terminal list` answers `result.terminals[]` with `handle` and `worktreePath` (measured on
+    Orca 1.4.222); a `truncated` list is closed as far as it goes and reported.
+    """
+    try:
+        answer = _call_tool("terminal", "list")
+    except OrcaError as error:
+        return [], [f"terminal list: {str(error)[:200]}"]
+    result = answer.get("result") if isinstance(answer, dict) else None
+    result = result if isinstance(result, dict) else {}
+    terminals = result.get("terminals") if isinstance(result.get("terminals"), list) else []
+    warnings = ["terminal list was truncated; terminals beyond it were not checked"] if result.get("truncated") else []
+    closed: list[str] = []
+    for terminal in terminals:
+        if not isinstance(terminal, dict):
+            continue
+        handle, path = terminal.get("handle"), terminal.get("worktreePath")
+        if not (isinstance(handle, str) and handle and isinstance(path, str) and path and _same_dir(path, worktree)):
+            continue
+        try:
+            _call_tool("terminal", "close", "--terminal", handle)
+        except OrcaError as error:
+            warnings.append(f"terminal close {handle}: {str(error)[:200]}")
+            continue
+        closed.append(handle)
+    return closed, warnings
 
 
 def remove_worktree(path: str, *, force: bool = False) -> None:
@@ -543,13 +611,16 @@ def remove_worktree(path: str, *, force: bool = False) -> None:
     _call_tool("worktree", "rm", "--worktree", f"path:{path}", *(["--force"] if force else []))
 
 
-def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str, base_ref: str | None = None) -> None:
-    """Add a worker worktree to the ledger, with the commit it starts from.
+def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str, base_ref: str | None = None,
+                  run: str | None = None) -> None:
+    """Add a worker worktree to the ledger, with the commit it starts from, the Run its task is in, and the time.
 
     The start commit is what later tells the worker's own commits apart from the difference between branches.
     `base_ref` is the ref the worker was started from (`--base-branch`, a plan node's `base:`); when it names a branch,
     its full ref is kept as `base_branch`, because the coordinator merges such a worker into that branch rather than
     into its own (`cleanup._unmerged`). A commit id, or no `base_ref`, records no branch.
+    The Run is `run`, else this process's Run (`run_id`); the cleanup reads the task in that Run even after the
+    coordinator moved to another one. With neither, no Run is recorded and the cleanup uses its current Run.
     A worktree of another repository than `root` (a child repository of a folder project) is recorded twice: in that
     repository's ledger, which is what makes a session in the worktree a worker, and in the root's, which is what the
     coordinator's board and cleanup read.
@@ -557,7 +628,10 @@ def record_worker(root: Path, *, worktree: str, task_id: str, dispatch: str, bas
     resolved = Path(worktree).resolve()
     repo = _repo_path(resolved) if resolved.is_dir() else None
     record = {"worktree": str(resolved), "task_id": task_id, "dispatch": dispatch, "base": _head(resolved) if resolved.is_dir() else None,
-              "repo": str(repo) if repo is not None else None}
+              "repo": str(repo) if repo is not None else None, "at": int(time.time())}
+    chosen = run_id(run)
+    if chosen:
+        record["run"] = chosen
     branch = branch_ref(resolved, base_ref) if base_ref and resolved.is_dir() else None
     if branch is not None:
         record["base_branch"] = branch
@@ -881,6 +955,10 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     OrcaError is raised. An answer without an agent terminal falls back to `worker-start --agent` on the new worktree.
     `repo` names the repository; by default it is the one `root` is in. The worktree is recorded before the worker
     starts, so the worker's session already finds itself in the ledger.
+    When starting fails after the worktree was created (the trust dialog, an agent never ready, or a refused
+    `worker-start`, such as `consumer_fenced` from a coordinator terminal no longer bound to the Run, seen on Orca 1.4.222),
+    the new worktree is removed again and its record dropped (`_drop_new_worktree`), then the error is raised. A
+    `worker-start` that gave no answer may still have started the worker, so its worktree stays.
 
     A Claude worker shares the coordinator's folder trust (`trust.share_trust`) so it never stops at the `Quick safety
     check` dialog: the worktree is created without an agent (`worktree create` with no `--agent`) to learn its path,
@@ -921,19 +999,50 @@ def _start_in_new_worktree(root: Path, task_id: str, agent: str, name: str, disp
     install = worktree_links.source_for(root, repo)
     separate = bool(permission_mode) or (claude and trust.sharing_enabled()) or install is not None
     path, terminal = _create_worktree(repo, name, base_args, None if separate else agent)
-    record_worker(root, worktree=path, task_id=task_id, dispatch="", base_ref=base)
-    if install is not None:
-        link_worker_install(root, Path(path), repo, session=session, task_id=task_id)
-    trust_note = _share_trust(root, [repo, Path(path)], session) if claude else None
-    if separate:
-        command = agent_command(agent, permission_mode)
-        terminal = terminal_handle_of(_call_tool("terminal", "create", "--worktree", f"path:{path}", "--title", display, "--command", command))
-        if terminal is None:
-            raise OrcaError(f"the terminal create answer for worktree {path} has no terminal handle, so no task was dispatched")
-    if terminal is None:
-        return _call("worker-start", "--task", task_id, "--agent", agent, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
-    _wait_agent_ready(terminal, path, trust_note=trust_note)
-    return _call("worker-start", "--task", task_id, "--terminal", terminal, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
+    record_worker(root, worktree=path, task_id=task_id, dispatch="", base_ref=base, run=run)
+    dispatching = False
+    try:
+        if install is not None:
+            link_worker_install(root, Path(path), repo, session=session, task_id=task_id)
+        trust_note = _share_trust(root, [repo, Path(path)], session) if claude else None
+        if separate:
+            command = agent_command(agent, permission_mode)
+            terminal = terminal_handle_of(_call_tool("terminal", "create", "--worktree", f"path:{path}", "--title", display, "--command", command))
+            if terminal is None:
+                raise OrcaError(f"the terminal create answer for worktree {path} has no terminal handle, so no task was dispatched")
+        if terminal is not None:
+            _wait_agent_ready(terminal, path, trust_note=trust_note)
+        dispatching = True
+        target = ("--terminal", terminal) if terminal is not None else ("--agent", agent)
+        return _call("worker-start", "--task", task_id, *target, "--worktree", f"path:{path}", "--display-name", display, *_run_args(run)), path
+    except (OrcaError, OSError) as error:
+        # Nothing was dispatched before `worker-start`, and an `ok: false` answer to it dispatched nothing either; any
+        # other worker-start error (a crash, a timeout) may have started the worker, so its worktree stays.
+        if not dispatching or isinstance(error, OrcaRefused):
+            _drop_new_worktree(root, path, task_id, error, session)
+        raise
+
+
+def _drop_new_worktree(root: Path, path: str, task_id: str, error: BaseException, session: str) -> None:
+    """Remove a worktree `_start_in_new_worktree` just created for a worker that was not started, and its ledger record.
+
+    It holds no work yet, so it is removed with force. When the removal fails the record stays, and the cleanup removes
+    the worktree later as one whose worker never started (`cleanup.candidates`). Logged as `worker-start-failed`.
+    """
+    resolved = str(Path(path).resolve())
+    removed, why = True, ""
+    try:
+        remove_worktree(path, force=True)
+    except OrcaError as failure:
+        removed, why = False, str(failure)[:200]
+    if removed:
+        mark_removed(root, resolved)
+    try:
+        events.record(root, guard="coordinator", kind="worker-start-failed", mode="enforce", applied=removed, session=session,
+                      detail={"task_id": task_id, "worktree": resolved, "error": str(error)[:300], "worktree_removed": removed,
+                              **({"remove_error": why} if why else {})})
+    except OSError:
+        pass
 
 
 ROLE_PREFIX = "CODING_AGENT_ROLE=worker "
@@ -991,7 +1100,7 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
     dispatch = dispatch_id_of(answer)
     worktree = created or worktree_of(answer) or find_worktree(target or root, name)
     if worktree is not None:
-        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch, base_ref=base)
+        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch, base_ref=base, run=run)
     events.record(root, guard="coordinator", kind="delegated", mode="enforce", applied=True, session=session,
                   detail={"task_id": task_id, "agent": agent, "dispatch": dispatch, "worktree": worktree, "name": name,
                           "turn_start": "unobserved" if turn_unobserved(answer) else "observed"})
@@ -1207,7 +1316,7 @@ def kick_by_hand(root: Path, *, task_id: str, run: str | None = None, session: s
     recorded = False
     linked: list[str] = []
     if worktree is not None and Path(worktree).resolve() not in {Path(w) for w in worker_worktrees(root)}:
-        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch)
+        record_worker(root, worktree=worktree, task_id=task_id, dispatch=dispatch, run=run)
         recorded = True
     if worktree is not None and Path(worktree).is_dir():
         prepared = link_worker_install(root, Path(worktree), _repo_path(Path(worktree)), session=session, task_id=task_id)

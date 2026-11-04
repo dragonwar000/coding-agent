@@ -62,8 +62,10 @@ def test_a_folder_root_with_repo_starts_the_worker_through_worktree_create(folde
     assert orca_cli.worker_worktrees(app) == {str(worktree)}
     assert coordinator.role_for(worktree) == "worker" and coordinator.role_for(app) == "coordinator"
     # The coordinator root sees the same worker, with the repository it belongs to.
-    assert orca_cli.worker_records(folder) == [{"worktree": str(worktree), "task_id": out["task_id"], "dispatch": out["dispatch"],
-                                                "base": git(app, "rev-parse", "HEAD"), "repo": str(app), "base_branch": "", "head": ""}]
+    records = orca_cli.worker_records(folder)
+    assert records[0].pop("at").isdigit()
+    assert records == [{"worktree": str(worktree), "task_id": out["task_id"], "dispatch": out["dispatch"],
+                        "base": git(app, "rev-parse", "HEAD"), "repo": str(app), "base_branch": "", "head": "", "run": "run_test"}]
     assert orca_cli.workers_ledger(folder) == folder / ".coding-agent" / "workers.jsonl"
 
 

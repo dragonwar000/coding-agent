@@ -1,8 +1,21 @@
 """Remove a worker's worktree after its task settled.
 
 A worktree is a candidate when coding-agent started a worker in it (the workers ledger) and its Orca task is
-`completed` or `failed`. `clean` releases the worker's terminal and removes the worktree through Orca, which also
-deletes its branch.
+`completed` or `failed`. The task is read in the Run the ledger record names (`orca_cli.record_worker` keeps the Run),
+so a worktree of an older Run is still found after the coordinator moved to a new Run; a record written before the Run
+was kept is read in the current Run. Each Run's task list is read once. A Run whose task list cannot be read (a fenced
+Run answers `consumer_fenced`) skips only its own records, with a warning, and never stops the other Runs; its records
+whose directory is gone are still marked removed.
+
+A worktree whose worker never started is a candidate too: recorded without a dispatch (`worker-start` failed after the
+worktree was created, and the start could not remove it), its task not `dispatched` or `running` (or gone from Orca),
+recorded at least `UNSTARTED_GRACE_S` ago, and clean, with no commit after the one it started from.
+
+`clean` releases the worker (`orca_cli.release_worker`) and removes the worktree through Orca, which also deletes its
+branch and ends the terminals in it. Orca keeps the terminal of a worker in an ordinary Orca terminal (`state:
+retained`, `reason: external_terminal`), so those terminals of the worktree are closed by hand first. A refused release
+or a terminal that will not close is a warning (an event, and a line from the CLI), never silent, and never stops the
+removal.
 
 A worktree is safe to remove when it holds no work that exists nowhere else: no uncommitted files, and no worker
 commits that are missing from both the coordinator's current branch and the task's base branch. The base branch is
@@ -36,6 +49,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,6 +57,11 @@ from typing import Any
 from coding_agent import events, orca, orca_cli, roots, worktree_links
 
 SETTLED = ("completed", "failed")
+ACTIVE = ("dispatched", "running")  # a task Orca handed to a worker: its worktree is in use
+# How long a record without a dispatch is left alone: `_start_in_new_worktree` records the worktree before the agent is
+# ready and `worker-start` answers (up to `orca_cli.AGENT_READY_TIMEOUT_S` plus the call), so a younger one may be a
+# worker that is starting right now.
+UNSTARTED_GRACE_S = 900
 AUTO_ENV = "CODING_AGENT_AUTO_CLEAN"
 WINDOWS = os.name == "nt"
 
@@ -302,54 +321,134 @@ def _orphan_is_merged(repo: Path, path: Path, gitdir: Path, record: dict[str, st
     return False
 
 
-def candidates(root: Path, run: str | None = None) -> list[Candidate]:
-    """Worker worktrees whose task settled, oldest first, with what removing each one would lose.
+def _unstarted(record: dict[str, str], task: dict[str, Any] | None) -> bool:
+    """True for a worker whose dispatch never started: recorded without a dispatch (not `adopted`), its task not handed
+    to a worker (`ACTIVE`) or gone from Orca, and recorded at least `UNSTARTED_GRACE_S` ago (a record from before the
+    time was kept counts as old)."""
+    if record["dispatch"] or (task is not None and task.get("status") in ACTIVE):
+        return False
+    try:
+        at = float(record.get("at") or 0)
+    except ValueError:
+        at = 0.0
+    return time.time() - at >= UNSTARTED_GRACE_S
+
+
+def _commits_since(path: Path, base: str) -> int:
+    """Commits in the worktree's HEAD after `base`, or UNKNOWN."""
+    if not base:
+        return UNKNOWN
+    out = _git(path, "rev-list", "--count", f"{base}..HEAD")
+    return int(out.strip()) if out and out.strip().isdigit() else UNKNOWN
+
+
+def _read_runs(keys: list[str | None], tasks: dict[str | None, dict[str, dict[str, Any]]],
+               unread: dict[str | None, str]) -> None:
+    """Read the task list of each Run in `keys` not read yet, once: into `tasks`, or its error into `unread`."""
+    for key in keys:
+        if key in tasks or key in unread:
+            continue
+        try:
+            tasks[key] = {str(task.get("id")): task for task in orca_cli.list_tasks(key)}
+        except orca_cli.OrcaError as error:
+            unread[key] = str(error)
+
+
+def candidates(root: Path, run: str | None = None, *, warnings: list[str] | None = None,
+               session: str = "cli") -> list[Candidate]:
+    """Worker worktrees whose task settled, or whose worker never started, oldest first, with what removing each one
+    would lose.
 
     Read from `root`'s workers ledger and from that of every repository `root` delegated into (`orca_cli.all_roots`);
     a worktree listed by two of them (repositories sharing one git directory) is listed once. A task no known
     repository owns makes `roots.discover` look its repository up from Orca first.
+
+    Each record's task is read in the Run the record names (`orca_cli.record_worker` keeps it), so a worktree of an
+    older Run is still found after the coordinator moved to a new one; a record without a Run uses `run` (the current
+    Run). Each Run's task list is read once. A Run whose task list cannot be read (`consumer_fenced`, ...) only skips
+    its own records, except those whose directory is gone, which are listed so they are marked removed; the error is
+    logged once per Run (`worktree-run-unread`) and added to `warnings`. Reading a fenced Run's task list works on
+    Orca 1.4.222 even when its mutations are fenced.
+
+    A record without a dispatch (`_unstarted`: `worker-start` failed after the worktree was made) is listed only when
+    its directory is gone, or when the worktree is clean and holds no commit after the one it started from.
     """
-    tasks = {str(task.get("id")): task for task in orca_cli.list_tasks(run)}
-    roots.discover(root, tasks, run)
+    current = orca_cli.run_id(run)
+    tasks: dict[str | None, dict[str, dict[str, Any]]] = {}
+    unread: dict[str | None, str] = {}
+    _read_runs([current], tasks, unread)
+    roots.discover(root, tasks.get(current, {}), run)
     home = orca.project_name(root)
     own = root.resolve()
+    records = [(owner, record) for owner in orca_cli.all_roots(root) for record in orca_cli.worker_records(owner)]
+    _read_runs([record["run"] or current for _owner, record in records], tasks, unread)
     found: list[Candidate] = []
     seen: set[str] = set()
-    for owner in orca_cli.all_roots(root):
-        name = orca.project_name(owner) if owner != own else home
-        for record in orca_cli.worker_records(owner):
-            task = tasks.get(record["task_id"])
-            if record["worktree"] in seen or task is None or task.get("status") not in SETTLED:
+    skipped: dict[str | None, int] = {}
+    for owner, record in records:
+        if record["worktree"] in seen:
+            continue
+        seen.add(record["worktree"])
+        key = record["run"] or current
+        path = Path(record["worktree"])
+        exists = path.is_dir() and not _only_junk(path)
+        if key in unread:
+            if exists:
+                skipped[key] = skipped.get(key, 0) + 1
                 continue
-            seen.add(record["worktree"])
-            path = Path(record["worktree"])
-            exists = path.is_dir() and not _only_junk(path)
-            repo = orca_cli.repo_of(owner, record)
-            gitdir = _lost_gitdir(path) if exists else None
-            if not exists:
-                dirty = unmerged = 0
-            elif gitdir is not None:
-                dirty = unmerged = 0 if _orphan_is_merged(repo, path, gitdir, record) else UNKNOWN
-            else:
-                head = (_git(path, "rev-parse", "HEAD") or "").strip()
-                if head and head != record.get("head"):
-                    _keep_head(owner, record, head)
-                dirty = _dirty(path)
-                unmerged = _unmerged(repo, head, record.get("base", ""), record.get("base_branch", ""))
-            found.append(Candidate(
-                task_id=record["task_id"],
-                dispatch=record["dispatch"],
-                worktree=record["worktree"],
-                status=str(task.get("status")),
-                title=str(task.get("task_title") or task.get("title") or ""),
-                exists=exists,
-                dirty=dirty,
-                unmerged=unmerged,
-                root="" if owner == own else str(owner),
-                repo="" if name == home else name,
-                orphan=gitdir is not None,
-            ))
+            task, status, unstarted = None, "Run không đọc được", False
+        else:
+            task = tasks[key].get(record["task_id"])
+            unstarted = not (task is not None and task.get("status") in SETTLED) and _unstarted(record, task)
+            if not unstarted and (task is None or task.get("status") not in SETTLED):
+                continue
+            status = str(task.get("status")) if task is not None else "task không còn trong Orca"
+        repo = orca_cli.repo_of(owner, record)
+        gitdir = _lost_gitdir(path) if exists else None
+        if unstarted and exists:
+            # A worker that never started did no work: only a clean worktree still at its start commit is listed.
+            if gitdir is not None or _dirty(path) != 0 or _commits_since(path, record.get("base", "")) != 0:
+                continue
+            dirty = unmerged = 0
+        elif not exists:
+            dirty = unmerged = 0
+        elif gitdir is not None:
+            dirty = unmerged = 0 if _orphan_is_merged(repo, path, gitdir, record) else UNKNOWN
+        else:
+            head = (_git(path, "rev-parse", "HEAD") or "").strip()
+            if head and head != record.get("head"):
+                _keep_head(owner, record, head)
+            dirty = _dirty(path)
+            unmerged = _unmerged(repo, head, record.get("base", ""), record.get("base_branch", ""))
+        name = orca.project_name(owner) if owner != own else home
+        found.append(Candidate(
+            task_id=record["task_id"],
+            dispatch=record["dispatch"],
+            worktree=record["worktree"],
+            status=status,
+            title=str((task or {}).get("task_title") or (task or {}).get("title") or ""),
+            exists=exists,
+            dirty=dirty,
+            unmerged=unmerged,
+            root="" if owner == own else str(owner),
+            repo="" if name == home else name,
+            orphan=gitdir is not None,
+        ))
+    for key, count in skipped.items():
+        _warn(root, warnings, session, kind="worktree-run-unread",
+              text=f"Run {key or '(bound)'}: task-list unreadable, {count} worktree(s) of it skipped: {unread[key][:200]}",
+              detail={"run": key or "", "records": count, "error": unread[key][:300]})
     return found
+
+
+def _warn(root: Path, warnings: list[str] | None, session: str, *, kind: str, text: str, detail: dict[str, Any]) -> None:
+    """A cleanup warning: added to `warnings` for the caller to show, and logged as an event (`applied: false`)."""
+    if warnings is not None:
+        warnings.append(text)
+    try:
+        events.record(root, guard="coordinator", kind=kind, mode="enforce", applied=False, session=session, detail=detail)
+    except OSError:
+        pass
 
 
 def _keep_head(owner: Path, record: dict[str, str], head: str) -> None:
@@ -360,9 +459,36 @@ def _keep_head(owner: Path, record: dict[str, str], head: str) -> None:
         pass  # a read-only ledger only costs that later check
 
 
+def _release(root: Path, item: Candidate, session: str, warnings: list[str] | None) -> None:
+    """Release the worker of `item` and close the terminals Orca keeps for it (`orca_cli.release_worker`).
+
+    Never stops the removal: a refused release (already released, Orca no longer tracks it, a fenced Run) and a
+    terminal that will not close are warnings (`worker-release-failed`, `worker-terminal-close-failed`).
+    """
+    try:
+        outcome = orca_cli.release_worker(item.dispatch, item.worktree)
+    except orca_cli.OrcaError as error:
+        _warn(root, warnings, session, kind="worker-release-failed",
+              text=f"{Path(item.worktree).name} ({item.task_id}): worker-release {item.dispatch}: {str(error)[:200]}",
+              detail={"task_id": item.task_id, "dispatch": item.dispatch, "error": str(error)[:300]})
+        return
+    for warning in getattr(outcome, "warnings", ()):
+        _warn(root, warnings, session, kind="worker-terminal-close-failed",
+              text=f"{Path(item.worktree).name} ({item.task_id}): {warning}",
+              detail={"task_id": item.task_id, "dispatch": item.dispatch, "worktree": item.worktree, "error": warning})
+    if getattr(outcome, "closed", ()):
+        events.record(root, guard="coordinator", kind="worker-terminals-closed", mode="enforce", applied=True, session=session,
+                      detail={"task_id": item.task_id, "dispatch": item.dispatch, "worktree": item.worktree,
+                              "terminals": list(outcome.closed), "release": {"state": outcome.state, "reason": outcome.reason}})
+
+
 def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session: str = "cli",
-          kind: str = "worktree-removed") -> list[tuple[Candidate, str]]:
-    """Remove each chosen worktree. Returns (candidate, outcome) with outcome `removed`, `kept: <why>`, or `failed: <why>`."""
+          kind: str = "worktree-removed", warnings: list[str] | None = None) -> list[tuple[Candidate, str]]:
+    """Remove each chosen worktree. Returns (candidate, outcome) with outcome `removed`, `kept: <why>`, or `failed: <why>`.
+
+    The worker is released first and its terminals closed when Orca keeps them (`_release`); what fails there is a
+    warning added to `warnings` and logged, and the worktree is still removed (removing it also ends its terminals).
+    """
     results: list[tuple[Candidate, str]] = []
     for item in chosen:
         if item.exists and not item.safe and not discard:
@@ -370,10 +496,7 @@ def clean(root: Path, chosen: list[Candidate], *, discard: bool = False, session
             continue
         try:
             if item.dispatch and item.dispatch != "adopted":
-                try:
-                    orca_cli.release_worker(item.dispatch)
-                except orca_cli.OrcaError:
-                    pass  # already released, or Orca no longer tracks it; the worktree removal below is what matters
+                _release(root, item, session, warnings)
             if item.exists:
                 # The install links go first, as links: no removal below ever walks into the coordinator's install.
                 worktree_links.unlink_install(Path(item.worktree))
@@ -434,7 +557,7 @@ def auto_enabled() -> bool:
 
 
 def auto_clean(root: Path, run: str | None = None, *, session: str = "cli",
-               found: list[Candidate] | None = None) -> list[tuple[Candidate, str]]:
+               found: list[Candidate] | None = None, warnings: list[str] | None = None) -> list[tuple[Candidate, str]]:
     """Remove every settled worker worktree that loses no work, without asking. Returns `clean`'s (candidate, outcome).
 
     Removed: safe candidates (with force, see `clean`); records whose directory no longer exists or holds only OS junk
@@ -442,13 +565,15 @@ def auto_clean(root: Path, run: str | None = None, *, session: str = "cli",
     (deleted directly, since git no longer knows them). Never touched: worktrees with commits merged into neither the
     coordinator's HEAD nor the task's base branch, uncommitted files, or a state git cannot report — including an
     orphaned checkout that cannot be proven to match a merged commit. An Orca error on one worktree is reported as its `failed:` outcome and does
-    not stop the others; an error listing the tasks raises `orca_cli.OrcaError`. `found` reuses candidates the caller
-    already listed.
+    not stop the others. `found` reuses candidates the caller already listed.
 
-    Limits: only tasks Orca lists for `run` are seen. With `run` None that is the Run the CLI is bound to
-    (`CODING_AGENT_ORCA_RUN`, or the stored or bound Run); `orca orchestration task-list` has no option to list
-    every Run, so a worker worktree whose task belongs to an older Run is never a candidate here and stays until
-    it is removed by hand. A worktree recorded by `worker-adopt` without a real task id has no task and is not seen either.
+    Each record's task is read in the Run the record names, else in `run` (None: the Run the CLI is bound to,
+    `CODING_AGENT_ORCA_RUN`, or the stored or bound Run). A Run whose task list cannot be read skips its records whose
+    directory still exists, and is a warning (added to `warnings`, logged as `worktree-run-unread`), not an error; a
+    record written before the Run was kept, whose task belongs to an older Run, is not seen. Worktrees whose worker
+    never started (`candidates`) are removed when clean and at their start commit. A worktree recorded by
+    `worker-adopt` without a real task id has no task and is not seen. Release and terminal-close failures are
+    warnings too (`clean`).
     Merged means reachable: a squash or rebase merge leaves the worker's own commits unmerged. A worker recorded before
     the base branch was kept is compared with HEAD alone. An orphaned checkout is matched only against the worker's
     last commit the cleanup saw while git still knew it, the branch named like its directory, and its start commit.
@@ -458,9 +583,9 @@ def auto_clean(root: Path, run: str | None = None, *, session: str = "cli",
     if found is None:
         if not any(orca_cli.worker_records(owner) for owner in orca_cli.all_roots(root)):
             return []
-        found = candidates(root, run)
+        found = candidates(root, run, warnings=warnings, session=session)
     chosen = [item for item in found if item.safe or not item.exists]
-    return clean(root, chosen, session=session, kind="worktree-auto-removed") if chosen else []
+    return clean(root, chosen, session=session, kind="worktree-auto-removed", warnings=warnings) if chosen else []
 
 
 def board_lines(found: list[Candidate]) -> list[str]:

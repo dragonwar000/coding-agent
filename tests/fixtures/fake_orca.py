@@ -18,6 +18,8 @@ the repository. `FAKE_ORCA_REAL_WORKTREE=1` makes `worktree create` add a real g
 `FAKE_ORCA_SCREEN` replaces what `terminal read` shows (lines separated by `\\n`). With `$CLAUDE_CONFIG_DIR` set,
 `worktree create` and `terminal create` copy `.claude.json` as it is at that moment to `$FAKE_ORCA_STATE.<word>-create.json`,
 so a test can see what was trusted when each call came.
+`FAKE_ORCA_WORKER_START_FENCED=1` makes `worker-start` answer the `consumer_fenced` refusal Orca gives a coordinator
+terminal no longer bound to the Task Run; `FAKE_ORCA_WORKER_START_CRASH=1` makes it exit 3 with no JSON.
 """
 
 import json
@@ -193,9 +195,14 @@ def main(argv: list[str]) -> int:
                     if other["status"] == "pending" and all(tasks[d]["status"] == "completed" for d in json.loads(other["deps"])):
                         other["status"] = "ready"
             answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"task": {"id": task["id"], "status": status}}}
+    elif command == "worker-start" and os.environ.get("FAKE_ORCA_WORKER_START_CRASH") == "1":
+        print("orca: lost connection to the runtime", file=sys.stderr)
+        return 3
     elif command == "worker-start":
         task = tasks.get(options.get("--task", ""))
-        if options.get("--worktree") == "new-child" and os.environ.get("FAKE_ORCA_NO_NEW_CHILD") == "1":
+        if os.environ.get("FAKE_ORCA_WORKER_START_FENCED") == "1":
+            answer = {"ok": False, "error": {"code": "consumer_fenced", "message": "worker-start requires the coordinator terminal currently bound to the Task Run"}}
+        elif options.get("--worktree") == "new-child" and os.environ.get("FAKE_ORCA_NO_NEW_CHILD") == "1":
             answer = {"ok": False, "error": {"code": "selector_not_found", "message": "selector_not_found"}}
         elif options.get("--worktree") == "new-child" and os.environ.get("FAKE_ORCA_FOLDER_PROJECT") == "1":
             answer = {"ok": False, "error": {"code": "invalid_argument", "message": "Folder projects cannot create orchestration worktrees; use current or an exact existing folder workspace."}}

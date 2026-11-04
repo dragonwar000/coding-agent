@@ -82,6 +82,8 @@ class FakeOrca:
             if self.terminal:
                 result["agentTerminalHandle"] = self.terminal
             return {"ok": True, "result": result}
+        if args[:2] == ("worktree", "rm"):
+            return {"ok": True, "result": {"removed": True}}
         if args[:2] == ("terminal", "read"):
             lines = self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
             return {"ok": True, "result": {"terminal": {"tail": lines}}}
@@ -123,6 +125,13 @@ def test_the_trust_dialog_stops_the_dispatch(fake, tmp_path):
     with pytest.raises(orca_cli.OrcaError, match="trust this folder"):
         start(tmp_path)
     assert orca.calls == []  # nothing typed into the dialog: Enter there picks `No, exit`
+    assert_new_worktree_removed(orca, tmp_path)
+
+
+def assert_new_worktree_removed(orca: FakeOrca, root: Path) -> None:
+    """Nothing was dispatched, so the worktree just created is removed again (with its agent terminal) and unrecorded."""
+    assert orca.tool_calls[-1] == ("worktree", "rm", "--worktree", "path:/wt/fix-login", "--force")
+    assert orca_cli.worker_records(root) == []
 
 
 def test_an_agent_never_ready_stops_the_dispatch_and_shows_the_screen(fake, tmp_path, monkeypatch):
@@ -132,6 +141,7 @@ def test_an_agent_never_ready_stops_the_dispatch_and_shows_the_screen(fake, tmp_
         start(tmp_path)
     assert "esc to interrupt" in str(raised.value)
     assert orca.calls == []
+    assert_new_worktree_removed(orca, tmp_path)
 
 
 def test_a_worktree_without_an_agent_terminal_falls_back_to_worker_start_agent(fake, tmp_path):
