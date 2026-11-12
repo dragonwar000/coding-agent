@@ -44,12 +44,15 @@ MUTATING_BASH = re.compile(
 SHELL_NAME = r"(?:\S*/)?(?:bash|sh|zsh|dash|ksh)(?=\s|$)"
 # Words that run the command after them (`sudo bash`, `env X=1 sh`).
 COMMAND_PREFIX = r"(?:(?:sudo|env|exec|nohup|command|nice|time)(?:\s+\S+)*?\s+)?"
-# A simple command whose program is a shell interpreter: its heredoc is the script it runs.
+# A command word that runs what it reads: a shell interpreter, or the `source` / `.` builtin
+# (`source /dev/stdin`, `. /dev/stdin`). `.` counts only as a word of its own, so `./run.sh` is not it.
+SCRIPT_RUNNER = r"(?:" + SHELL_NAME + r"|source(?=\s|$)|\.(?=\s|$))"
+# A simple command whose program runs its heredoc as a script (`bash <<'EOF'`, `source /dev/stdin <<'EOF'`).
 HEREDOC_SHELL = re.compile(
-    r"^\s*(?:[{!]\s*|(?:if|then|else|elif|do|while|until)\s+)*(?:\w+=\S*\s+)*" + COMMAND_PREFIX + SHELL_NAME
+    r"^\s*(?:[{!]\s*|(?:if|then|else|elif|do|while|until)\s+)*(?:\w+=\S*\s+)*" + COMMAND_PREFIX + SCRIPT_RUNNER
 )
-# The rest of the heredoc's line pipes it into a shell interpreter (`cat <<'EOF' | bash`).
-PIPE_TO_SHELL = re.compile(r"\|&?\s*(?:\w+=\S*\s+)*" + COMMAND_PREFIX + SHELL_NAME)
+# The rest of the heredoc's line pipes it into a script runner (`cat <<'EOF' | bash`, `cat <<'EOF' | source /dev/stdin`).
+PIPE_TO_SHELL = re.compile(r"\|&?\s*(?:\w+=\S*\s+)*" + COMMAND_PREFIX + SCRIPT_RUNNER)
 # Characters that end a shell word.
 WORD_END = " \t\n;&|()<>"
 
@@ -128,7 +131,8 @@ def code_only(command: str) -> str:
     substitutions, because the shell runs those. Quotes stay as empty pairs so word boundaries hold.
     A heredoc body (`<<WORD`, `<<-WORD`, not the here-string `<<<`) is data too: with a quoted delimiter it
     is dropped, with an unquoted one only its substitutions stay, like double-quoted text. When the heredoc
-    feeds a shell interpreter (`bash <<'EOF'`, `cat <<EOF | sh`) the body is the script, so it stays whole.
+    feeds a shell interpreter or the `source` / `.` builtin (`bash <<'EOF'`, `cat <<EOF | sh`,
+    `source /dev/stdin <<'EOF'`, `cat <<EOF | . /dev/stdin`) the body is the script, so it stays whole.
     The operator, the delimiter and the closing line stay. Comments and `((...))` arithmetic are kept as they
     are, so a `<<` in them does not start a body.
     """

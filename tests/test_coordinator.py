@@ -545,6 +545,7 @@ HTML_BODY = "<html><title>OpenMausBot</title>\n<p>a -> b</p> rm -rf x\n</html>"
     "cat <<'EOF'\n<a> unterminated",
     "cat <<< '<a>'",
     "grep x <<< \"$(cat notes.txt)\"",
+    "./run.sh <<'EOF'\n<a>\nEOF",
 ])
 def test_a_heredoc_body_is_data_not_shell(command, monkeypatch):
     monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
@@ -559,6 +560,9 @@ def test_a_heredoc_body_is_data_not_shell(command, monkeypatch):
     "/bin/zsh <<'EOF'\necho a > f\nEOF",
     "FOO=1 sudo -u me bash -s <<'EOF'\ntouch x\nEOF",
     "cat <<'EOF' | sh\nrm -rf x\nEOF",
+    "source /dev/stdin <<'EOF'\nrm -rf x\nEOF",
+    ". /dev/stdin <<EOF\nrm -rf x\nEOF",
+    "cat <<'EOF' | source /dev/stdin\nrm -rf x\nEOF",
     "cat <<EOF\n$(rm -rf x)\nEOF",
     "cat <<EOF\n`touch x`\nEOF",
     "cat <<'A' <<B\n<a>\nA\n$(touch y)\nB",
