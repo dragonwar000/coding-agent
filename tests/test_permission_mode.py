@@ -121,11 +121,11 @@ def test_unknown_payload_mode_is_ignored_and_logged(repo: Path, monkeypatch: pyt
 
 
 def test_claude_worker_gets_its_own_terminal_with_the_mode(repo: Path, fake_orca: Path) -> None:
-    dispatch = orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="Fix the thing", permission_mode="bypassPermissions")
+    dispatch = orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", model="sonnet", title="Fix the thing", permission_mode="bypassPermissions")
     orca = _orca(fake_orca)
     assert orca["created_worktrees"][0]["agent"] is None
     terminal = orca["created_terminals"][0]
-    assert terminal["command"] == orca_cli.agent_command("claude", "bypassPermissions")
+    assert terminal["command"] == orca_cli.agent_command("claude", "bypassPermissions", "sonnet")
     assert terminal["worktree"] == orca["dispatches"][dispatch]["worktree"]
     assert orca["dispatches"][dispatch]["terminal"] == terminal["handle"] and orca["dispatches"][dispatch]["agent"] == "claude"
     started = [e for e in _events(repo, "permission-mode") if e["kind"] == "worker-started"]
@@ -135,8 +135,8 @@ def test_claude_worker_gets_its_own_terminal_with_the_mode(repo: Path, fake_orca
 
 def test_session_mode_reaches_the_worker(repo: Path, fake_orca: Path) -> None:
     state.save_permission_mode(repo, "acceptEdits", "coord")
-    orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x")
-    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "acceptEdits")
+    orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", model="sonnet", title="x")
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "acceptEdits", "sonnet")
 
 
 def _child_repo(parent: Path) -> Path:
@@ -152,8 +152,8 @@ def test_root_inside_the_coordinator_project_reads_the_parent_record(repo: Path,
     state.save_permission_mode(repo, "bypassPermissions", "coord")
     child = _child_repo(repo)
     assert orca_cli.worker_permission_mode(child, None) == ("bypassPermissions", "session")
-    orca_cli.worker_start(child, task_id=_task(child), agent="claude", title="x")
-    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "bypassPermissions")
+    orca_cli.worker_start(child, task_id=_task(child), agent="claude", model="sonnet", title="x")
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "bypassPermissions", "sonnet")
     detail = [e for e in _events(child, "permission-mode") if e["kind"] == "worker-started"][-1]["detail"]
     assert detail["permission_mode"] == "bypassPermissions" and detail["source"] == "session"
     assert detail["origin"] == "parent" and detail["recorded_by"] == "coord"
@@ -166,8 +166,8 @@ def test_claude_project_dir_is_read_when_root_has_no_record(tmp_path: Path, repo
     other.mkdir()
     state.save_permission_mode(other, "acceptEdits", "coord")
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))
-    orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x")
-    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "acceptEdits")
+    orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", model="sonnet", title="x")
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", "acceptEdits", "sonnet")
     detail = [e for e in _events(repo, "permission-mode") if e["kind"] == "worker-started"][-1]["detail"]
     assert detail["source"] == "session" and detail["origin"] == "CLAUDE_PROJECT_DIR"
     assert detail["state_dir"] == (other.resolve() / ".coding-agent" / "state").as_posix()
@@ -187,13 +187,14 @@ def test_lookup_order_root_then_project_dir_then_cwd(tmp_path: Path, repo: Path,
 
 
 @pytest.mark.parametrize("mode", [None, "default"])
-def test_default_or_no_mode_keeps_worktree_create_agent(repo: Path, fake_orca: Path, mode: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CODING_AGENT_SHARE_TRUST", "off")  # with sharing on, a Claude worker always gets its own terminal
-    dispatch = orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x", permission_mode=mode)
+def test_default_or_no_mode_adds_no_mode_flag(repo: Path, fake_orca: Path, mode: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A Claude worker always has a model, so it always gets a terminal of its own; the mode flag alone is left out.
+    monkeypatch.setenv("CODING_AGENT_SHARE_TRUST", "off")
+    dispatch = orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", model="sonnet", title="x", permission_mode=mode)
     orca = _orca(fake_orca)
-    assert orca["created_worktrees"][0]["agent"] == "claude"
-    assert "created_terminals" not in orca
-    assert orca["dispatches"][dispatch]["terminal"] == "term_wt_x"
+    assert orca["created_worktrees"][0]["agent"] is None
+    assert orca["created_terminals"][0]["command"] == orca_cli.agent_command("claude", None, "sonnet")
+    assert orca["dispatches"][dispatch]["terminal"] == orca["created_terminals"][0]["handle"]
     started = [e for e in _events(repo, "permission-mode") if e["kind"] == "worker-started"]
     assert started[-1]["applied"] is False and started[-1]["detail"]["permission_mode"] == "agent-default"
 
@@ -211,6 +212,6 @@ def test_bypass_confirmation_stops_the_dispatch(repo: Path, fake_orca: Path, mon
     task_id = _task(repo)
     monkeypatch.setenv("FAKE_ORCA_SCREEN", "WARNING: Claude Code running in Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept")
     with pytest.raises(orca_cli.OrcaError, match="Bypass Permissions"):
-        orca_cli.worker_start(repo, task_id=task_id, agent="claude", title="x", permission_mode="bypassPermissions")
+        orca_cli.worker_start(repo, task_id=task_id, agent="claude", model="sonnet", title="x", permission_mode="bypassPermissions")
     orca = _orca(fake_orca)
     assert "dispatches" not in orca and "sent" not in orca

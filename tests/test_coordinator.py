@@ -225,7 +225,7 @@ def test_session_start_injects_the_contract_and_the_board(repo, fake_orca, monke
     monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
     manifest(repo, verify=[])
     committed_repo(repo)
-    orca_cli.delegate(repo, title="Ship", spec="ship it", t_id="T-30", agent="claude")
+    orca_cli.delegate(repo, title="Ship", spec="ship it", t_id="T-30", agent="claude", model="sonnet")
     result = call(repo, "coordinator-context", {"session_id": "c3", "cwd": str(repo), "hook_event_name": "SessionStart", "source": "startup"}, mode="shadow")
     body = json.loads(result.stdout)["hookSpecificOutput"]
     assert body["hookEventName"] == "SessionStart"
@@ -306,7 +306,7 @@ def test_delegate_creates_a_task_and_starts_a_worker_in_its_own_worktree(repo, f
                                              "display": "Refactor", "base": None}
     assert len(orca_cli.worker_worktrees(repo)) == 1
     assert state["tasks"][task_id]["status"] == "dispatched"
-    assert cli.main(["--root", str(repo), "delegate", "--title", "Docs", "--spec", "write docs", "--t-id", "T-32"]) == 0
+    assert cli.main(["--root", str(repo), "delegate", "--model", "sonnet", "--title", "Docs", "--spec", "write docs", "--t-id", "T-32"]) == 0
     assert json.loads(capsys.readouterr().out)["dispatch"].startswith("dsp_")
 
 
@@ -314,7 +314,7 @@ def test_delegate_without_a_run_fails_clearly(repo, fake_orca, monkeypatch):
     committed_repo(repo)
     monkeypatch.delenv("CODING_AGENT_ORCA_RUN")
     with pytest.raises(orca_cli.OrcaError, match="run_required"):
-        orca_cli.delegate(repo, title="x", spec="y", t_id="T-33", agent="claude")
+        orca_cli.delegate(repo, title="x", spec="y", t_id="T-33", agent="claude", model="sonnet")
 
 
 def test_a_worker_start_answer_without_a_dispatch_id_is_an_error():
@@ -409,11 +409,12 @@ def test_dirty_paths_is_none_outside_git(tmp_path):
 def test_worker_start_falls_back_to_worker_start_agent_when_the_worktree_has_no_agent_terminal(repo, fake_orca, monkeypatch):
     committed_repo(repo)
     monkeypatch.setenv("FAKE_ORCA_NO_AGENT_TERMINAL", "1")
-    task_id, dispatch = orca_cli.delegate(repo, title="Models", spec="x", t_id="T-50", agent="claude")
+    # codex: a claude worker always has a model, so its agent starts in a terminal of its own and never takes this path.
+    task_id, dispatch = orca_cli.delegate(repo, title="Models", spec="x", t_id="T-50", agent="codex")
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
-    assert [(w["name"], w["repo"], w["agent"]) for w in state["created_worktrees"]] == [("models", f"path:{repo.resolve()}", "claude")]
+    assert [(w["name"], w["repo"], w["agent"]) for w in state["created_worktrees"]] == [("models", f"path:{repo.resolve()}", "codex")]
     record = state["dispatches"][dispatch]
-    assert record["worktree"].startswith("path:") and record["task"] == task_id and record["agent"] == "claude" and record["terminal"] is None
+    assert record["worktree"].startswith("path:") and record["task"] == task_id and record["agent"] == "codex" and record["terminal"] is None
     assert "sent" not in state  # nothing typed into a terminal
     assert len(orca_cli.worker_worktrees(repo)) == 1
 
@@ -421,7 +422,7 @@ def test_worker_start_falls_back_to_worker_start_agent_when_the_worktree_has_no_
 def test_a_worker_start_error_is_raised_and_not_retried(repo, fake_orca):
     committed_repo(repo)
     with pytest.raises(orca_cli.OrcaError, match="unknown_task"):
-        orca_cli.worker_start(repo, task_id="task_nope", agent="claude")
+        orca_cli.worker_start(repo, task_id="task_nope", agent="claude", model="sonnet")
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
     assert len(state["created_worktrees"]) == 1 and "dispatches" not in state
 
@@ -459,7 +460,7 @@ def test_the_worktree_name_is_read_from_the_title(title, expected):
 def test_a_worker_started_by_task_id_gets_its_name_from_the_title_orca_stores(repo, fake_orca):
     committed_repo(repo)
     task_id = orca_cli.create_task(repo, project="demo-repo", t_id="T-60", spec="x", title="Vật thể tương tác, ánh sáng")
-    dispatch = orca_cli.worker_start(repo, task_id=task_id, agent="claude")
+    dispatch = orca_cli.worker_start(repo, task_id=task_id, agent="claude", model="sonnet")
     record = json.loads(fake_orca.read_text(encoding="utf-8"))["dispatches"][dispatch]
     assert record["name"] == "vat-the-tuong-tac-anh-sang" and record["display"] == "Vật thể tương tác, ánh sáng"
     assert not record["name"].startswith("ca-")

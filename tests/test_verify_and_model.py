@@ -4,6 +4,8 @@
   session runs its task's own `verify` commands; no commands is `skipped` and never blocks; pytest's exit 5 is `skipped`.
 - model: `delegate --model`, a plan node's `model:`; claude takes `--model`, codex `-m`, another agent is logged as
   not applied; the model is kept in the workers ledger, the events, and on the board.
+- tier (user request, 2026-11-12): a claude worker cannot start without a model, `sonnet` or `opus` by the rule; a
+  full id is taken too; `CODING_AGENT_WORKER_MODEL` supplies one when none is given; codex is unchanged.
 """
 
 from __future__ import annotations
@@ -125,10 +127,11 @@ def test_another_agent_ignores_the_model_and_logs_it(repo: Path, fake_orca: Path
     assert [e for e in _events(repo, "coordinator") if e["kind"] == "delegated"][-1]["detail"]["model"] == "agent-default"
 
 
-def test_no_model_keeps_the_agent_start(repo: Path, fake_orca: Path) -> None:
-    orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x")
+def test_a_codex_worker_without_a_model_keeps_the_agent_start(repo: Path, fake_orca: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(orca_cli.WORKER_MODEL_ENV, "opus")  # names a Claude model: not read for codex
+    orca_cli.worker_start(repo, task_id=_task(repo), agent="codex", title="x")
     orca = _orca(fake_orca)
-    assert orca["created_worktrees"][0]["agent"] == "claude" and "created_terminals" not in orca
+    assert orca["created_worktrees"][0]["agent"] == "codex" and "created_terminals" not in orca
     record = orca_cli.worker_records(repo)[0]
     assert "model" not in record and "verify" not in record
     assert [e for e in _events(repo, "permission-mode") if e["kind"] == "worker-started"][-1]["detail"]["model"] == "agent-default"
@@ -176,7 +179,7 @@ def _plan(tmp_path: Path, text: str) -> Path:
 
 def test_a_plan_node_reads_model_and_verify(tmp_path: Path) -> None:
     nodes = plan.load(_plan(tmp_path, "tasks:\n  - id: a\n    title: t\n    spec: s\n    model: haiku\n"
-                                      "    verify:\n      - go test ./pkg/...\n      - npm test\n  - {id: b, title: t, spec: s}\n"))
+                                      "    verify:\n      - go test ./pkg/...\n      - npm test\n  - {id: b, title: t, spec: s, agent: codex}\n"))
     assert (nodes[0].model, nodes[0].verify) == ("haiku", ("go test ./pkg/...", "npm test"))
     assert (nodes[1].model, nodes[1].verify) == (None, ())
 
@@ -197,8 +200,117 @@ def test_plan_next_passes_the_node_model_and_verify(repo: Path, tmp_path: Path, 
     monkeypatch.setattr(plan, "states", lambda root, nodes, run=None: {"a": "pending"})
     calls: list[dict] = []
     monkeypatch.setattr(orca_cli, "worker_start", lambda root, **kwargs: calls.append(kwargs) or "ctx_a")
-    assert plan.dispatch_ready(repo, nodes, default_agent="claude") == [("a", "task_a", "ctx_a")]
+    assert plan.dispatch_ready(repo, nodes, default_agent="claude") == [("a", "task_a", "ctx_a", "opus")]
     assert calls[0]["model"] == "opus" and calls[0]["verify"] == ("make check",)
+
+
+# --- the tier is required for a claude worker ------------------------------------------------------------------------
+
+
+def test_delegate_without_a_model_is_refused_before_any_task_exists(repo: Path, fake_orca: Path) -> None:
+    with pytest.raises(orca_cli.OrcaError) as refused:
+        orca_cli.delegate(repo, title="x", spec="y", t_id="T-none", agent="claude")
+    message = str(refused.value)
+    assert "worker claude phải có model" in message and "`sonnet`" in message and "`opus`" in message
+    assert "`--model sonnet|opus`" in message and "`model: sonnet|opus`" in message and orca_cli.WORKER_MODEL_ENV in message
+    assert not fake_orca.exists() or "tasks" not in _orca(fake_orca)
+
+
+@pytest.mark.parametrize("argv", [
+    ["delegate", "--title", "t", "--spec", "s"],
+    ["delegate", "--title", "t", "--spec", "s", "--agent", "claude", "--model", " "],
+    ["worker-start", "--task-id", "task_0001"],
+])
+def test_the_cli_refuses_a_claude_worker_without_a_model(repo: Path, fake_orca: Path, capsys, argv: list[str]) -> None:
+    assert cli.main(["--root", str(repo), *argv]) == 1
+    err = capsys.readouterr().err
+    assert "worker claude phải có model" in err and "--model sonnet|opus" in err
+    assert not fake_orca.exists() or not {"tasks", "created_worktrees", "dispatches"} & set(_orca(fake_orca))
+
+
+def test_worker_start_without_a_model_creates_no_worktree(repo: Path, fake_orca: Path) -> None:
+    task_id = _task(repo)
+    with pytest.raises(orca_cli.OrcaError, match="worker claude phải có model"):
+        orca_cli.worker_start(repo, task_id=task_id, agent="claude", title="x")
+    assert "created_worktrees" not in _orca(fake_orca) and orca_cli.worker_records(repo) == []
+
+
+@pytest.mark.parametrize("node", [
+    {"id": "a", "title": "t", "spec": "s"},
+    {"id": "a", "title": "t", "spec": "s", "agent": "claude"},
+])
+def test_a_claude_plan_node_without_a_model_is_refused_by_name(node: dict) -> None:
+    with pytest.raises(plan.PlanError, match=r"tasks\[a\]\.model: worker claude phải có model.*`model: sonnet\|opus`"):
+        plan.parse({"tasks": [{"id": "first", "title": "t", "spec": "s", "model": "opus"}, node]})
+
+
+def test_a_plan_without_a_model_creates_no_task(repo: Path, tmp_path: Path, fake_orca: Path, capsys) -> None:
+    path = _plan(tmp_path, "tasks:\n  - {id: a, title: t, spec: s}\n")
+    for command in ("plan-apply", "plan-next", "plan-status"):
+        assert cli.main(["--root", str(repo), command, str(path)]) == 1
+        assert "tasks[a].model: worker claude phải có model" in capsys.readouterr().err
+    assert not fake_orca.exists()
+
+
+@pytest.mark.parametrize("model", ["sonnet", "opus", "claude-opus-5-5", "haiku"])
+def test_a_tier_a_full_id_or_another_alias_is_accepted(repo: Path, fake_orca: Path, model: str) -> None:
+    task_id, _dispatch = orca_cli.delegate(repo, title="x", spec="y", t_id="T-ok", agent="claude", model=model)
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", None, model)
+    assert coordinator.worker_models([repo]) == {task_id: model}
+    assert [node.model for node in plan.parse({"tasks": [{"id": "a", "title": "t", "spec": "s", "model": model}]})] == [model]
+
+
+def test_the_env_model_is_used_when_none_is_given(repo: Path, fake_orca: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    monkeypatch.setenv(orca_cli.WORKER_MODEL_ENV, " claude-sonnet-5-5 ")
+    assert orca_cli.worker_model("claude") == "claude-sonnet-5-5" and orca_cli.worker_model("claude", "opus") == "opus"
+    assert cli.main(["--root", str(repo), "delegate", "--title", "t", "--spec", "s"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["model"] == "claude-sonnet-5-5"
+    assert _orca(fake_orca)["created_terminals"][0]["command"] == orca_cli.agent_command("claude", None, "claude-sonnet-5-5")
+    assert orca_cli.worker_records(repo)[0]["model"] == "claude-sonnet-5-5"
+    # A plan node without `model:` is taken as it is, and gets the same model when its worker starts.
+    assert [node.model for node in plan.parse({"tasks": [{"id": "a", "title": "t", "spec": "s"}]})] == [None]
+
+
+def test_a_malformed_env_model_is_refused_by_name(repo: Path, fake_orca: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(orca_cli.WORKER_MODEL_ENV, "a; b")
+    with pytest.raises(orca_cli.OrcaError, match=f"{orca_cli.WORKER_MODEL_ENV}: .*not a model name"):
+        orca_cli.delegate(repo, title="x", spec="y", t_id="T-env", agent="claude")
+    assert not fake_orca.exists() or "tasks" not in _orca(fake_orca)
+
+
+def test_codex_and_other_agents_need_no_model(repo: Path, fake_orca: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    assert orca_cli.worker_model("codex") is None and orca_cli.worker_model("gemini") is None
+    assert orca_cli.shown_model("codex") == "agent-default" and orca_cli.shown_model("codex", "o3") == "o3"
+    assert orca_cli.shown_model("gemini", "sonnet") == "agent-default"
+    nodes = plan.parse({"tasks": [{"id": "a", "title": "t", "spec": "s", "agent": "codex"}]})
+    assert (nodes[0].agent, nodes[0].model) == ("codex", None)
+    assert plan.parse({"tasks": [{"id": "a", "title": "t", "spec": "s"}]}, default_agent="codex")[0].model is None
+    monkeypatch.setenv("CODING_AGENT_WORKER_AGENT", "codex")
+    assert plan.parse({"tasks": [{"id": "a", "title": "t", "spec": "s"}]})[0].model is None
+    assert cli.main(["--root", str(repo), "delegate", "--title", "t", "--spec", "s"]) == 0
+    assert json.loads(capsys.readouterr().out)["model"] == "agent-default"
+    orca = _orca(fake_orca)
+    assert orca["created_worktrees"][0]["agent"] == "codex" and "created_terminals" not in orca
+
+
+def test_delegate_and_worker_start_print_the_model(repo: Path, fake_orca: Path, capsys) -> None:
+    assert cli.main(["--root", str(repo), "delegate", "--title", "Hard one", "--spec", "s", "--model", "opus"]) == 0
+    assert json.loads(capsys.readouterr().out)["model"] == "opus"
+    task_id = orca_cli.create_task(repo, project="demo-repo", t_id="T-ws", spec="x", title="Easy one")
+    assert cli.main(["--root", str(repo), "worker-start", "--task-id", task_id, "--model", "sonnet"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"task_id": task_id, "dispatch": orca_cli.worker_records(repo)[-1]["dispatch"], "model": "sonnet"}
+
+
+def test_plan_next_prints_each_started_worker_model(repo: Path, tmp_path: Path, fake_orca: Path, capsys) -> None:
+    path = _plan(tmp_path, "tasks:\n  - {id: easy, title: Rename it, spec: s, model: sonnet}\n"
+                           "  - {id: hard, title: Auth guard, spec: s, model: opus}\n"
+                           "  - {id: other, title: Codex job, spec: s, agent: codex}\n")
+    assert cli.main(["--root", str(repo), "plan-apply", str(path)]) == 0
+    capsys.readouterr()
+    assert cli.main(["--root", str(repo), "plan-next", str(path), "--max", "3"]) == 0
+    started = [line for line in capsys.readouterr().out.splitlines() if line.startswith("started ")]
+    assert [(line.split()[1], line.rsplit(" ", 1)[1]) for line in started] == [("easy", "[sonnet]"), ("hard", "[opus]"), ("other", "[agent-default]")]
 
 
 # --- board ---------------------------------------------------------------------------------------------------------
@@ -331,8 +443,13 @@ def test_verdict_rules():
 def test_the_contract_states_both_rules_and_the_delegate_form():
     text = coordinator.contract("src")
     assert "Test: bạn quyết định." in text and "`go test ./pkg/...`" in text
-    assert "Model: chọn theo độ khó — `haiku`" in text and "Không ghi → model mặc định." in text
-    assert 'delegate --title "..." --spec "..." [--agent claude|codex] [--model M] [--verify CMD]' in text
+    assert "- " + coordinator.MODEL_RULE in text
+    rule = coordinator.MODEL_RULE
+    assert "với MỌI task" in rule and "`sonnet` cho việc máy móc hoặc spec rõ" in rule and "`opus` cho việc khó/rủi ro cao" in rule
+    assert "Chưa chắc → `opus`" in rule and "BẮT BUỘC với worker claude" in rule and "`--model sonnet|opus` / `model: sonnet|opus`" in rule
+    assert "haiku" not in rule and "model mặc định" not in rule
+    assert 'delegate --title "..." --spec "..." --model sonnet|opus [--agent claude|codex] [--verify CMD]' in text
+    assert "(tasks: id, title, spec, deps, model; tuỳ chọn verify)" in text
 
 
 def test_the_shipped_manifest_runs_no_default_verify():

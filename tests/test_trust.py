@@ -195,20 +195,21 @@ def test_untrusted_coordinator_keeps_the_dialog_error(repo: Path, fake_orca: Pat
     task_id = _task(repo)
     monkeypatch.setenv("FAKE_ORCA_SCREEN", "Quick safety check: Is this a project you created or one you trust?\n❯ 1. Yes, I trust this folder")
     with pytest.raises(orca_cli.OrcaError, match="asking whether to trust this folder.*not trusted"):
-        orca_cli.worker_start(repo, task_id=task_id, agent="claude", title="x")
+        orca_cli.worker_start(repo, task_id=task_id, agent="claude", model="sonnet", title="x")
     assert config.read_bytes() == before
     assert "dispatches" not in _orca(fake_orca)
     assert [e["kind"] for e in _events(repo)] == ["skipped"]
 
 
-def test_off_switch_keeps_the_old_start(repo: Path, fake_orca: Path, claude_config_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_off_switch_writes_no_trust(repo: Path, fake_orca: Path, claude_config_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(trust.SHARE_ENV, "off")
     config = _config(claude_config_dir, {_key(repo): {"hasTrustDialogAccepted": True}})
     before = config.read_bytes()
-    orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", title="x")
+    orca_cli.worker_start(repo, task_id=_task(repo), agent="claude", model="sonnet", title="x")
     orca = _orca(fake_orca)
-    assert orca["created_worktrees"][0]["agent"] == "claude"
-    assert "created_terminals" not in orca
+    # The model flag still needs a terminal of its own; only the trust step is skipped.
+    assert orca["created_worktrees"][0]["agent"] is None
+    assert orca["created_terminals"][0]["command"] == orca_cli.agent_command("claude", None, "sonnet")
     assert config.read_bytes() == before
     assert [e["kind"] for e in _events(repo)] == ["skipped"]
 

@@ -50,10 +50,10 @@ def folder(tmp_path: Path) -> Path:
 
 def test_a_folder_root_with_repo_starts_the_worker_through_worktree_create(folder, fake_orca, capsys):
     app = folder / "vgps" / "app"
-    assert cli.main(["--root", str(folder), "delegate", "--title", "Fix login", "--spec", "x", "--t-id", "T-f1", "--repo", "vgps/app"]) == 0
+    assert cli.main(["--root", str(folder), "delegate", "--agent", "codex", "--title", "Fix login", "--spec", "x", "--t-id", "T-f1", "--repo", "vgps/app"]) == 0
     out = json.loads(capsys.readouterr().out)
     state = orca_state(fake_orca)
-    assert state["created_worktrees"] == [{"name": "fix-login", "repo": f"path:{app}", "agent": "claude"}]
+    assert state["created_worktrees"] == [{"name": "fix-login", "repo": f"path:{app}", "agent": "codex"}]
     # The worktree starts from the commit the target repository has checked out, and is nobody's child.
     assert state["create_calls"] == [{"base": git(app, "rev-parse", "HEAD"), "no_parent": True}]
     dispatch = state["dispatches"][out["dispatch"]]
@@ -72,10 +72,10 @@ def test_a_folder_root_with_repo_starts_the_worker_through_worktree_create(folde
 def test_a_repository_orca_does_not_know_is_registered_and_the_creation_tried_once_more(folder, fake_orca, monkeypatch):
     monkeypatch.setenv("FAKE_ORCA_UNKNOWN_REPO", "1")
     tools = folder / "tools"
-    orca_cli.delegate(folder, title="Lint", spec="x", t_id="T-f2", agent="claude", repo=str(tools))
+    orca_cli.delegate(folder, title="Lint", spec="x", t_id="T-f2", agent="codex", repo=str(tools))
     state = orca_state(fake_orca)
     assert state["refused_creates"] == [str(tools)] and state["repos"] == [str(tools)]
-    assert state["created_worktrees"] == [{"name": "lint", "repo": f"path:{tools}", "agent": "claude"}]
+    assert state["created_worktrees"] == [{"name": "lint", "repo": f"path:{tools}", "agent": "codex"}]
     assert len(orca_cli.worker_worktrees(tools)) == 1
 
 
@@ -89,7 +89,7 @@ def test_a_folder_root_without_repo_fails_before_any_task_is_created(folder, fak
     new_repo(folder / "node_modules" / "dep")
     new_repo(folder / ".hidden" / "repo")
     new_repo(folder / "a" / "b" / "c" / "too-deep")
-    assert cli.main(["--root", str(folder), "delegate", "--title", "Fix", "--spec", "x"]) == 1
+    assert cli.main(["--root", str(folder), "delegate", "--agent", "codex", "--title", "Fix", "--spec", "x"]) == 1
     err = capsys.readouterr().err
     assert "pass --repo" in err and "Git repositories found under it: tools, vgps/app." in err
     assert not fake_orca.exists()
@@ -99,16 +99,16 @@ def test_a_folder_root_without_repo_fails_before_any_task_is_created(folder, fak
 def test_a_named_path_that_is_not_a_repository_fails_before_any_task_is_created(folder, fake_orca):
     (folder / "docs").mkdir()
     with pytest.raises(orca_cli.OrcaError, match="--repo docs: not a git repository"):
-        orca_cli.delegate(folder, title="x", spec="y", t_id="T-f3", agent="claude", repo="docs")
+        orca_cli.delegate(folder, title="x", spec="y", t_id="T-f3", agent="codex", repo="docs")
     assert not fake_orca.exists()
 
 
 def test_a_git_root_creates_the_worktree_from_its_own_repository(repo, fake_orca):
     # Never `new-child`: Orca refuses it for a terminal of a folder project, and it types the dispatch before the agent is ready.
     git(repo, "commit", "-q", "--allow-empty", "-m", "init")
-    task_id, dispatch = orca_cli.delegate(repo, title="Models", spec="x", t_id="T-f4", agent="claude")
+    task_id, dispatch = orca_cli.delegate(repo, title="Models", spec="x", t_id="T-f4", agent="codex")
     state = orca_state(fake_orca)
-    assert state["created_worktrees"] == [{"name": "models", "repo": f"path:{repo.resolve()}", "agent": "claude"}]
+    assert state["created_worktrees"] == [{"name": "models", "repo": f"path:{repo.resolve()}", "agent": "codex"}]
     assert state["create_calls"] == [{"base": git(repo, "rev-parse", "HEAD"), "no_parent": True}]
     worktree = Path(state["dispatches"][dispatch]["worktree"][5:]).resolve()
     assert orca_cli.worker_worktrees(repo) == {str(worktree)} and coordinator.role_for(worktree) == "worker"
@@ -117,20 +117,20 @@ def test_a_git_root_creates_the_worktree_from_its_own_repository(repo, fake_orca
 def test_a_base_ref_is_passed_to_the_new_worktree(repo, folder, fake_orca, capsys):
     git(repo, "commit", "-q", "--allow-empty", "-m", "init")
     git(repo, "branch", "release")
-    assert cli.main(["--root", str(repo), "delegate", "--title", "On main", "--spec", "x", "--base-branch", "release"]) == 0
+    assert cli.main(["--root", str(repo), "delegate", "--agent", "codex", "--title", "On main", "--spec", "x", "--base-branch", "release"]) == 0
     assert orca_state(fake_orca)["create_calls"] == [{"base": "release", "no_parent": True}]
     assert [record["base_branch"] for record in orca_cli.worker_records(repo)] == ["refs/heads/release"]
     app = folder / "vgps" / "app"
     git(app, "branch", "old")
     task_id = orca_cli.create_task(folder, project="sdk", t_id="T-f5", spec="x", title="From old")
-    assert cli.main(["--root", str(folder), "worker-start", "--task-id", task_id, "--repo", str(app), "--base-branch", "old"]) == 0
+    assert cli.main(["--root", str(folder), "worker-start", "--agent", "codex", "--task-id", task_id, "--repo", str(app), "--base-branch", "old"]) == 0
     assert orca_state(fake_orca)["create_calls"][1:] == [{"base": "old", "no_parent": True}]
     assert [record["base_branch"] for record in orca_cli.worker_records(folder)] == ["refs/heads/old"]
 
 
 def test_worker_start_on_a_folder_root_without_repo_names_the_repositories(folder, fake_orca, capsys):
     task_id = orca_cli.create_task(folder, project="sdk", t_id="T-f6", spec="x", title="x")
-    assert cli.main(["--root", str(folder), "worker-start", "--task-id", task_id]) == 1
+    assert cli.main(["--root", str(folder), "worker-start", "--agent", "codex", "--task-id", task_id]) == 1
     assert "tools, vgps/app" in capsys.readouterr().err
     assert "dispatches" not in orca_state(fake_orca)
 
@@ -149,22 +149,22 @@ FOLDER_PLAN = """tasks:
 
 
 def test_plan_nodes_carry_repo_and_base_to_the_worker(folder, fake_orca):
-    nodes = plan.parse(__import__("yaml").safe_load(FOLDER_PLAN))
+    nodes = plan.parse(__import__("yaml").safe_load(FOLDER_PLAN), default_agent="codex")
     assert [(node.id, node.repo, node.base) for node in nodes] == [("app", "vgps/app", "old"), ("tools", "tools", None)]
     app, tools = folder / "vgps" / "app", folder / "tools"
     git(app, "branch", "old")
     plan.apply(folder, nodes)
-    started = plan.dispatch_ready(folder, nodes, default_agent="claude")
+    started = plan.dispatch_ready(folder, nodes, default_agent="codex")
     state = orca_state(fake_orca)
     assert len(started) == 2
-    assert state["created_worktrees"] == [{"name": "app-screen", "repo": f"path:{app}", "agent": "claude"}, {"name": "tool-script", "repo": f"path:{tools}", "agent": "claude"}]
+    assert state["created_worktrees"] == [{"name": "app-screen", "repo": f"path:{app}", "agent": "codex"}, {"name": "tool-script", "repo": f"path:{tools}", "agent": "codex"}]
     assert state["create_calls"] == [{"base": "old", "no_parent": True}, {"base": git(tools, "rev-parse", "HEAD"), "no_parent": True}]
     assert len(orca_cli.worker_worktrees(app)) == 1 and len(orca_cli.worker_worktrees(tools)) == 1 and len(orca_cli.worker_records(folder)) == 2
 
 
 def test_a_plan_without_repo_in_a_folder_project_creates_no_task(folder, tmp_path, fake_orca, capsys):
     path = tmp_path / "plan.yaml"
-    path.write_text("tasks:\n  - id: ok\n    title: Ok\n    spec: x\n    repo: tools\n  - id: lost\n    title: Lost\n    spec: x\n", encoding="utf-8")
+    path.write_text("tasks:\n  - id: ok\n    title: Ok\n    spec: x\n    repo: tools\n    model: sonnet\n  - id: lost\n    title: Lost\n    spec: x\n    model: opus\n", encoding="utf-8")
     assert cli.main(["--root", str(folder), "plan-apply", str(path)]) == 1
     err = capsys.readouterr().err
     assert "task 'lost'" in err and "pass --repo" in err and "tools, vgps/app" in err
@@ -179,7 +179,7 @@ def test_a_blank_repo_or_base_is_refused(field):
 
 def test_the_folder_root_board_and_cleanup_see_a_worker_of_a_child_repository(folder, fake_orca, capsys):
     app = folder / "vgps" / "app"
-    task_id, _dispatch = orca_cli.delegate(folder, title="Fix login", spec="x", t_id="T-f7", agent="claude", repo="vgps/app")
+    task_id, _dispatch = orca_cli.delegate(folder, title="Fix login", spec="x", t_id="T-f7", agent="codex", repo="vgps/app")
     worktree = Path(orca_cli.worker_records(folder)[0]["worktree"])
     assert cleanup.candidates(folder) == []
     orca_cli.set_status(folder, task_id=task_id, requested="completed", basis="predicate")

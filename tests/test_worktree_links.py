@@ -321,11 +321,12 @@ def test_worker_start_links_the_install_before_the_agent_starts(parent, tmp_path
 
     monkeypatch.setattr(orca_cli, "_call_tool", watch)
     task_id = orca_cli.create_task(parent, project="demo-repo", t_id="T-start", spec="x", title="Fix it")
-    orca_cli.worker_start(parent, task_id=task_id, agent=agent, title="Fix it")
+    model = "sonnet" if agent == "claude" else None  # a claude worker cannot start without one
+    orca_cli.worker_start(parent, task_id=task_id, agent=agent, title="Fix it", model=model)
     state = json.loads(fake_orca.read_text(encoding="utf-8"))
     assert state["created_worktrees"][0]["agent"] is None  # every agent takes the separate path when there is an install
     assert linked_at_start == [True]
-    assert state["created_terminals"][0]["command"] == orca_cli.agent_command(agent)
+    assert state["created_terminals"][0]["command"] == orca_cli.agent_command(agent, None, model)
     wt = Path(orca_cli.worker_records(parent)[0]["worktree"])
     assert git(wt, "status", "--porcelain", "--untracked-files=all") == ""
     events = [json.loads(line) for line in (parent / ".coding-agent" / "events.jsonl").read_text(encoding="utf-8").splitlines()]

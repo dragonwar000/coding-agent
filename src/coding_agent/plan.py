@@ -6,6 +6,7 @@ Plan file (YAML):
       - id: protocol
         title: Wire protocol
         spec: Define the message types ...
+        model: opus
       - id: server
         title: Server
         spec: Implement the room actor ...
@@ -13,7 +14,8 @@ Plan file (YAML):
         agent: codex        # optional; default is the delegate default
         repo: services/api  # optional; the git repository the worker's worktree is created in (required in a folder project)
         base: develop       # optional; the ref the worktree starts from (default: that repository's HEAD)
-        model: sonnet       # optional; the worker's model (claude --model, codex -m); default: the agent's own
+        model: gpt-5.1-codex  # the worker's model (claude --model, codex -m): required for a claude worker, `sonnet`
+                              # or `opus`, unless CODING_AGENT_WORKER_MODEL is set; optional for another agent
         verify:             # optional; the commands the worker's stop-gate runs; none: verification is `skipped`
           - go test ./server/...
 
@@ -26,6 +28,7 @@ starts workers for them. A node whose dependency failed or is blocked is never d
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -59,8 +62,13 @@ def _text(value: Any, where: str) -> str:
     return value.strip()
 
 
-def parse(raw: Any) -> list[Node]:
-    """Validate a parsed plan document and return its nodes in dependency order (dependencies first)."""
+def parse(raw: Any, *, default_agent: str | None = None) -> list[Node]:
+    """Validate a parsed plan document and return its nodes in dependency order (dependencies first).
+
+    A node whose worker is claude must name its `model:` (`orca_cli.worker_model`). A node without `agent:` gets
+    `default_agent`, by default `CODING_AGENT_WORKER_AGENT`, else claude.
+    """
+    default_agent = default_agent or os.environ.get("CODING_AGENT_WORKER_AGENT") or "claude"
     tasks = raw.get("tasks") if isinstance(raw, dict) else None
     if not isinstance(tasks, list) or not tasks:
         raise PlanError("the plan needs a non-empty `tasks` list")
@@ -113,15 +121,21 @@ def parse(raw: Any) -> list[Node]:
             ordered.append(node)
             done.add(node.id)
         remaining = [node for node in remaining if node.id not in done]
+    # Checked last, so a plan that is malformed in another way is reported for that first.
+    for node in ordered:
+        try:
+            orca_cli.worker_model(node.agent or default_agent, node.model)
+        except orca_cli.OrcaError as error:
+            raise PlanError(f"tasks[{node.id}].model: {error}") from error
     return ordered
 
 
-def load(path: Path) -> list[Node]:
-    """Read and validate a plan file."""
+def load(path: Path, *, default_agent: str | None = None) -> list[Node]:
+    """Read and validate a plan file. `default_agent` is the agent of a node without `agent:` (`parse`)."""
     import yaml
 
     try:
-        return parse(yaml.safe_load(path.read_text(encoding="utf-8")))
+        return parse(yaml.safe_load(path.read_text(encoding="utf-8")), default_agent=default_agent)
     except OSError as error:
         raise PlanError(f"cannot read {path}: {error}") from error
     except yaml.YAMLError as error:
@@ -184,15 +198,17 @@ def ready(nodes: list[Node], state: dict[str, str]) -> list[Node]:
 
 
 def dispatch_ready(root: Path, nodes: list[Node], *, default_agent: str, run: str | None = None, limit: int = 2,
-                   permission_mode: str | None = None) -> list[tuple[str, str, str]]:
-    """Start workers for up to `limit` ready nodes. Returns (plan id, Orca task id, dispatch id) per worker started."""
+                   permission_mode: str | None = None) -> list[tuple[str, str, str, str]]:
+    """Start workers for up to `limit` ready nodes. Returns (plan id, Orca task id, dispatch id, model) per worker
+    started; the model is the one the worker started on (`orca_cli.shown_model`)."""
     mapping = ledger(root)
-    started: list[tuple[str, str, str]] = []
+    started: list[tuple[str, str, str, str]] = []
     for node in ready(nodes, states(root, nodes, run=run))[:max(limit, 0)]:
-        dispatch = orca_cli.worker_start(root, task_id=mapping[node.id], agent=node.agent or default_agent, run=run, title=node.title,
+        agent = node.agent or default_agent
+        dispatch = orca_cli.worker_start(root, task_id=mapping[node.id], agent=agent, run=run, title=node.title,
                                          repo=node.repo, base=node.base, permission_mode=permission_mode,
                                          model=node.model, verify=node.verify)
-        started.append((node.id, mapping[node.id], dispatch))
+        started.append((node.id, mapping[node.id], dispatch, orca_cli.shown_model(agent, node.model)))
     return started
 
 

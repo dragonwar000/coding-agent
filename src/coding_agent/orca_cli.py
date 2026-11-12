@@ -1069,6 +1069,17 @@ MODEL_FLAGS = {"claude": "--model", "codex": "-m"}
 MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,99}")
 
 
+# The two tiers a claude worker starts on; the coordinator picks one per task (`coordinator.MODEL_RULE`).
+MODEL_TIERS = ("sonnet", "opus")
+# Supplies a claude worker's model when the coordinator named none, for a setup that wants one model for every worker.
+WORKER_MODEL_ENV = "CODING_AGENT_WORKER_MODEL"
+MODEL_REQUIRED = (
+    "worker claude phải có model: chọn `sonnet` (việc dễ/thường, spec rõ) hoặc `opus` (việc khó/rủi ro cao; chưa chắc thì opus), "
+    "ghi bằng `--model sonnet|opus` (delegate, worker-start) hoặc `model: sonnet|opus` (node trong plan). "
+    f"Muốn một model cho mọi worker: đặt {WORKER_MODEL_ENV}=<tên model>."
+)
+
+
 def check_model(model: str | None) -> str | None:
     """`model` stripped, or None when not given. A name with spaces or shell characters raises OrcaError, because the
     name is typed into the worker terminal's shell (`agent_command`)."""
@@ -1078,6 +1089,31 @@ def check_model(model: str | None) -> str | None:
     if not MODEL_NAME.fullmatch(model):
         raise OrcaError(f"model {model!r} is not a model name (letters, digits, and . _ : / @ [ ] -)")
     return model
+
+
+def worker_model(agent: str, model: str | None = None) -> str | None:
+    """The model a worker of `agent` starts on: `model` when given, checked by `check_model`.
+
+    A claude worker must have one: without `model` it takes `CODING_AGENT_WORKER_MODEL` when that is set, and
+    otherwise the start is refused (OrcaError), because the coordinator decides each task's tier (`sonnet` or `opus`).
+    Another agent keeps None, its own default; the variable names a Claude model and is not read for it.
+    """
+    model = check_model(model)
+    if model is not None or agent != "claude":
+        return model
+    try:
+        fallback = check_model(os.environ.get(WORKER_MODEL_ENV))
+    except OrcaError as error:
+        raise OrcaError(f"{WORKER_MODEL_ENV}: {error}") from error
+    if fallback is None:
+        raise OrcaError(MODEL_REQUIRED)
+    return fallback
+
+
+def shown_model(agent: str, model: str | None = None) -> str:
+    """The model to show for a worker of `agent`: the one it starts on, or `agent-default` when none is applied (an
+    agent without a model flag, or codex without a model)."""
+    return (worker_model(agent, model) if agent in MODEL_FLAGS else None) or "agent-default"
 
 
 def agent_command(agent: str, permission_mode: str | None = None, model: str | None = None, *, windows: bool | None = None) -> str:
@@ -1124,10 +1160,11 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
     A Claude worker runs in the permission mode `worker_permission_mode` picks; `default`, no mode, or another agent
     keeps the agent's own start command (another agent's skip is logged).
     `model` starts the worker on that model (`claude --model`, `codex -m`); another agent starts on its default and the
-    skip is logged (`guard=model kind=not-applied`); no model keeps the agent's own start command. `verify` are the
+    skip is logged (`guard=model kind=not-applied`). A claude worker without one takes `CODING_AGENT_WORKER_MODEL`, and is
+    refused when that is not set (`worker_model`); a codex worker without one keeps its own start command. `verify` are the
     task's verify commands, which the worker session's stop-gate runs. Both are kept in the workers ledger.
     """
-    model = check_model(model)
+    model = worker_model(agent, model)
     verify = tuple(command.strip() for command in verify if command and command.strip())
     target = target_repo(root, repo)
     title = title if title is not None else _title_of(task_id, run)
@@ -1139,6 +1176,7 @@ def worker_start(root: Path, *, task_id: str, agent: str, run: str | None = None
                       detail={"task_id": task_id, "agent": agent, "permission_mode": mode, "source": source,
                               "reason": "--permission-mode is a Claude Code flag; this agent starts with its own default"})
     applied_model = model if model is not None and agent in MODEL_FLAGS else None
+    # Same value as `shown_model(agent, model)`, which the CLI prints for the task.
     if model is not None and applied_model is None:
         events.record(root, guard="model", kind="not-applied", mode="enforce", applied=False, session=session,
                       detail={"task_id": task_id, "agent": agent, "model": model,
@@ -1380,10 +1418,10 @@ def delegate(root: Path, *, title: str, spec: str, t_id: str, agent: str, run: s
              model: str | None = None, verify: tuple[str, ...] = ()) -> tuple[str, str]:
     """Create a task for this repository and start a worker on it. Returns (task id, dispatch id).
 
-    The target repository and the model name are checked first, so a folder project without `repo`, or a malformed
-    model, fails before any task exists. `model` and `verify` go to `worker_start`.
+    The target repository and the model are checked first, so a folder project without `repo`, a malformed model, or
+    a claude worker without a model, fails before any task exists. `model` and `verify` go to `worker_start`.
     """
-    check_model(model)
+    worker_model(agent, model)
     target_repo(root, repo)
     task_id = create_task(root, project=orca.project_name(root), t_id=t_id, spec=spec, title=title, run=run)
     return task_id, worker_start(root, task_id=task_id, agent=agent, run=run, session=session, title=title, repo=repo, base=base,

@@ -32,6 +32,13 @@ requires_zm = pytest.mark.skipif(not zm_available(), reason="zm binary is not in
 
 
 @pytest.fixture(autouse=True)
+def no_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reads the developer's own worker agent or model: both variables change which starts are refused."""
+    monkeypatch.delenv("CODING_AGENT_WORKER_AGENT", raising=False)
+    monkeypatch.delenv("CODING_AGENT_WORKER_MODEL", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def claude_config_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Every test reads and writes Claude Code's config in a temporary CLAUDE_CONFIG_DIR, never the real ~/.claude.json."""
     config_dir = tmp_path_factory.mktemp("claude-config")

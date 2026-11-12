@@ -172,8 +172,8 @@ def test_delegate_with_another_root_registers_it_once(repo: Path, other: Path, o
     monkeypatch.setattr(orca_cli, "delegate", lambda root, **kwargs: ("task_x", "ctx_x"))
 
     for _ in range(2):
-        assert cli.main(["--root", str(other), "delegate", "--title", "t", "--spec", "s"]) == 0
-    assert cli.main(["--root", str(repo), "delegate", "--title", "t", "--spec", "s"]) == 0
+        assert cli.main(["--root", str(other), "delegate", "--model", "sonnet", "--title", "t", "--spec", "s"]) == 0
+    assert cli.main(["--root", str(repo), "delegate", "--model", "sonnet", "--title", "t", "--spec", "s"]) == 0
 
     data = json.loads((repo / orca_cli.ROOTS_FILE).read_text(encoding="utf-8"))
     assert data == [str(other.resolve())]

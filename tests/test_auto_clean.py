@@ -289,7 +289,7 @@ def test_inbox_runs_auto_clean(repo: Path, auto_calls: list, monkeypatch: pytest
 
 
 def test_plan_next_runs_auto_clean(repo: Path, auto_calls: list, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(plan_graph, "load", lambda path: [])
+    monkeypatch.setattr(plan_graph, "load", lambda path, **kwargs: [])
     monkeypatch.setattr(plan_graph, "dispatch_ready", lambda *a, **k: [])
     monkeypatch.setattr(plan_graph, "states", lambda *a, **k: {})
     monkeypatch.setattr(plan_graph, "status_lines", lambda *a, **k: [])

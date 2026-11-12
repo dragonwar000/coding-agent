@@ -394,17 +394,24 @@ Hợp đồng in ở đầu phiên coordinator có hai luật:
 
 - **Test: bạn quyết định.** Việc có code chạy được → khai `--verify` / `verify:` bằng lệnh test hợp với việc đó
   (vd `go test ./pkg/...`, `npm test -- path`); việc chỉ đổi tài liệu/hạ tầng → không cần verify, tự kiểm kết quả.
-- **Model: chọn theo độ khó** — `haiku` cho việc máy móc (đổi chữ, sao chép, tra cứu), `sonnet` cho việc thường,
-  `opus` cho việc khó/rủi ro cao (bảo mật, prod, thiết kế). Không ghi → model mặc định.
+- **Model: với mọi task, coordinator xét dễ hay khó rồi chọn một trong hai** — `sonnet` cho việc máy móc hoặc spec rõ
+  (đổi tên, sao chép, tài liệu, config, scaffold, thay đổi có spec và test rõ); `opus` cho việc khó/rủi ro cao (bảo mật,
+  auth, concurrency, migrate dữ liệu, prod/deploy, kiến trúc, debug mơ hồ, mọi thứ chạm guard/quyền). Chưa chắc → `opus`.
+  Bắt buộc với worker claude: thiếu model thì lệnh giao việc bị từ chối.
 
 ```sh
-python3 -m coding_agent.cli delegate --title "..." --spec "..." [--agent claude|codex] [--model M] [--verify CMD]
+python3 -m coding_agent.cli delegate --title "..." --spec "..." --model sonnet|opus [--agent claude|codex] [--verify CMD]
 ```
 
 - `--verify` lặp được; lệnh được ghi vào sổ worker (`coding-agent-workers.jsonl`, trường `verify`), và `stop-gate` của phiên
   worker chạy đúng các lệnh đó trong worktree. Task không khai → `skipped`, không chặn. Phiên coordinator không chạy verify.
 - `--model`: Claude chạy `claude --model M`, Codex chạy `codex -m M`; agent khác bỏ qua và ghi event `model` / `not-applied`.
-  Có model thì agent được mở trong terminal riêng như khi có permission mode. Không có model → lệnh khởi động mặc định của agent.
+  Có model thì agent được mở trong terminal riêng như khi có permission mode.
+- Worker claude (agent mặc định) bắt buộc có model: `sonnet` hoặc `opus`; id đầy đủ (vd `claude-opus-5-5`) hay alias khác
+  ghi rõ vẫn được nhận. `delegate` / `worker-start` thiếu `--model`, hoặc node của plan thiếu `model:`, bị từ chối trước khi
+  tạo task. Muốn một model cho mọi worker claude như trước: đặt `CODING_AGENT_WORKER_MODEL=<tên model>`; khi có biến này
+  không lệnh nào bị từ chối. Codex không đổi: không có model → lệnh khởi động mặc định của codex.
+- `delegate`, `worker-start` in model trong JSON kết quả (`"model": "sonnet"`); `plan-next` in ở cuối dòng `started ... [opus]`.
   Model được ghi vào event `delegated` và `worker-started`, vào sổ worker, và hiện trên bảng việc ở cuối dòng task (`[sonnet]`).
 - Node của plan dùng `model:` và `verify:` (danh sách lệnh); `plan-next` truyền xuống worker. `worker-start` cũng nhận `--model`, `--verify`.
 
@@ -418,12 +425,13 @@ tasks:
   - id: protocol
     title: Wire protocol
     spec: Định nghĩa message và validate
+    model: opus         # bắt buộc với worker claude: sonnet (việc dễ/thường) | opus (việc khó/rủi ro cao)
   - id: server
     title: Server
     spec: Room actor, transport
     deps: [protocol]
     agent: codex        # tuỳ chọn
-    model: sonnet       # tuỳ chọn; claude --model / codex -m. Không ghi → model mặc định
+    model: gpt-5.1-codex  # tuỳ chọn với codex (codex -m); bắt buộc với worker claude: sonnet | opus
     verify:             # tuỳ chọn; lệnh stop-gate của worker chạy. Không ghi → skipped
       - go test ./server/...
 ```

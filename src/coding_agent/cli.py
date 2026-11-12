@@ -10,13 +10,15 @@
 - `claim --task-id ID [--project NAME]`: refuse a task owned by another repository and log the refusal (FR-008).
 - `orca-check --tasks FILE [--strict]`: report `CLAIMED-DONE BUT ABSENT`; `--strict` exits 1 when any is found (SC-002).
 - `status`: this repository's Orca tasks by state, read from the live Orca CLI (FR-014, SC-001).
-- `delegate --title ... --spec ... [--agent claude|codex] [--model M] [--verify CMD ...] [--t-id T-x] [--repo PATH] [--base-branch REF] [--permission-mode M]`: create a task and start an Orca worker on it
+- `delegate --title ... --spec ... --model sonnet|opus [--agent claude|codex] [--verify CMD ...] [--t-id T-x] [--repo PATH] [--base-branch REF] [--permission-mode M]`: create a task and start an Orca worker on it
   in its own worktree (coordinator). `--repo` names the git repository the worktree is created in; a root outside git requires it.
   `--model` starts the worker on that model (`claude --model M`, `codex -m M`; another agent ignores it, logged as
-  `guard: model`, `kind: not-applied`); without it the agent starts on its default. `--verify` (repeatable) are the
+  `guard: model`, `kind: not-applied`). A claude worker must have one, `sonnet` or `opus` (a full model id is taken
+  too): without it the command is refused, unless `CODING_AGENT_WORKER_MODEL` names the model for every claude worker.
+  A codex worker without it starts on its default. The output names the model. `--verify` (repeatable) are the
   commands the worker session's stop-gate runs; a task without any is `skipped` and never blocked.
 - `board`: the task board the coordinator sees on each prompt.
-- `worker-start --task-id ID [--agent A] [--model M] [--verify CMD ...] [--repo PATH] [--base-branch REF] [--permission-mode M]`: start a worker on an existing task, recorded as a worker worktree.
+- `worker-start --task-id ID --model sonnet|opus [--agent A] [--verify CMD ...] [--repo PATH] [--base-branch REF] [--permission-mode M]`: start a worker on an existing task, recorded as a worker worktree.
   A Claude worker runs in the coordinator session's permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`):
   `--permission-mode`, else `CODING_AGENT_WORKER_PERMISSION_MODE`, else the mode the hooks last recorded in
   `.coding-agent/state/permission-mode` (under `--root`, else `$CLAUDE_PROJECT_DIR`, the working directory, or a parent
@@ -62,7 +64,8 @@
 - `roots-add PATH...`: register repositories outside the tree by hand. Both act on `--root`, else the coordinator's directory.
 - `run-init --objective TEXT`: create an Orca Run from this terminal and store it in `.coding-agent/orca-run`.
 - `plan-apply FILE`, `plan-next FILE [--max N] [--permission-mode M]`, `plan-status FILE`: a task graph with dependencies (see `plan.py`);
-  a node's `model:` and `verify:` go to its worker as `--model` and `--verify` do.
+  a node's `model:` and `verify:` go to its worker as `--model` and `--verify` do. A node whose worker is claude must
+  have `model:` (same rule as `--model`), else the plan is refused; `plan-next` prints each started worker's model.
 - `auto-decide [on|off|status] [--timeout N] [--fable|--no-fable] [--fable-timeout N]`: turn auto-decide on or off and set how
   long a question to the user waits (10 to 3600 s) before Fable or the suggested option decides it. Stored in
   `.coding-agent/state/auto-decide.json`, which wins over `auto_decide:` in integration.yaml.
@@ -136,7 +139,9 @@ def _target_options(command: argparse.ArgumentParser) -> None:
 
 
 def _task_options(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--model", help="the worker's model, e.g. haiku, sonnet, opus (claude --model, codex -m; default: the agent's own)")
+    command.add_argument("--model", help="the worker's model: sonnet (easy or ordinary work) or opus (hard or high-risk work), or a full model id "
+                              "(claude --model, codex -m). Required for a claude worker unless CODING_AGENT_WORKER_MODEL is set; "
+                              "another agent defaults to its own")
     command.add_argument("--verify", action="append", default=[], metavar="CMD",
                          help="a command the worker's stop-gate runs before its turn may end (repeatable; none: verification is skipped)")
 
@@ -396,10 +401,9 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             return _status(root, args.run)
         if args.command == "worker-start":
             agent = args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude")
-            print(json.dumps({"task_id": args.task_id, "dispatch": orca_cli.worker_start(root, task_id=args.task_id, agent=agent, run=args.run,
-                                                                                              repo=args.repo, base=args.base_branch,
-                                                                                              permission_mode=args.permission_mode,
-                                                                                              model=args.model, verify=tuple(args.verify))}))
+            dispatch = orca_cli.worker_start(root, task_id=args.task_id, agent=agent, run=args.run, repo=args.repo, base=args.base_branch,
+                                             permission_mode=args.permission_mode, model=args.model, verify=tuple(args.verify))
+            print(json.dumps({"task_id": args.task_id, "dispatch": dispatch, "model": orca_cli.shown_model(agent, args.model)}))
             return 0
         if args.command == "worker-adopt":
             if not args.worktree.is_dir():
@@ -463,7 +467,7 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             print(json.dumps({"run": orca_cli.run_init(root, args.objective)}))
             return 0
         if args.command in ("plan-apply", "plan-next", "plan-status"):
-            nodes = plan_graph.load(args.file)
+            nodes = plan_graph.load(args.file, default_agent=getattr(args, "agent", None))
             if args.command == "plan-apply":
                 for node_id, task_id, created in plan_graph.apply(root, nodes, run=args.run):
                     print(f"{'created' if created else 'exists '} {node_id} -> {task_id}")
@@ -471,8 +475,8 @@ def _command(args: argparse.Namespace, root: Path) -> int:
                 agent = args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude")
                 started = plan_graph.dispatch_ready(root, nodes, default_agent=agent, run=args.run, limit=args.max,
                                                     permission_mode=args.permission_mode)
-                for node_id, task_id, dispatch in started:
-                    print(f"started {node_id} -> {task_id} ({dispatch})")
+                for node_id, task_id, dispatch, model in started:
+                    print(f"started {node_id} -> {task_id} ({dispatch}) [{model}]")
                 if not started:
                     print("plan-next: no node is ready (dependencies open, or every node already has a worker)")
             print("\n".join(plan_graph.status_lines(nodes, plan_graph.states(root, nodes, run=args.run))))
@@ -485,12 +489,13 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             print("\n".join(lines))
             return 0
         if args.command == "delegate":
+            agent = args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude")
             task_id, dispatch = orca_cli.delegate(
                 root,
                 title=args.title,
                 spec=args.spec,
                 t_id=args.t_id or f"T-{uuid.uuid4().hex[:8]}",
-                agent=args.agent or os.environ.get("CODING_AGENT_WORKER_AGENT", "claude"),
+                agent=agent,
                 run=args.run,
                 repo=args.repo,
                 base=args.base_branch,
@@ -498,7 +503,7 @@ def _command(args: argparse.Namespace, root: Path) -> int:
                 model=args.model,
                 verify=tuple(args.verify),
             )
-            print(json.dumps({"task_id": task_id, "dispatch": dispatch}, ensure_ascii=False))
+            print(json.dumps({"task_id": task_id, "dispatch": dispatch, "model": orca_cli.shown_model(agent, args.model)}, ensure_ascii=False))
             return 0
         if args.command == "brief":
             print(brief(args.plan.read_text(encoding="utf-8"), args.task), end="")

@@ -84,7 +84,7 @@ def test_worker_start_records_the_worktree_and_kicks_the_worker_when_the_turn_wa
     task_id = orca_cli.create_task(committed, project="demo-repo", t_id="T-k1", spec="x", title="Fix login bug")
     path = placed_worktree(committed, tmp_path, "fix-login-bug")
 
-    dispatch = orca_cli.worker_start(committed, task_id=task_id, agent="claude")
+    dispatch = orca_cli.worker_start(committed, task_id=task_id, agent="claude", model="sonnet")
 
     assert dispatch.startswith("dsp_")
     assert orca_cli.worker_worktrees(committed) == {str(path.resolve())}
@@ -102,7 +102,7 @@ def test_worker_start_records_the_worktree_and_kicks_the_worker_when_the_turn_wa
 
 def test_worker_start_does_not_kick_when_the_turn_was_seen(committed, fake_orca):
     task_id = orca_cli.create_task(committed, project="demo-repo", t_id="T-k2", spec="x", title="x")
-    orca_cli.worker_start(committed, task_id=task_id, agent="claude")
+    orca_cli.worker_start(committed, task_id=task_id, agent="claude", model="sonnet")
     assert "sent" not in orca_state(fake_orca)
     assert [e["kind"] for e in event_kinds(committed)] == ["delegated"]
 
@@ -113,7 +113,7 @@ def test_a_kick_the_worker_never_shows_is_resent_then_reported_without_raising(c
     task_id = orca_cli.create_task(committed, project="demo-repo", t_id="T-k3", spec="x", title="Deaf worker")
     placed_worktree(committed, tmp_path, "deaf-worker")
 
-    dispatch = orca_cli.worker_start(committed, task_id=task_id, agent="claude")
+    dispatch = orca_cli.worker_start(committed, task_id=task_id, agent="claude", model="sonnet")
 
     assert len(orca_state(fake_orca)["sent"]) == orca_cli.KICK_ATTEMPTS
     kicked = event_kinds(committed)[-1]
@@ -169,7 +169,7 @@ def test_worker_kick_fails_clearly_for_a_task_without_a_dispatch(committed, fake
 
 def test_settle_abandons_the_active_dispatch_then_completes_the_task(committed, fake_orca):
     task_id = orca_cli.create_task(committed, project="demo-repo", t_id="T-s1", spec="x", title="x")
-    dispatch = orca_cli.worker_start(committed, task_id=task_id, agent="claude")
+    dispatch = orca_cli.worker_start(committed, task_id=task_id, agent="claude", model="sonnet")
 
     outcome = orca_cli.settle(committed, task_id=task_id, basis="verifier", artifacts=("REPORT.md",))
 
@@ -182,7 +182,7 @@ def test_settle_abandons_the_active_dispatch_then_completes_the_task(committed, 
 
 def test_settle_leaves_a_settled_dispatch_alone(committed, fake_orca):
     task_id = orca_cli.create_task(committed, project="demo-repo", t_id="T-s2", spec="x", title="x")
-    dispatch = orca_cli.worker_start(committed, task_id=task_id, agent="claude")
+    dispatch = orca_cli.worker_start(committed, task_id=task_id, agent="claude", model="sonnet")
     orca_cli._call("worker-abandon", "--dispatch", dispatch)
     assert orca_cli.dispatch_active(dispatch) is False
 
@@ -200,7 +200,7 @@ def test_settle_without_a_dispatch_just_applies_the_status(committed, fake_orca)
 
 def test_the_settle_command_requires_proof(committed, fake_orca, capsys):
     task_id = orca_cli.create_task(committed, project="demo-repo", t_id="T-s4", spec="x", title="x")
-    orca_cli.worker_start(committed, task_id=task_id, agent="claude")
+    orca_cli.worker_start(committed, task_id=task_id, agent="claude", model="sonnet")
     with pytest.raises(SystemExit):
         cli.main(["--root", str(committed), "worker-settle", "--task-id", task_id, "--basis", "agentReported"])
     assert "abandoned" not in orca_state(fake_orca)

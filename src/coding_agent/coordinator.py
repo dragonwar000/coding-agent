@@ -320,7 +320,7 @@ def worker_record(cwd: Path | None) -> dict[str, Any] | None:
 PLAN_FILE = Path(".coding-agent") / "plan.yaml"
 DELEGATING_TOOLS = frozenset({"Agent", "Task"})
 HOW = (
-    "Chia việc theo graph: (1) ghi plan vào .coding-agent/plan.yaml (tasks: id, title, spec, deps; tuỳ chọn model, verify); "
+    "Chia việc theo graph: (1) ghi plan vào .coding-agent/plan.yaml (tasks: id, title, spec, deps, model; tuỳ chọn verify); "
     "(2) `python3 -m coding_agent.cli run-init --objective \"...\"` nếu chưa có Run; "
     "(3) `python3 -m coding_agent.cli plan-apply .coding-agent/plan.yaml`; "
     "(4) `python3 -m coding_agent.cli plan-next .coding-agent/plan.yaml`. Xem graph: `plan-status`."
@@ -433,15 +433,18 @@ def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python
 
 
 # The two rules the user set on 2026-11-04: the coordinator decides each task's tests and each worker's model.
+# Since 2026-11-12 the model is one of two tiers and a claude worker cannot start without it (`orca_cli.worker_model`).
 TEST_RULE = (
     "Test: bạn quyết định. Việc có code chạy được → khai `--verify` / `verify:` bằng lệnh test hợp với việc đó "
     "(vd `go test ./pkg/...`, `npm test -- path`); việc chỉ đổi tài liệu/hạ tầng → không cần verify, tự kiểm kết quả. "
     "Stop-gate của phiên bạn không chạy test; stop-gate của worker chỉ chạy đúng lệnh verify của task đó."
 )
 MODEL_RULE = (
-    "Model: chọn theo độ khó — `haiku` cho việc máy móc (đổi chữ, sao chép, tra cứu), `sonnet` cho việc thường, "
-    "`opus` cho việc khó/rủi ro cao (bảo mật, prod, thiết kế). Không ghi → model mặc định. "
-    "Ghi bằng `--model` / `model:` (claude nhận `--model`, codex nhận `-m`)."
+    "Model: với MỌI task, bạn xét dễ hay khó rồi chọn một trong hai — `sonnet` cho việc máy móc hoặc spec rõ "
+    "(đổi tên, sao chép, tài liệu, config, scaffold, thay đổi có spec và test rõ); `opus` cho việc khó/rủi ro cao "
+    "(bảo mật, auth, concurrency, migrate dữ liệu, prod/deploy, kiến trúc, debug mơ hồ, mọi thứ chạm guard/quyền). "
+    "Chưa chắc → `opus`. BẮT BUỘC với worker claude: ghi `--model sonnet|opus` / `model: sonnet|opus`, thiếu thì "
+    "lệnh giao việc bị từ chối (codex: `-m`, tuỳ chọn)."
 )
 
 
@@ -463,7 +466,7 @@ def contract(python_src: str, auto_decide: bool = False) -> str:
         "- Chỉ worker được ghi: mọi lần ghi file, script tạm, hay lệnh shell đổi trạng thái là việc của worker. Bạn không tự làm, và không viết lại lệnh bị chặn để lách guard.",
         "- Khi việc cần ghi, hoặc khi hook chặn một lệnh: giao ngay trong cùng lượt, bằng lệnh delegate (một việc nhỏ) hoặc graph (nhiều việc). Không xin phép người dùng, không kết thúc lượt để chờ. Chỉ hỏi người dùng khi quyết định thật sự là của họ (phạm vi, thao tác phá huỷ hoặc ra bên ngoài), không hỏi \"có giao việc không\".",
         "- Chưa có Orca Run: tự chạy `run-init --objective \"...\"` với mục tiêu một dòng, rồi giao việc. Không nhờ người dùng chạy.",
-        f"- Giao việc bằng: {delegate_command(python_src)} [--agent claude|codex] [--model M] [--verify CMD]",
+        f"- Giao việc bằng: {delegate_command(python_src)} --model sonnet|opus [--agent claude|codex] [--verify CMD]",
         "- " + TEST_RULE,
         "- " + MODEL_RULE,
         "- Folder project (root không phải repo git, chứa nhiều repo con): mọi lệnh delegate phải có `--repo <đường dẫn repo>`, và mỗi node trong plan đặt `repo:`. Worker tách nhánh từ HEAD của repo đó; đổi bằng `--base-branch` / `base:`.",

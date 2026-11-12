@@ -14,9 +14,11 @@ PLAN = """tasks:
     title: Web client
     spec: Build the client
     deps: [protocol, server]
+    model: opus
   - id: protocol
     title: Wire protocol
     spec: Define messages
+    model: sonnet
   - id: server
     title: Server
     spec: Implement rooms
@@ -87,12 +89,12 @@ def test_only_nodes_with_completed_dependencies_are_dispatched(repo, tmp_path, f
     ids = plan.ledger(repo)
 
     started = plan.dispatch_ready(repo, nodes, default_agent="claude")
-    assert [node_id for node_id, _t, _d in started] == ["protocol"]
+    assert [node_id for node_id, _t, _d, _m in started] == ["protocol"]
     assert plan.dispatch_ready(repo, nodes, default_agent="claude") == []
 
     orca_cli.set_status(repo, task_id=ids["protocol"], requested="completed", basis="predicate")
     started = plan.dispatch_ready(repo, nodes, default_agent="claude")
-    assert [node_id for node_id, _t, _d in started] == ["server"]
+    assert [node_id for node_id, _t, _d, _m in started] == ["server"]
     dispatches = orca_state(fake_orca)["dispatches"]
     assert [d["agent"] for d in dispatches.values()] == ["claude", "codex"]
 
@@ -101,7 +103,7 @@ def test_only_nodes_with_completed_dependencies_are_dispatched(repo, tmp_path, f
 
 
 def test_the_limit_caps_workers_started_at_once(repo, tmp_path, fake_orca):
-    text = "tasks:\n" + "".join(f"  - {{id: n{i}, title: t{i}, spec: s}}\n" for i in range(4))
+    text = "tasks:\n" + "".join(f"  - {{id: n{i}, title: t{i}, spec: s, model: sonnet}}\n" for i in range(4))
     nodes = plan.load(plan_file(tmp_path, text))
     plan.apply(repo, nodes)
     assert len(plan.dispatch_ready(repo, nodes, default_agent="claude", limit=3)) == 3
