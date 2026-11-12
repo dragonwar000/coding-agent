@@ -40,13 +40,101 @@ MUTATING_BASH = re.compile(
 )
 
 
+# A shell interpreter as a command word, optionally path-prefixed.
+SHELL_NAME = r"(?:\S*/)?(?:bash|sh|zsh|dash|ksh)(?=\s|$)"
+# Words that run the command after them (`sudo bash`, `env X=1 sh`).
+COMMAND_PREFIX = r"(?:(?:sudo|env|exec|nohup|command|nice|time)(?:\s+\S+)*?\s+)?"
+# A simple command whose program is a shell interpreter: its heredoc is the script it runs.
+HEREDOC_SHELL = re.compile(
+    r"^\s*(?:[{!]\s*|(?:if|then|else|elif|do|while|until)\s+)*(?:\w+=\S*\s+)*" + COMMAND_PREFIX + SHELL_NAME
+)
+# The rest of the heredoc's line pipes it into a shell interpreter (`cat <<'EOF' | bash`).
+PIPE_TO_SHELL = re.compile(r"\|&?\s*(?:\w+=\S*\s+)*" + COMMAND_PREFIX + SHELL_NAME)
+# Characters that end a shell word.
+WORD_END = " \t\n;&|()<>"
+
+
+def _substitutions(text: str, i: int, stop: str | None) -> tuple[list[str], int]:
+    """The `$(...)` and backtick substitutions in `text` from `i` up to the `stop` character (or the end).
+
+    Returns them (a `$(...)` itself read with `code_only`) and the index where scanning stopped.
+    """
+    kept: list[str] = []
+    n = len(text)
+    while i < n and text[i] != stop:
+        if text[i] == "\\" and i + 1 < n:
+            i += 2
+        elif text.startswith("$(", i):
+            depth, start = 0, i
+            i += 1
+            while i < n:
+                depth += {"(": 1, ")": -1}.get(text[i], 0)
+                i += 1
+                if depth == 0:
+                    break
+            kept.append(code_only(text[start:i]))
+        elif text[i] == "`":
+            end = text.find("`", i + 1)
+            stop_at = n if end < 0 else end + 1
+            kept.append(text[i:stop_at])
+            i = stop_at
+        else:
+            i += 1
+    return kept, i
+
+
+def _heredoc_word(command: str, i: int) -> tuple[str, str, bool, int]:
+    """The delimiter word of a heredoc starting at `i`: its raw text, the delimiter after quote removal,
+    whether any part of it was quoted, and the index after it."""
+    start, n = i, len(command)
+    delimiter: list[str] = []
+    quoted = False
+    while i < n and command[i] not in WORD_END:
+        char = command[i]
+        if char == "\\" and i + 1 < n:
+            quoted = True
+            delimiter.append(command[i + 1])
+            i += 2
+        elif char in "'\"":
+            quoted = True
+            end = command.find(char, i + 1)
+            end = n if end < 0 else end
+            delimiter.append(command[i + 1:end])
+            i = end + 1
+        else:
+            delimiter.append(char)
+            i += 1
+    return command[start:i], "".join(delimiter), quoted, min(i, n)
+
+
+def _heredoc_body(command: str, i: int, delimiter: str, strip_tabs: bool) -> tuple[str, str, int]:
+    """The body of a heredoc whose first line starts at `i`, its closing line (empty when the command
+    ends first), and the index after the closing line."""
+    start, n = i, len(command)
+    while i < n:
+        end = command.find("\n", i)
+        stop = n if end < 0 else end
+        line = command[i:stop]
+        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+            return command[start:i], command[i:stop + 1], stop + 1
+        i = stop + 1
+    return command[start:], "", n
+
+
 def code_only(command: str) -> str:
     """`command` with quoted text removed, so a `>` or `rm` inside a string is not read as shell.
 
     Single-quoted text is dropped whole. Double-quoted text is dropped except `$(...)` and backtick
     substitutions, because the shell runs those. Quotes stay as empty pairs so word boundaries hold.
+    A heredoc body (`<<WORD`, `<<-WORD`, not the here-string `<<<`) is data too: with a quoted delimiter it
+    is dropped, with an unquoted one only its substitutions stay, like double-quoted text. When the heredoc
+    feeds a shell interpreter (`bash <<'EOF'`, `cat <<EOF | sh`) the body is the script, so it stays whole.
+    The operator, the delimiter and the closing line stay. Comments and `((...))` arithmetic are kept as they
+    are, so a `<<` in them does not start a body.
     """
     out: list[str] = []
+    # Heredocs opened on the current line, in order: (delimiter, quoted, strip_tabs, feeds_shell).
+    pending: list[tuple[str, bool, bool, bool]] = []
     i, n = 0, len(command)
     while i < n:
         char = command[i]
@@ -58,29 +146,55 @@ def code_only(command: str) -> str:
             i = n if end < 0 else end + 1
             out.append("''")
         elif char == '"':
-            i += 1
-            kept: list[str] = []
-            while i < n and command[i] != '"':
-                if command[i] == "\\" and i + 1 < n:
-                    i += 2
-                elif command.startswith("$(", i):
-                    depth, start = 0, i
-                    i += 1
-                    while i < n:
-                        depth += {"(": 1, ")": -1}.get(command[i], 0)
-                        i += 1
-                        if depth == 0:
-                            break
-                    kept.append(command[start:i])
-                elif command[i] == "`":
-                    end = command.find("`", i + 1)
-                    stop = n if end < 0 else end + 1
-                    kept.append(command[i:stop])
-                    i = stop
-                else:
-                    i += 1
+            kept, i = _substitutions(command, i + 1, '"')
             i += 1
             out.append('"' + " ".join(kept) + '"')
+        elif char == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            out.append(command[i:end])
+            i = end
+        elif command.startswith("((", i):
+            depth, start = 0, i
+            while i < n:
+                depth += {"(": 1, ")": -1}.get(command[i], 0)
+                i += 1
+                if depth == 0:
+                    break
+            out.append(command[start:i])
+        elif command.startswith("<<<", i):
+            out.append("<<<")
+            i += 3
+        elif command.startswith("<<", i):
+            operator_end = i + (3 if command.startswith("<<-", i) else 2)
+            word_start = operator_end
+            while word_start < n and command[word_start] in " \t":
+                word_start += 1
+            raw, delimiter, quoted, after = _heredoc_word(command, word_start)
+            if not raw:
+                out.append(command[i:operator_end])
+                i = operator_end
+                continue
+            text = "".join(out)
+            owner = text[max(text.rfind(sep) for sep in ";&|(\n`") + 1:]
+            line_end = command.find("\n", after)
+            rest = command[after:n if line_end < 0 else line_end]
+            feeds_shell = bool(HEREDOC_SHELL.match(owner) or PIPE_TO_SHELL.search(rest))
+            pending.append((delimiter, quoted, operator_end - i == 3, feeds_shell))
+            out.append(command[i:word_start] + code_only(raw))
+            i = after
+        elif char == "\n" and pending:
+            out.append("\n")
+            i += 1
+            for delimiter, quoted, strip_tabs, feeds_shell in pending:
+                body, closing, i = _heredoc_body(command, i, delimiter, strip_tabs)
+                if feeds_shell:
+                    out.append(body)
+                elif not quoted:
+                    kept, _ = _substitutions(body, 0, None)
+                    out.append(" ".join(kept) + ("\n" if kept else ""))
+                out.append(closing)
+            pending = []
         else:
             out.append(char)
             i += 1
@@ -94,8 +208,9 @@ SHELL_STRING = re.compile(r"(?:^|[\s;&|(])(?:(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\s
 def checked_shell(command: str) -> str:
     """The text of `command` that the guard matches mutating forms against.
 
-    Quoted text is not shell, so it is removed (`code_only`), unless the command hands a quoted script to a
-    shell interpreter or to `eval`; then the whole command is checked, because the shell runs that text.
+    Quoted text and heredoc bodies are not shell, so they are removed (`code_only`), unless the command hands
+    a quoted script to a shell interpreter or to `eval`; then the whole command is checked, because the shell
+    runs that text. A heredoc fed to a shell interpreter keeps its body in `code_only` already.
     """
     shell = code_only(command)
     return command if SHELL_STRING.search(shell) else shell

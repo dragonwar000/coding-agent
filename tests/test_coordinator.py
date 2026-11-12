@@ -530,6 +530,57 @@ def test_quoted_text_that_no_shell_runs_is_not_a_write(command):
     assert coordinator.guard_reason("Bash", {"command": command}) is None
 
 
+HTML_BODY = "<html><title>OpenMausBot</title>\n<p>a -> b</p> rm -rf x\n</html>"
+
+
+@pytest.mark.parametrize("command", [
+    f"cat <<'EOF'\n{HTML_BODY}\nEOF",
+    f'cat <<"EOF"\n{HTML_BODY}\nEOF',
+    f"cat <<\\EOF\n{HTML_BODY}\nEOF",
+    f"cat <<E'O'F\n{HTML_BODY}\nEOF",
+    f"SPEC=$(cat <<'EOF'\n{HTML_BODY}\nEOF\n)\necho \"$SPEC\" | head",
+    "PYTHONPATH=harness/src python3 -m coding_agent.cli delegate --title T --spec \"$(cat <<'EOF'\n<p>html</p>\nEOF\n)\"",
+    "cat <<EOF\n<b>$HOME</b>\nEOF",
+    "cat <<'A' <<'B'\n<a>\nA\n<b>\nB",
+    "cat <<'EOF'\n<a> unterminated",
+    "cat <<< '<a>'",
+    "grep x <<< \"$(cat notes.txt)\"",
+])
+def test_a_heredoc_body_is_data_not_shell(command, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
+    assert coordinator.guard_reason("Bash", {"command": command}) is None
+
+
+@pytest.mark.parametrize("command", [
+    "cat > out.txt <<'EOF'\nhi\nEOF",
+    "cat <<'EOF' >> out.txt\nhi\nEOF",
+    "bash <<'EOF'\nrm -rf x\nEOF",
+    "sh <<EOF\nrm -rf x\nEOF",
+    "/bin/zsh <<'EOF'\necho a > f\nEOF",
+    "FOO=1 sudo -u me bash -s <<'EOF'\ntouch x\nEOF",
+    "cat <<'EOF' | sh\nrm -rf x\nEOF",
+    "cat <<EOF\n$(rm -rf x)\nEOF",
+    "cat <<EOF\n`touch x`\nEOF",
+    "cat <<'A' <<B\n<a>\nA\n$(touch y)\nB",
+    "cat <<-'EOF'\n\t<a>\n\tEOF\nrm -rf x",
+    "cat <<'EOF'\n<a>\nEOF\nmkdir out",
+    "echo $((1<<2))\nrm -rf x",
+    "echo hi # <<'EOF'\nrm -rf x",
+    "cat <<< '<a>' > out.txt",
+])
+def test_a_heredoc_does_not_hide_a_write(command, monkeypatch):
+    monkeypatch.delenv("CODING_AGENT_COORDINATOR_GIT", raising=False)
+    assert coordinator.guard_reason("Bash", {"command": command}) is not None
+
+
+def test_the_quote_aware_view_drops_heredoc_bodies_but_keeps_their_frame():
+    assert coordinator.code_only("cat <<'EOF'\n<a>\nEOF\n") == "cat <<''\nEOF\n"
+    assert coordinator.code_only("cat <<EOF\n<a> $(date)\nEOF") == "cat <<EOF\n$(date)\nEOF"
+    assert coordinator.code_only("bash <<'EOF'\nrm x\nEOF") == "bash <<''\nrm x\nEOF"
+    assert coordinator.code_only("cat <<'EOF'\n<a>") == "cat <<''\n"
+    assert coordinator.checked_shell("cat <<-EOF\n\t<a>\n\tEOF\nls") == "cat <<-EOF\n\tEOF\nls"
+
+
 @pytest.mark.parametrize("file_path", [".claude/settings.json", ".claude/settings.local.json", "integration.yaml"])
 def test_editing_the_hook_config_asks_the_user_instead_of_blocking(repo, monkeypatch, file_path):
     monkeypatch.delenv("CODING_AGENT_ROLE", raising=False)
