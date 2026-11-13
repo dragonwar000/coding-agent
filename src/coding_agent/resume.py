@@ -21,6 +21,11 @@ for hours and nobody told the coordinator the work was nearly done. Those turn-c
 `silent`; it gets a short reminder through `orca orchestration send` and the same line typed into its terminal, at
 most `MAX_NUDGES` times per dispatch, recorded in the same ledger as the resumes.
 
+Liveness (2026-11-13): workers no longer send heartbeats (`orca_cli.NO_HEARTBEAT`), so nothing here reads message times.
+A worker is alive or dead by its terminal: `stalled_workers` asks Orca about the terminal of every worker whose screen
+is not `working` (`terminal_death`), and a closed terminal or an agent that left it is `dead`. `watcher` turns the
+findings that no resume or reminder can fix into one escalation to the coordinator.
+
 The stalled screen of 2026-10-12 was not measured on a live terminal: `classify` lists what was measured and what is assumed.
 """
 
@@ -103,7 +108,8 @@ class Screen:
 class Finding:
     """One unsettled worker: its screen's `state`, and `action`, what `resume_stalled` did or decided about it.
 
-    `action` is empty for a worker that needs nothing. `attempt` counts the resumes sent to the dispatch so far, or
+    `state` is `classify`'s, `silent` (`nudge_silent`), or `dead` (`terminal_death`; `error` then says why). `title` is
+    the task's title. `action` is empty for a worker that needs nothing. `attempt` counts the resumes sent to the dispatch so far, or
     for a `silent` worker the reminders (`nudge_silent`). `status` is the task's status; `idle_s` how long the screen
     has been idle and unchanged, as far as the scans saw.
     """
@@ -118,10 +124,11 @@ class Finding:
     attempt: int = 0
     status: str = ""
     idle_s: int = 0
+    title: str = ""
 
     @property
     def attention(self) -> bool:
-        return self.state in ("stalled", "blocked", "silent")
+        return self.state in ("stalled", "blocked", "silent", "dead")
 
     @property
     def halted(self) -> bool:
@@ -218,6 +225,27 @@ def classify(screen: str) -> Screen:
     return Screen("stalled" if transient else "blocked", error=text.lstrip("⏺●⎿ ")[:200], fingerprint=fingerprint)
 
 
+def terminal_death(handle: str, seen: Screen) -> str | None:
+    """Why the worker in terminal `handle` is dead, or None while it may be alive. At most one `terminal show` read.
+
+    A `working` screen (spinner, or a prompt that is not empty) is alive and is not asked about. Dead is: Orca says the
+    handle is stale (the terminal was closed), or Orca sees no agent in the terminal any more (`agentIdentity` null: the
+    agent exited to the shell). An Orca that cannot be read, or an answer without `agentIdentity`, is not a death.
+    `connected` and `orphaned` are not used: what they mean for a running agent was not measured.
+    """
+    if seen.state == "working":
+        return None
+    try:
+        info = orca_cli.terminal_state(handle)
+    except orca_cli.OrcaError:
+        return None
+    if not info.get("exists"):
+        return f"terminal is gone (Orca: {info.get('code')})"
+    if "agent" in info and info["agent"] is None:
+        return "agent process exited: Orca sees no agent running in the terminal"
+    return None
+
+
 def _known_tasks(root: Path) -> set[str]:
     """The Orca tasks this coordinator created or started a worker for, over every repository it delegated into."""
     known: set[str] = set()
@@ -230,6 +258,8 @@ def _known_tasks(root: Path) -> set[str]:
 def stalled_workers(root: Path, run: str | None = None, *, task_ids: list[str] | None = None,
                     tasks: list[dict[str, Any]] | None = None) -> list[Finding]:
     """One Finding per unsettled dispatch of the Run, with its screen sorted by `classify`. Nothing is sent.
+
+    A worker whose terminal is closed or whose agent left it (`terminal_death`) is `dead`, whatever its screen showed.
 
     Without `task_ids`, only this coordinator's tasks are read (`_known_tasks`): a Run can hold another repository's
     workers. A task that is completed, failed or still pending, has no dispatch, a settled dispatch or no terminal
@@ -249,8 +279,12 @@ def stalled_workers(root: Path, run: str | None = None, *, task_ids: list[str] |
         if not dispatch["assignee_handle"] or dispatch["status"] in orca_cli.SETTLED_WORKER_STATES:
             continue
         seen = classify(orca_cli.screen_of(dispatch["assignee_handle"]))
+        death = terminal_death(dispatch["assignee_handle"], seen)
+        if death is not None:
+            seen = Screen("dead", error=death, fingerprint=seen.fingerprint)
         found.append(Finding(task_id=task_id, dispatch=dispatch["id"], terminal=dispatch["assignee_handle"], state=seen.state,
-                             error=seen.error, fingerprint=seen.fingerprint, status=str(task.get("status") or "")))
+                             error=seen.error, fingerprint=seen.fingerprint, status=str(task.get("status") or ""),
+                             title=str(task.get("task_title") or task.get("title") or "")))
     return found
 
 
@@ -493,7 +527,10 @@ NOTED_ACTIONS = ("waiting-network", "blocked", "limit", "already-resumed", "nudg
 
 
 def auto(root: Path, tasks: list[dict[str, Any]], run: str | None = None, session: str = "board") -> list[Finding]:
-    """The board's step: scan, resume and remind, and return the workers that are stalled, blocked or silent. Never raises.
+    """The board's step: scan, resume and remind, and return every unsettled worker's finding. Never raises.
+
+    The board lists the stalled, blocked, silent and dead ones apart (`board_notes`, `silent_notes`, `dead_notes`) and
+    says how long a running worker's screen has stood still (`quiet_minutes`).
 
     A scan less than `SCAN_GAP_S` after the last one of the same Run is skipped and that scan's findings are returned,
     so the board keeps showing them. A worker's waiting, blocked or unchanged state is recorded as an event when it
@@ -508,11 +545,11 @@ def auto(root: Path, tasks: list[dict[str, Any]], run: str | None = None, sessio
         last = _load_scan(root)
         if last.get("run") == current and time.time() - float(last.get("ts") or 0) < SCAN_GAP_S:
             return [Finding(**item) for item in last.get("findings") or []]
-        found = [item for item in scan(root, run, session=session, tasks=tasks, budget_s=AUTO_BUDGET_S) if item.attention]
+        found = scan(root, run, session=session, tasks=tasks, budget_s=AUTO_BUDGET_S)
         noted = last.get("noted") if isinstance(last.get("noted"), dict) else {}
-        marks = {item.task_id: f"{item.action}|{item.fingerprint}" for item in found}
+        marks = {item.task_id: f"{item.action}|{item.fingerprint}" for item in found if item.attention}
         for item in found:
-            if item.action in NOTED_ACTIONS and noted.get(item.task_id) != marks[item.task_id]:
+            if item.attention and item.action in NOTED_ACTIONS and noted.get(item.task_id) != marks[item.task_id]:
                 events.record(root, guard="worker-resume", kind=item.action, mode="enforce", applied=False, session=session,
                               detail={"task_id": item.task_id, "dispatch": item.dispatch, "terminal": item.terminal,
                                       "screen_error": item.error, "fingerprint": item.fingerprint, "attempt": item.attempt,
@@ -549,6 +586,19 @@ def board_notes(findings: list[Finding]) -> dict[str, str]:
         }.get(item.action, "bị dừng")
         notes[item.task_id] = f"{said} — {item.error}" if item.error else said
     return notes
+
+
+def dead_notes(findings: list[Finding]) -> dict[str, str]:
+    """Task id to what the board says about a worker whose terminal or agent is gone."""
+    return {item.task_id: f"worker chết, cần người xử lý — {item.error}" for item in findings if item.state == "dead"}
+
+
+def quiet_minutes(findings: list[Finding]) -> dict[str, int]:
+    """Task id to how many minutes a worker's screen has stood idle and unchanged (`track_idle`), for the ones it has.
+
+    This is the board's measure of a quiet worker: its terminal, never the time of its last message.
+    """
+    return {item.task_id: item.idle_s // 60 for item in findings if item.state == "idle" and item.idle_s > 0}
 
 
 def _minutes(seconds: float) -> str:
@@ -597,8 +647,9 @@ def describe(item: Finding) -> str:
         "limit": f"stalled, {MAX_RESUMES} resumes were sent already: needs a person",
         "send-failed": "stalled, the resume could not be sent to its terminal",
         "blocked": "BLOCKED by an error a retry does not fix, not resumed: needs a person",
-    }).get(item.action) or ("working again" if item.state == "working" else f"{item.state}, no API error on screen")
-    return f"worker-resume: {item.task_id} {said}" + (f": {item.error}" if item.error and item.attention else "")
+    }).get(item.action) or ("working again" if item.state == "working" else f"DEAD: {item.error}" if item.state == "dead"
+                             else f"{item.state}, no API error on screen")
+    return f"worker-resume: {item.task_id} {said}" + (f": {item.error}" if item.error and item.attention and item.state != "dead" else "")
 
 
 def watch(root: Path, run: str | None = None, *, task_ids: list[str] | None = None, dry_run: bool = False, interval_s: float = WATCH_INTERVAL_S,

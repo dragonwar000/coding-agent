@@ -79,6 +79,8 @@ def no_real_orca(monkeypatch: pytest.MonkeyPatch) -> None:
     from coding_agent import orca_cli
 
     monkeypatch.setattr(orca_cli, "_adopted", None)
-    # Board and inbox also read worker questions and heartbeats (`check --all`, `inbox --full`); tests that do not
+    # No test starts the background death watcher (`watcher.ensure_running`); test_watcher.py turns it on where it checks it.
+    monkeypatch.setenv("CODING_AGENT_WORKER_WATCH", "off")
+    # Board and inbox also read worker questions (`check --all`, `inbox --full`); tests that do not
     # patch `_call` see none. test_worker_questions.py exercises the real function.
-    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: ([], {}))
+    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: [])

@@ -4,7 +4,6 @@ command that answers it; a dispatched task whose worker went silent says for how
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -85,11 +84,9 @@ def test_an_escalation_is_a_question_too() -> None:
     assert [(q["id"], q["type"], q["question"]) for q in orca_cli.open_questions([escalation], [])] == [("msg_e", "escalation", "need a token")]
 
 
-def test_last_heard_is_the_latest_message_of_each_task() -> None:
-    run_messages = [_heartbeat("m2", "2026-10-11T12:30:00Z", 2), _heartbeat("m1", "2026-10-11T12:00:00Z", 1),
-                    _heartbeat("m3", "2026-10-11T11:00:00Z", 3, task="task_other")]
-
-    assert orca_cli.last_heard(run_messages) == {"task_q": "2026-10-11T12:30:00Z", "task_other": "2026-10-11T11:00:00Z"}
+def test_liveness_is_not_read_from_message_times() -> None:
+    """Workers send no heartbeats any more: nothing maps a task to the time of its last message."""
+    assert not hasattr(orca_cli, "last_heard")
 
 
 def test_worker_activity_reads_the_run_and_the_inbox(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,20 +100,16 @@ def test_worker_activity_reads_the_run_and_the_inbox(monkeypatch: pytest.MonkeyP
         raise orca_cli.OrcaError("orca inbox exited 1: boom")
 
     monkeypatch.setattr(orca_cli, "_call", call)
-    questions, heard = real_worker_activity(RUN)
+    questions = real_worker_activity(RUN)
     assert [q["id"] for q in questions] == ["msg_q"]
-    assert heard == {"task_q": "2026-10-11T12:42:56Z"}
     assert calls[0] == ("check", "--all", "--run", RUN)
     assert calls[1][:2] == ("inbox", "--full")
 
     monkeypatch.setattr(orca_cli, "_call", lambda *args, **kwargs: {"ok": True, "result": {"messages": [_question()] if args[0] == "check" else [reply]}})
-    assert real_worker_activity(RUN)[0] == []
+    assert real_worker_activity(RUN) == []
 
 
 # --- the board --------------------------------------------------------------------------------------------------
-
-
-NOW = datetime(2026, 10, 11, 13, 40, tzinfo=timezone.utc)
 
 
 def _tasks() -> list[dict]:
@@ -127,17 +120,17 @@ def _tasks() -> list[dict]:
 
 def test_board_lists_the_waiting_worker_first_and_not_as_running() -> None:
     owners = {"task_q": "home", "task_run": "home", "task_quiet": "home"}
-    heard = {"task_q": "2026-10-11T12:42:56Z", "task_run": "2026-10-11T13:35:00Z", "task_quiet": "2026-10-11T13:05:00Z"}
+    quiet = {"task_q": 57, "task_run": 5, "task_quiet": 35}  # minutes each screen stood idle and unchanged
     questions = orca_cli.open_questions([_question()], [])
 
-    lines = coordinator.board_lines(_tasks(), owners, "home", questions=questions, heard=heard, now=NOW, run=RUN)
+    lines = coordinator.board_lines(_tasks(), owners, "home", questions=questions, quiet=quiet, run=RUN)
 
     assert lines[0] == "worker đang hỏi, chờ trả lời (1):"
     assert lines[1] == "  - task_q: Can quyet 3 diem. Dong y?"
     assert lines[2] == "    lựa chọn: dong y de xuat | bo qua | khac (ghi ro)"
     assert lines[3] == f'    msg msg_q; trả lời: `orca orchestration reply --id msg_q --run {RUN} --body "..."`'
     running = lines[lines.index("đang chạy (2):") + 1:]
-    assert running[:2] == ["  - task_run [dispatched] Dang chay", "  - task_quiet [dispatched] Im lang (không có tin 35 phút)"]
+    assert running[:2] == ["  - task_run [dispatched] Dang chay", "  - task_quiet [dispatched] Im lang (màn hình đứng yên 35 phút)"]
     assert not any(line.startswith("  - task_q [") for line in lines)
 
 
@@ -145,7 +138,7 @@ def test_board_cuts_a_long_question_and_names_the_repo() -> None:
     long = {**_question(), "payload": json.dumps({**QUESTION_PAYLOAD, "question": "x" * 500})}
     questions = orca_cli.open_questions([long], [])
 
-    lines = coordinator.board_lines(_tasks(), {"task_q": "other", "task_run": "home"}, "home", {"other"}, questions, now=NOW)
+    lines = coordinator.board_lines(_tasks(), {"task_q": "other", "task_run": "home"}, "home", {"other"}, questions)
 
     assert lines[1] == "  - task_q (repo other): " + "x" * 200 + "…"
 
@@ -153,7 +146,7 @@ def test_board_cuts_a_long_question_and_names_the_repo() -> None:
 def test_board_leaves_out_questions_of_another_coordinators_task() -> None:
     questions = orca_cli.open_questions([_question()], [])
 
-    lines = coordinator.board_lines(_tasks(), {"task_run": "home"}, "home", questions=questions, now=NOW)
+    lines = coordinator.board_lines(_tasks(), {"task_run": "home"}, "home", questions=questions)
 
     assert "worker đang hỏi" not in "\n".join(lines)
 
@@ -162,7 +155,7 @@ def test_read_board_shows_the_question(repo: Path, orca_fake: dict, monkeypatch:
     orca.link(repo, t_id="T-q", task_id="task_q", project=orca.project_name(repo))
     orca_fake["tasks"]["task_q"] = "dispatched"
     monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: [])
-    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: (orca_cli.open_questions([_question()], []), {}))
+    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: orca_cli.open_questions([_question()], []))
 
     lines, error = coordinator.read_board(repo)
 
@@ -175,7 +168,7 @@ def test_read_board_shows_the_question(repo: Path, orca_fake: dict, monkeypatch:
 def test_inbox_prints_open_questions(repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setattr(orca_cli, "_call", lambda *args, **kwargs: {"ok": True, "result": {"run": None}})
     monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: [])
-    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: (orca_cli.open_questions([_question()], []), {}))
+    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: orca_cli.open_questions([_question()], []))
 
     assert cli.main(["--root", str(repo), "inbox"]) == 0
 

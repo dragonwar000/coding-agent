@@ -17,7 +17,7 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `integration.yaml` | Manifest duy nhất: hook, mode, assumption, verify, bộ nhớ, ngưỡng loop, cờ `verified` |
 | `src/coding_agent/manifest.py` | Đọc và kiểm manifest; cấu hình sai bị từ chối ngay lúc nạp |
 | `src/coding_agent/gen.py` | Sinh `.claude/settings.json` và `.codex/hooks.json` với đường dẫn tương đối; `--check` báo drift |
-| `src/coding_agent/hooks/` | Sáu hook: `orca-guard`, `loop-guard`, `prompt-reset`, `stop-gate`, `pre-compact`, `session-restore` |
+| `src/coding_agent/hooks/` | Hook: `orca-guard`, `loop-guard`, `prompt-reset`, `stop-gate`, `pre-compact`, `session-restore`, các hook coordinator (`coordinator-guard`, `coordinator-context`, `coordinator-board`, `coordinator-heartbeat`) và `auto-decide` |
 | `src/coding_agent/transcript.py` | Đọc một lượt từ transcript, có số dòng làm bằng chứng và số lần lỗi/bị từ chối |
 | `src/coding_agent/orca.py` | Quy tắc Orca thuần: completion cần bằng chứng, task thuộc một repo, bằng chứng `CLAIMED-DONE BUT ABSENT` |
 | `src/coding_agent/orca_cli.py` | Adapter tới `orca orchestration`: tạo task, claim, đổi trạng thái, liệt kê |
@@ -27,7 +27,8 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
-| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-settle`, `wiki-sync`, `wikieval` |
+| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-watch`, `worker-settle`, `wiki-sync`, `wikieval` |
+| `src/coding_agent/watcher.py` | `worker-watch`: theo dõi worker bằng terminal (không model, không heartbeat), báo coordinator đúng một lần khi worker chết hoặc kẹt |
 | `src/coding_agent/wiki/` | Công cụ wiki của dự án: neo đồng bộ code→wiki (`sync.py`) và bộ eval goldens (`evaluate.py`) |
 | `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
 | `install.sh` | Lệnh một dòng cho `project_install` |
@@ -374,6 +375,8 @@ Nó không tự sửa file.
   event `direct-change` nếu cây của coordinator có file mới đổi. Đây là phát hiện, không hoàn tác. Sửa tay của người dùng
   trong lúc đó cũng bị tính.
 - **Hợp đồng và bảng việc** được nạp đầu phiên, sau nén ngữ cảnh, và mỗi prompt.
+- **`coordinator-heartbeat` (enforce)** chặn prompt chỉ gồm thông báo hộp thư của Orca khi mọi tin chưa đọc là `heartbeat`
+  (ack chúng, không có lượt model); mọi trường hợp khác cho qua. Xem "Theo dõi worker không cần heartbeat".
 - **Test và model theo việc:** xem mục dưới.
 - **Nới lỏng:** đổi `coordinator-guard` sang `mode: shadow` trong `integration.yaml` rồi cài lại. Khi đó hook chỉ nhắc.
 
@@ -479,7 +482,8 @@ python3 -m coding_agent.cli inbox --ack                       # đánh dấu đ�
 - **Worker đang hỏi:** worker chờ trả lời `orca orchestration ask` (type `question`/`escalation`, hoặc `payload.question`) nằm ở
   nhóm đầu bảng `worker đang hỏi, chờ trả lời (N):` kèm lựa chọn, msg id và lệnh `orca orchestration reply --id <msg> --run <run>`,
   và không còn nằm trong `đang chạy`. Đã trả lời = có tin cùng thread, worker báo cáo task, hoặc câu hỏi mới hơn của cùng dispatch;
-  heartbeat và `send` thường tới dispatch không tính. Task đang chạy mà worker im lặng quá 20 phút ghi `(không có tin X phút)`.
+  heartbeat và `send` thường tới dispatch không tính. Task đang chạy mà màn hình worker đứng yên (idle, không đổi) quá 20 phút
+  ghi `(màn hình đứng yên X phút)`: đo trên terminal, không đo theo giờ của tin nhắn cuối (worker không gửi heartbeat nữa).
   `inbox` (không `--ack`) in cả câu hỏi mở.
 - Nhóm `xong, worktree còn việc chưa gộp hoặc chưa commit` lấy từ git và sổ worker, không từ hộp thư: nó luôn hiện, kể cả khi
   hộp thư không đọc được hay báo cáo đã được ack, tới khi nhánh được gộp hoặc bỏ.
@@ -592,8 +596,43 @@ mid-response`), dòng `Worked for 3h 5m · done 9:24 PM`, rồi ô nhập trốn
 
 Giới hạn: phát hiện dựa trên chữ trên màn hình Claude Code; hai dòng lỗi ngắt lượt ở trên đã đo trên terminal thật, các dòng
 lỗi mạng của sự cố 2026-10-12 và các mẫu ngắt lượt còn lại lấy theo mô tả và thông báo lỗi của Node/undici, và agent khác
-(codex) có dạng lỗi khác thì chưa nhận ra. Worker im lặng chỉ được phát hiện khi có lượt quét. Không có coordinator nào đang chạy lượt mới
-và không có `worker-resume --watch` chạy nền thì không ai quét.
+(codex) có dạng lỗi khác thì chưa nhận ra. Worker im lặng chỉ được phát hiện khi có lượt quét: bảng việc ở mỗi lượt của
+coordinator, và `worker-watch` chạy nền (mục dưới).
+
+## Theo dõi worker không cần heartbeat
+
+Trước đây preamble của Orca bảo mọi worker gửi `heartbeat` mỗi 5 phút. Mỗi heartbeat tốn worker một lời gọi tool, rồi Orca gõ
+``You have N orchestration messages. Run `orca orchestration check --run <run>`.`` vào terminal coordinator, mở một lượt
+coordinator đầy đủ chỉ để đọc và ack "alive". Giờ coding-agent tự theo dõi worker qua terminal, không dùng model, và chỉ báo
+coordinator khi worker chết hoặc kẹt hẳn.
+
+- **Worker không gửi heartbeat:** spec của mọi task (`delegate`, `plan-apply`/`plan-next`, `orca-create`) kết thúc bằng một câu
+  ghi đè preamble (`orca_cli.NO_HEARTBEAT`): không gửi `heartbeat`, coding-agent theo dõi terminal; `worker_done` gửi đúng một
+  lần, `ask`/question và escalation giữ nguyên. Kick-off (`worker-kick`, kick tự động) có câu tương đương không dấu.
+- **Sống/chết đọc từ terminal, không từ tin nhắn:** mỗi lượt quét (`resume.stalled_workers`) đọc màn hình worker. Màn hình đang
+  chạy (spinner, ô nhập có chữ) là sống, không hỏi gì thêm. Màn hình khác thì hỏi Orca một lần `orca terminal show`: handle
+  `terminal_handle_stale` (terminal đã đóng, đo 2026-11-13) hoặc `agentIdentity: null` (agent đã thoát về shell) là **dead**.
+  Orca không đọc được hoặc không có trường `agentIdentity` thì không coi là chết. Worker im không gửi tin mà màn hình đang chạy
+  là sống, không bị đánh dấu. Bảng việc có nhóm đầu `worker chết, terminal hoặc agent đã mất (N):`.
+- **`worker-watch [--task-id <id> ...] [--interval GIÂY] [--run ID]`:** vòng lặp không model, mặc định 60 giây một lượt, chỉ đọc
+  Orca CLI. Mỗi lượt chạy đúng bước quét của `worker-resume` (tự resume, tự nhắc như trên), rồi coi là **chết hoặc kẹt** khi:
+  terminal hay agent đã mất; màn hình có lỗi API mà thử lại không sửa được (`PERMANENT_MARKS` hoặc `API Error` lạ); lỗi tạm thời
+  vẫn còn sau 5 lần resume (hoặc đã resume mà màn hình không đổi); hay worker vẫn im sau 2 lần nhắc. Phải thấy hai lượt liên tiếp
+  mới báo. Báo bằng MỘT tin `orca orchestration send --to run:<run> --type escalation`, subject `worker dead: <tên task>`, body
+  có task id, dispatch id, terminal, lý do và các dòng cuối màn hình (tối đa 15 dòng). Lần báo ghi vào `.coding-agent/resumes.jsonl`
+  với `kind: death`, nên mỗi dispatch chỉ được báo một lần; Orca từ chối thì lượt sau gửi lại. Vòng lặp tự thoát khi không còn
+  dispatch chưa xong nào chưa bị báo. Event `guard: worker-watch`: `started`, `start-failed`, `reported`, `report-failed`.
+- **Tự chạy nền:** `delegate`, `plan-next` (khi có worker mới) và bảng việc (khi còn worker chưa xong) chạy nền `worker-watch`
+  cho Run đó nếu chưa có cái nào chạy (vòng lặp ghi `.coding-agent/state/worker-watch.json` mỗi lượt; file cũ hơn 3 phút là
+  vòng lặp đã mất). Log ở `.coding-agent/worker-watch.log`. Tắt bằng `CODING_AGENT_WORKER_WATCH=off`. `worker-resume --watch`
+  vẫn còn, nhưng không báo coordinator.
+- **Hook `coordinator-heartbeat` (UserPromptSubmit, enforce):** khi prompt của coordinator chỉ là dòng thông báo hộp thư của
+  Orca, hook xem (`check --peek`) các tin chưa đọc của Run. Nếu tất cả là `heartbeat` (của worker khởi động trước thay đổi này,
+  vẫn theo preamble cũ), hook ack chúng và chặn prompt (`decision: block`, lý do `heartbeat only, acked (N)`): không có lượt model.
+  Có bất kỳ tin nào khác (`worker_done`, question, escalation, status...), prompt có chữ của người dùng, hộp thư trống, hay Orca
+  lỗi thì prompt đi qua nguyên vẹn. Mỗi lô giao của Orca được đọc lại trước khi ack: lô có thêm tin khác thì không ack. Ở
+  `shadow` hook chỉ ghi event `would-block`. Event `guard: coordinator-heartbeat`: `blocked`, `would-block`, `passed`, `orca-error`.
+  Cài vào dự án cũ bằng `install.sh --add-new-hooks` như các hook coordinator khác.
 
 ## Khởi động worker
 

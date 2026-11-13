@@ -15,6 +15,8 @@ folder project (the harness no longer asks for `new-child`). `FAKE_ORCA_UNKNOWN_
 the repository. `FAKE_ORCA_REAL_WORKTREE=1` makes `worktree create` add a real git worktree of the named repository.
 `terminal create` records `--worktree`, `--title`, and `--command` and answers `result.terminal.handle`.
 `orchestration send` records its options (without `--`) in `orchestration_sent`.
+`terminal show` answers a live claude terminal; a handle listed in `FAKE_ORCA_GONE_TERMINALS` (comma-separated) answers
+`terminal_handle_stale` as Orca does for a closed terminal, one in `FAKE_ORCA_NO_AGENT_TERMINALS` shows `agentIdentity: null`.
 `FAKE_ORCA_SCREEN` replaces what `terminal read` shows (lines separated by `\\n`). With `$CLAUDE_CONFIG_DIR` set,
 `worktree create` and `terminal create` copy `.claude.json` as it is at that moment to `$FAKE_ORCA_STATE.<word>-create.json`,
 so a test can see what was trusted when each call came.
@@ -106,6 +108,15 @@ def main(argv: list[str]) -> int:
         if "FAKE_ORCA_SCREEN" in os.environ:
             tail = os.environ["FAKE_ORCA_SCREEN"].split("\n")
         print(json.dumps({"ok": True, "result": {"terminal": {"handle": handle, "status": "running", "tail": tail, "source": "screen"}}}, ensure_ascii=False))
+        return exit_code
+    if argv[:2] == ["terminal", "show"]:
+        handle = _options(argv[2:]).get("--terminal", "")
+        if handle in os.environ.get("FAKE_ORCA_GONE_TERMINALS", "").split(","):
+            print(json.dumps({"ok": False, "error": {"code": "terminal_handle_stale", "message": "terminal_handle_stale"}}))
+            return 1
+        agent = None if handle in os.environ.get("FAKE_ORCA_NO_AGENT_TERMINALS", "").split(",") else "claude"
+        print(json.dumps({"ok": True, "result": {"terminal": {"handle": handle, "connected": True, "orphaned": False, "agentIdentity": agent,
+                                                              "lastOutputAt": 1794568264920}}}))
         return exit_code
     if argv[:2] == ["terminal", "create"]:
         options = _options(argv[2:])

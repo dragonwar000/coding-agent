@@ -16,7 +16,6 @@ import json
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +26,8 @@ ROLES = ("coordinator", "worker", "maintainer")
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 BOARD_LIMIT = 20
 QUESTION_CHARS = 200
-# A dispatched task whose worker sent nothing (heartbeat, report, question) for longer than this is flagged on the board.
+# A running task whose worker's screen has stood idle and unchanged for longer than this is flagged on the board. Measured
+# on the terminal (`resume.quiet_minutes`), never on message times: workers send no heartbeats (`orca_cli.NO_HEARTBEAT`).
 SILENT_MINUTES = 20
 
 # Shell forms that change file content. Read-only forms (ls, cat, grep) and the coding-agent CLI are not matched.
@@ -475,10 +475,11 @@ def contract(python_src: str, auto_decide: bool = False) -> str:
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, rồi `inbox --ack --task-id <id>` cho đúng task vừa gộp (không ack cả hộp thư: báo cáo chưa xem sẽ mất khỏi bảng), rồi `plan-next`.",
         "- Task giao bằng `delegate`/`plan-next` với `--root <repo khác>` vẫn hiện trên bảng (kèm tên repo) và được tự dọn như task của repo này: repo trong cây thư mục của bạn được tự tìm (có .coding-agent/links.jsonl), repo ngoài cây được ghi vào .coding-agent/roots.json. Task giao trước khi có roots.json được tự tìm lại repo từ Orca; nếu bảng vẫn thiếu, chạy `roots-add <path>`, xem bằng `roots-list`.",
         "- " + RECOVER,
-        "- Worker dừng vì lỗi API tạm thời (mất mạng, quá tải, rate limit) được tự resume khi dựng bảng việc, sau khi kiểm thấy mạng đã có lại; bảng việc ghi rõ worker nào đã resume, đang chờ mạng, hay bị chặn cần người xử lý. Khi còn worker đang chạy mà bạn không có lượt mới, chạy nền `worker-resume --watch` để chúng được resume ngay khi mạng trở lại.",
+        "- Worker dừng vì lỗi API tạm thời (mất mạng, quá tải, rate limit) được tự resume khi dựng bảng việc, sau khi kiểm thấy mạng đã có lại; bảng việc ghi rõ worker nào đã resume, đang chờ mạng, hay bị chặn cần người xử lý.",
+        "- Worker không gửi heartbeat: coding-agent theo dõi terminal của worker, không cần model. `delegate`/`plan-next` (và bảng việc khi còn worker chưa xong) tự chạy nền `worker-watch` (thay cho `worker-resume --watch`): mỗi phút nó resume, nhắc, và chỉ khi worker chết hoặc kẹt hẳn (terminal hay agent đã mất, lỗi không tạm thời, resume hay nhắc đủ số lần mà vẫn vậy) mới gửi bạn MỘT tin escalation 'worker dead: <task>' kèm lý do và các dòng cuối màn hình. Nhận tin đó thì đọc diff của worktree rồi xử lý (gộp và `worker-settle` nếu đạt, giao lại nếu chưa). Thông báo hộp thư mà chỉ có heartbeat (từ worker cũ) bị hook chặn và ack, không tốn lượt của bạn.",
         "- Worker im lặng (task còn dispatched, terminal đứng ở ô nhập trống quá 10 phút, chưa có worker_done trong hộp thư) được tự nhắc tối đa 2 lần: việc xong thì commit và gửi worker_done, chưa xong thì làm tiếp. Bảng việc tách riêng nhóm 'worker im lặng, chưa báo' kèm số lần đã nhắc; nhắc đủ 2 lần mà vẫn im thì đọc màn hình terminal và diff của worktree rồi xử lý (gộp và `worker-settle` nếu đạt).",
         "- Worktree của worker đã xong, đã gộp và sạch thì tự được xoá (khi dựng bảng việc và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`), không cần hỏi người dùng. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit: kiểm rồi gộp nhánh vào HEAD, hoặc vào nhánh base của task khi worker được tạo từ nhánh đó (`base:`/`--base-branch`), lượt sau nó tự được dọn. Muốn bỏ việc đó thì hỏi người dùng trong hội thoại trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp; host cũng hỏi xác nhận, trừ khi phiên đang bypass permissions).",
-        "- Khi bảng việc ghi 'worker đang hỏi, chờ trả lời': worker đó đang đứng chờ, không chạy. Trả lời ngay bằng lệnh in trên bảng (`orca orchestration reply --id <msg> --run <run> --body \"...\"`). Câu hỏi cần người dùng quyết (phạm vi, xoá/ghi đè, commit/push, chọn hướng) thì hỏi người dùng trong hội thoại trước rồi mới trả lời worker. Dòng task có '(không có tin X phút)' là worker im lặng lâu: đọc terminal của nó trước khi coi là đang chạy.",
+        "- Khi bảng việc ghi 'worker đang hỏi, chờ trả lời': worker đó đang đứng chờ, không chạy. Trả lời ngay bằng lệnh in trên bảng (`orca orchestration reply --id <msg> --run <run> --body \"...\"`). Câu hỏi cần người dùng quyết (phạm vi, xoá/ghi đè, commit/push, chọn hướng) thì hỏi người dùng trong hội thoại trước rồi mới trả lời worker. Dòng task có '(màn hình đứng yên X phút)' là terminal của worker không đổi đã lâu: đọc terminal của nó trước khi coi là đang chạy.",
         "- Task `completed` do worker tự báo là chưa có bằng chứng: kiểm kết quả (đọc diff của worktree, chạy verify) trước khi báo người dùng là xong.",
         "- Worker chạy trong worktree riêng và ghi kết quả vào Orca. Sau khi giao, trả lời người dùng ngay; không chờ worker.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái task.",
@@ -486,15 +487,6 @@ def contract(python_src: str, auto_decide: bool = False) -> str:
     if auto_decide:
         lines.append(AUTO_DECIDE_LINE)
     return "\n".join(lines)
-
-
-def _minutes_since(when: Any, now: datetime) -> int | None:
-    try:
-        then = datetime.fromisoformat(str(when).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    then = then if then.tzinfo else then.replace(tzinfo=timezone.utc)
-    return int((now - then).total_seconds() // 60)
 
 
 def question_lines(questions: list[dict[str, Any]], owners: dict[str, str] | None = None, home: str | None = None,
@@ -520,23 +512,27 @@ def question_lines(questions: list[dict[str, Any]], owners: dict[str, str] | Non
 
 
 def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: str, others: frozenset[str] | set[str] = frozenset(),
-                questions: list[dict[str, Any]] | None = None, heard: dict[str, str] | None = None,
-                now: datetime | None = None, run: str | None = None, stalled: dict[str, str] | None = None,
-                silent: dict[str, str] | None = None, models: dict[str, str] | None = None) -> list[str]:
+                questions: list[dict[str, Any]] | None = None, quiet: dict[str, int] | None = None,
+                run: str | None = None, stalled: dict[str, str] | None = None,
+                silent: dict[str, str] | None = None, models: dict[str, str] | None = None,
+                dead: dict[str, str] | None = None) -> list[str]:
     """The task board for this repository, one line per task, grouped by state.
 
     `models` maps a task to the model its worker started with (`worker_models`); the task's line ends with `[model]`.
 
     `others` are the repositories this coordinator delegated into; their tasks are listed too, each with its repository.
-    `questions` (`orca_cli.open_questions`) come first: a task waiting on an answer is not listed as running. `heard`
-    maps a task to when its worker last sent anything; a running task silent for over `SILENT_MINUTES` says so.
+    `questions` (`orca_cli.open_questions`) come first: a task waiting on an answer is not listed as running. `quiet`
+    maps a task to how many minutes its worker's screen has stood idle and unchanged (`resume.quiet_minutes`); a running
+    task quiet for over `SILENT_MINUTES` says so. Liveness is read from the terminal, never from message times.
+    `dead` maps a task whose worker's terminal or agent is gone to why (`resume.dead_notes`); those are listed first.
     `stalled` maps a task whose worker stopped on an API error to what was done about it (`resume.board_notes`); those
     tasks are listed next, in a group of their own, and not as running. `silent` does the same for a worker that went
     quiet without reporting (`resume.silent_notes`), in the group after it.
     """
     shown = {project, *others}
-    stalled = stalled or {}
-    silent = {task: note for task, note in (silent or {}).items() if task not in stalled}
+    dead = dead or {}
+    stalled = {task: note for task, note in (stalled or {}).items() if task not in dead}
+    silent = {task: note for task, note in (silent or {}).items() if task not in stalled and task not in dead}
     mine = [{**task, "project": owners[str(task.get("id"))]} for task in tasks if owners.get(str(task.get("id"))) in shown]
     ids = {str(task.get("id")) for task in mine}
     known = {str(task.get("id")) for task in tasks}
@@ -554,11 +550,12 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
         model = (models or {}).get(str(task.get("id")))
         return f"  - {task.get('id')} [{task.get('status')}] {title}".rstrip() + (f" [{model}]" if model else "") + repo
 
+    gone = [task for task in mine if str(task.get("id")) in dead]
     halted = [task for task in mine if str(task.get("id")) in stalled]
-    quiet = [task for task in mine if str(task.get("id")) in silent]
-    groups = orca.reconcile([task for task in mine if str(task.get("id")) not in stalled and str(task.get("id")) not in silent])
+    hushed = [task for task in mine if str(task.get("id")) in silent]
+    apart = {*dead, *stalled, *silent}
+    groups = orca.reconcile([task for task in mine if str(task.get("id")) not in apart])
     groups["running"] = [task for task in groups["running"] if str(task.get("id")) not in waiting]
-    now = now or datetime.now(timezone.utc)
     labels = {
         "running": "đang chạy",
         "never_dispatched": "chưa giao worker",
@@ -566,14 +563,18 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
         "unverified": "báo xong nhưng chưa có bằng chứng",
         "other": "khác",
     }
+    if gone:
+        lines.append(f"worker chết, terminal hoặc agent đã mất ({len(gone)}):")
+        lines += [f"{row(task)}: {dead[str(task.get('id'))]}" for task in gone]
+        lines.append("  việc cần làm: đọc diff của worktree; việc đã xong thì kiểm, gộp rồi `worker-settle`, chưa xong thì giao lại.")
     if halted:
         lines.append(f"worker bị dừng vì lỗi API/mạng, không còn chạy ({len(halted)}):")
         lines += [f"{row(task)}: {stalled[str(task.get('id'))]}" for task in halted]
-        lines.append("  việc cần làm: worker 'đã tự resume' hoặc 'đang chờ mạng' thì không cần làm gì (chạy nền `worker-resume --watch` để resume ngay khi mạng có lại); "
+        lines.append("  việc cần làm: worker 'đã tự resume' hoặc 'đang chờ mạng' thì không cần làm gì (`worker-watch` chạy nền resume ngay khi mạng có lại); "
                      "worker 'bị chặn' thì đọc màn hình terminal của nó và báo người dùng.")
-    if quiet:
-        lines.append(f"worker im lặng, chưa báo ({len(quiet)}):")
-        lines += [f"{row(task)}: {silent[str(task.get('id'))]}" for task in quiet]
+    if hushed:
+        lines.append(f"worker im lặng, chưa báo ({len(hushed)}):")
+        lines += [f"{row(task)}: {silent[str(task.get('id'))]}" for task in hushed]
         lines.append("  việc cần làm: worker vừa được nhắc hoặc chờ nhắc lại thì không cần làm gì; worker 'cần người xử lý' thì đọc màn hình "
                      "terminal và diff của worktree: việc đã xong thì kiểm, gộp rồi `worker-settle`, chưa xong thì báo người dùng.")
     for key, label in labels.items():
@@ -582,10 +583,8 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
             continue
         lines.append(f"{label} ({len(items)}):")
         for task in items:
-            quiet_for = ""
-            if key == "running" and (heard or {}).get(str(task.get("id"))):
-                minutes = _minutes_since(heard[str(task.get("id"))], now)
-                quiet_for = f" (không có tin {minutes} phút)" if minutes is not None and minutes > SILENT_MINUTES else ""
+            minutes = (quiet or {}).get(str(task.get("id"))) if key == "running" else None
+            quiet_for = f" (màn hình đứng yên {minutes} phút)" if minutes is not None and minutes > SILENT_MINUTES else ""
             lines.append(row(task) + quiet_for)
     return lines[:BOARD_LIMIT] + (["  ..."] if len(lines) > BOARD_LIMIT else [])
 
@@ -605,6 +604,21 @@ def split_orca_pointer(prompt: str) -> str | None:
         return None
     rest = "\n".join(line.strip() for line in ORCA_POINTER.sub("\n", prompt).splitlines() if line.strip())
     return rest or None
+
+
+POINTER_RUN = re.compile(r"--run\s+([A-Za-z0-9_-]+)")
+
+
+def orca_pointer_only(prompt: str) -> bool:
+    """True when the prompt is nothing but Orca's mailbox line (once or more): a wake-up, with no text of the user's."""
+    return bool(ORCA_POINTER.search(prompt)) and split_orca_pointer(prompt) is None
+
+
+def pointer_run(prompt: str) -> str | None:
+    """The Run named in Orca's mailbox line (`orca orchestration check --run <id>`), or None when it names none."""
+    match = ORCA_POINTER.search(prompt)
+    found = POINTER_RUN.search(match.group(0)) if match else None
+    return found.group(1) if found else None
 
 
 def collision_context(user_text: str) -> str:
@@ -641,9 +655,10 @@ def read_board(root: Path, run: str | None = None, session: str = "board") -> tu
     left as it is; when they differ the first line says which Run the board follows (`orca_cli.adopt_run`). Tasks,
     reports and worker worktrees are read for `root` and every repository it delegated into (`orca_cli.all_roots`); a
     task no known repository owns makes `roots.discover` look its repository up from Orca and register it first.
-    Worker questions nobody answered come first (`orca_cli.worker_activity`). Workers that stopped on a transient API
-    error are resumed (`resume.auto`), and listed in a group of their own; so are workers that went silent without
-    reporting, which `resume.auto` reminds.
+    Worker questions nobody answered come first (`orca_cli.worker_activity`). Workers whose terminal or agent is gone
+    are listed first among the tasks; workers that stopped on a transient API error are resumed (`resume.auto`), and
+    listed in a group of their own; so are workers that went silent without reporting, which `resume.auto` reminds.
+    While any worker is unsettled, the death watcher is kept running in the background (`watcher.ensure_running`).
     Settled worker worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists
     only the ones that still hold work; that group does not depend on the inbox being readable.
     """
@@ -671,18 +686,20 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
     owners = repo_owners(roots)
     home = orca.project_name(root)
     try:
-        questions, heard = orca_cli.worker_activity(run)
+        questions = orca_cli.worker_activity(run)
         activity_error = None
     except orca_cli.OrcaError as error:
         if orca_cli.fenced_run(error):
             return [], None, orca_cli.fenced_run(error)
-        questions, heard, activity_error = [], {}, str(error)[:160]
-    from coding_agent import resume
+        questions, activity_error = [], str(error)[:160]
+    from coding_agent import resume, watcher
 
     found = resume.auto(root, tasks, run, session)
-    lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]}, questions, heard,
-                        run=orca_cli.run_id(run), stalled=resume.board_notes(found), silent=resume.silent_notes(found),
-                        models=worker_models(roots))
+    if found:
+        watcher.ensure_running(root, run, session=session)
+    lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]}, questions,
+                        resume.quiet_minutes(found), run=orca_cli.run_id(run), stalled=resume.board_notes(found),
+                        silent=resume.silent_notes(found), models=worker_models(roots), dead=resume.dead_notes(found))
     if activity_error:
         lines.append(f"câu hỏi của worker không đọc được: {activity_error}")
     try:

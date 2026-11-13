@@ -36,6 +36,15 @@
   The same scan reminds a silent worker (task `dispatched`, screen idle and unchanged for `CODING_AGENT_SILENT_MINUTES`,
   default 10, and no `worker_done` in the inbox) through `orca orchestration send` and its terminal, twice at most;
   `--dry-run` lists stalled and silent workers alike.
+- `worker-watch [--task-id ID ...] [--interval SECONDS]`: the death watcher (`watcher.py`). Every `--interval` seconds
+  (default 60) it runs the `worker-resume` scan (Orca CLI reads, no model, the same resumes and reminders) and reports a
+  worker that is dead or stuck for good to the coordinator with ONE `escalation` (`worker dead: <task title>`, task and
+  dispatch ids, the reason, the last screen lines), once per dispatch (`kind: death` in `.coding-agent/resumes.jsonl`).
+  Dead or stuck: its terminal or agent process is gone, its screen shows an API error a retry does not fix, a transient
+  error stays after the last resume, or it stays silent after the last reminder; seen on two scans in a row. Exits when
+  no unsettled, unreported dispatch is left. Liveness comes from the terminal, never from heartbeats, which workers no
+  longer send. `delegate`, `plan-next` and the board start it in the background when none runs for the Run (output in
+  `.coding-agent/worker-watch.log`); `CODING_AGENT_WORKER_WATCH=off` turns that off.
 - `worker-settle --task-id ID --basis B [--artifact PATH ...]`: abandon the task's active dispatch and mark it completed, once the coordinator
   has checked the result; for a worker whose `worker_done` Orca rejected.
 - `worktree-list`: worker worktrees whose task settled and that still hold work, and what removing each would lose.
@@ -87,7 +96,7 @@ from pathlib import Path
 import os
 import uuid
 
-from coding_agent import autodecide, cleanup, coordinator, events, orca, orca_cli, resume, roots
+from coding_agent import autodecide, cleanup, coordinator, events, orca, orca_cli, resume, roots, watcher
 from coding_agent import plan as plan_graph
 from coding_agent.brief import BriefError, brief
 from coding_agent.hooks import utf8_output
@@ -155,7 +164,7 @@ ROOT_REGISTERED = frozenset({"delegate", "plan-next"})
 # Commands that act in an Orca Run. Without `--run` they use the Run Orca has bound to this terminal ahead of the
 # shared `.coding-agent/orca-run` (`orca_cli.sync_bound_run`); `board` resolves it in `coordinator.read_board`.
 TERMINAL_RUN = frozenset({"orca-create", "orca-status", "claim", "status", "worker-start", "worker-adopt", "worker-kick",
-                          "worker-resume", "worker-settle", "worktree-list", "worktree-clean", "inbox", "delegate", "plan-apply",
+                          "worker-resume", "worker-watch", "worker-settle", "worktree-list", "worktree-clean", "inbox", "delegate", "plan-apply",
                           "plan-next", "plan-status"})
 
 
@@ -196,7 +205,7 @@ def _inbox(args: argparse.Namespace, root: Path) -> int:
     owners, plans, home = coordinator.repo_owners(known), coordinator.plan_ids(known), orca.project_name(root)
     if not args.ack:
         try:
-            asking = coordinator.question_lines(orca_cli.worker_activity(args.run)[0], owners, home, orca_cli.run_id(args.run))
+            asking = coordinator.question_lines(orca_cli.worker_activity(args.run), owners, home, orca_cli.run_id(args.run))
         except orca_cli.OrcaError as error:
             asking = [f"inbox: worker questions unreadable: {str(error)[:160]}"]
         lines = coordinator.report_lines(reports, plans, owners, home)
@@ -300,6 +309,10 @@ def main(argv: list[str] | None = None) -> int:
     resumed.add_argument("--watch", action="store_true", help="keep scanning and resume when the network is back")
     resumed.add_argument("--interval", type=float, default=resume.WATCH_INTERVAL_S, help="seconds between scans with --watch (default 60)")
     resumed.add_argument("--run")
+    watching = sub.add_parser("worker-watch", help="report dead or stuck workers to the coordinator, once each, with no model")
+    watching.add_argument("--task-id", action="append", default=[], help="only this task's worker (repeatable; default: every unsettled worker of the Run)")
+    watching.add_argument("--interval", type=float, default=watcher.WATCH_INTERVAL_S, help="seconds between scans (default 60)")
+    watching.add_argument("--run")
     settle = sub.add_parser("worker-settle", help="abandon the task's dispatch and complete the task after checking its result")
     settle.add_argument("--task-id", required=True)
     settle.add_argument("--basis", required=True, choices=sorted(orca.PROOF_BASES))
@@ -390,6 +403,12 @@ def _auto_decide(args: argparse.Namespace, root: Path) -> int:
     return 0
 
 
+def _start_watch(root: Path, run: str | None) -> None:
+    """Keep the death watcher running for the Run once a worker was started; say so on stderr when it was started."""
+    if watcher.ensure_running(root, run) == "started":
+        print(f"worker-watch: started in the background (log: {root / watcher.LOG_FILE})", file=sys.stderr)
+
+
 def _command(args: argparse.Namespace, root: Path) -> int:
     try:
         if args.command == "auto-decide":
@@ -429,6 +448,11 @@ def _command(args: argparse.Namespace, root: Path) -> int:
                 return 0
             print("\n".join(resume.main_lines(resume.scan(root, args.run, task_ids=args.task_id, dry_run=args.dry_run))))
             return 0
+        if args.command == "worker-watch":
+            try:
+                return watcher.watch(root, args.run, task_ids=args.task_id or None, interval_s=max(args.interval, 1.0))
+            except KeyboardInterrupt:
+                return 0
         if args.command == "worker-settle":
             outcome = orca_cli.settle(root, task_id=args.task_id, basis=args.basis, artifacts=tuple(args.artifact), run=args.run)
             print(json.dumps(outcome, ensure_ascii=False))
@@ -479,6 +503,8 @@ def _command(args: argparse.Namespace, root: Path) -> int:
                     print(f"started {node_id} -> {task_id} ({dispatch}) [{model}]")
                 if not started:
                     print("plan-next: no node is ready (dependencies open, or every node already has a worker)")
+                else:
+                    _start_watch(orca_cli.coordinator_root(), args.run)
             print("\n".join(plan_graph.status_lines(nodes, plan_graph.states(root, nodes, run=args.run))))
             return 0
         if args.command == "board":
@@ -504,6 +530,7 @@ def _command(args: argparse.Namespace, root: Path) -> int:
                 verify=tuple(args.verify),
             )
             print(json.dumps({"task_id": task_id, "dispatch": dispatch, "model": orca_cli.shown_model(agent, args.model)}, ensure_ascii=False))
+            _start_watch(orca_cli.coordinator_root(), args.run)
             return 0
         if args.command == "brief":
             print(brief(args.plan.read_text(encoding="utf-8"), args.task), end="")

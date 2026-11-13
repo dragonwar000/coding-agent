@@ -392,14 +392,25 @@ def owner_of(root: Path, task_id: str) -> str | None:
     return links(root).get(task_id)
 
 
+# Ends every task spec (`create_task`, so `delegate`, `plan-apply`/`plan-next` and `orca-create`). Orca's preamble asks a
+# worker for a heartbeat every 5 minutes; each one costs the worker a tool call and wakes the coordinator for a full turn
+# that only reads "alive". coding-agent tells live from dead by the worker's terminal (`resume.stalled_workers`,
+# `watcher`), so the heartbeat is turned off here. worker_done, ask/question and escalation are left as the preamble says.
+NO_HEARTBEAT = ("Liveness: do NOT send `heartbeat` messages, whatever the preamble says; coding-agent watches this terminal "
+                "and tells the coordinator when a worker dies. Send worker_done exactly once at the end, and use ask or "
+                "escalation as the preamble says.")
+
+
 def create_task(root: Path, *, project: str, t_id: str, spec: str, title: str, run: str | None = None, deps: tuple[str, ...] = ()) -> str:
     """Create an Orca task that carries the durable `T-id` and the `project`, then link the two ids (FR-006).
 
-    `deps` are the Orca task ids this task depends on; Orca records them with the task.
+    `deps` are the Orca task ids this task depends on; Orca records them with the task. The spec ends with
+    `NO_HEARTBEAT`, which overrides the preamble's heartbeat instruction.
     """
     header = f"project: {project}\nt_id: {t_id}\n\n"
     dep_args = ["--deps", json.dumps(list(deps))] if deps else []
-    task_id = task_id_of(_call("task-create", "--spec", header + spec, "--task-title", title, *dep_args, *_run_args(run)))
+    text = header + spec.rstrip("\n") + "\n\n" + NO_HEARTBEAT
+    task_id = task_id_of(_call("task-create", "--spec", text, "--task-title", title, *dep_args, *_run_args(run)))
     orca.link(root, t_id=t_id, task_id=task_id, project=project)
     return task_id
 
@@ -1250,15 +1261,22 @@ KICK_MARK = "Ban la worker"
 PROMPT_MARKS = ("❯", "›", ">", "$")
 
 
+# The kick-off's form of `NO_HEARTBEAT`: plain ASCII, nothing a shell expands inside double quotes.
+NO_HEARTBEAT_KICK = ("KHONG gui heartbeat (bo qua dong heartbeat moi 5 phut trong preamble): coding-agent tu theo doi terminal nay. "
+                     "Giu nguyen worker_done, ask/question va escalation.")
+
+
 def kickoff_text(task_id: str, dispatch: str) -> str:
     """The one-line kick-off sent to a worker at an empty prompt.
 
     It goes through `terminal send --text`, and `_manual_kick` prints it inside double quotes for a person to paste,
     so it holds no newline, no `>`, and nothing a shell expands inside double quotes (backtick, `$`, `"`, `\\`).
+    It tells the worker not to send heartbeats (`NO_HEARTBEAT_KICK`), whatever its preamble says.
     """
     return (f"Ban la worker Orca cho task {task_id} (dispatch {dispatch}). "
             f"Chay lenh [orca orchestration dispatch-show --task {task_id} --preamble --json] de doc preamble + TASK, roi thuc hien dung TASK. "
-            "Heartbeat/worker_done co the bi tu choi vi thieu token: van gui worker_done DUNG MOT LAN cuoi cung, "
+            f"{NO_HEARTBEAT_KICK} "
+            "worker_done co the bi tu choi vi thieu token: van gui worker_done DUNG MOT LAN cuoi cung, "
             f"va ghi bao cao REPORT-{task_id}.md trong worktree roi commit. Khong dung AskUserQuestion.")
 
 
@@ -1289,6 +1307,47 @@ def screen_of(handle: str) -> str:
     terminal = result.get("terminal") if isinstance(result, dict) else None
     tail = terminal.get("tail") if isinstance(terminal, dict) else None
     return "\n".join(str(line) for line in tail) if isinstance(tail, list) else ""
+
+
+# `terminal show` / `terminal read` answer `ok: false` with one of these codes for a handle whose terminal is closed
+# (measured on Orca 2026-11-13: `terminal_handle_stale` for a handle that no longer exists).
+TERMINAL_GONE_CODES = ("terminal_handle_stale", "terminal_not_found", "terminal_closed")
+
+
+def terminal_state(handle: str) -> dict[str, Any]:
+    """What Orca knows about a terminal (`terminal show`), for telling a live worker from a dead one. One CLI read.
+
+    Answers `{"exists": False, "code": ...}` when Orca says the handle is stale (the terminal was closed), else
+    `{"exists": True, "connected", "orphaned", "agent", "last_output_ms"}`. `agent` is `agentIdentity` (`claude`,
+    `codex`, ...), None when Orca sees no agent running in the terminal, and the key is absent when the answer does not
+    carry the field (an older Orca), which says nothing either way. Measured on Orca 2026-11-13: a Claude Code worker
+    shows `connected: true`, `orphaned: false`, `agentIdentity: "claude"` and `lastOutputAt` in milliseconds; a plain
+    shell shows `agentIdentity: null`. Any other failure raises `OrcaError`: an Orca that cannot be read is not a death.
+    """
+    try:
+        answer = _call_tool("terminal", "show", "--terminal", handle)
+    except OrcaRefused as error:
+        if any(code in str(error) for code in TERMINAL_GONE_CODES):
+            return {"exists": False, "code": next(code for code in TERMINAL_GONE_CODES if code in str(error))}
+        raise
+    result = answer.get("result") if isinstance(answer, dict) else None
+    terminal = result.get("terminal", result) if isinstance(result, dict) else None
+    if not isinstance(terminal, dict):
+        raise OrcaError(f"terminal show answered no terminal for {handle}")
+    out: dict[str, Any] = {"exists": True, "connected": terminal.get("connected"), "orphaned": terminal.get("orphaned"),
+                           "last_output_ms": terminal.get("lastOutputAt")}
+    if "agentIdentity" in terminal:
+        out["agent"] = terminal.get("agentIdentity") or None
+    return out
+
+
+def escalate(*, run: str | None, subject: str, body: str, task_id: str, dispatch: str) -> None:
+    """Send the coordinator an `escalation` through the Run's mailbox (`--to run:<id>`, the address Orca names for raising
+    something with the Run's own coordinator), carrying the task and dispatch ids."""
+    chosen = run_id(run)
+    target = ["--to", f"run:{chosen}"] if chosen else []
+    _call("send", *target, "--type", "escalation", "--subject", subject, "--body", body, "--task-id", task_id,
+          "--dispatch-id", dispatch, *_run_args(run))
 
 
 def send_line(handle: str, text: str) -> None:
@@ -1479,8 +1538,18 @@ def _when(message: dict[str, Any]) -> tuple[str, int]:
     return str(message.get("created_at") or ""), sequence if isinstance(sequence, int) else -1
 
 
+# Subject of the escalation `watcher.report_death` sends: a report about a worker, not a worker asking anything.
+DEATH_SUBJECT = "worker dead: "
+
+
 def is_question(message: dict[str, Any]) -> bool:
-    """A worker waiting on the coordinator: `orca orchestration ask` (type `question`, `payload.question`) or an escalation."""
+    """A worker waiting on the coordinator: `orca orchestration ask` (type `question`, `payload.question`) or an escalation.
+
+    The death watcher's own escalation (`DEATH_SUBJECT`) is not one: no worker waits on it, and the board lists the
+    dead or stuck worker in its own group.
+    """
+    if str(message.get("subject") or "").startswith(DEATH_SUBJECT):
+        return False
     return message.get("type") in ("question", "escalation") or "question" in _payload_of(message)
 
 
@@ -1531,34 +1600,24 @@ def open_questions(run_messages: list[dict[str, Any]], replies: list[dict[str, A
     return sorted(out, key=lambda question: str(question.get("created_at") or ""))
 
 
-def last_heard(run_messages: list[dict[str, Any]]) -> dict[str, str]:
-    """Task id to the `created_at` of the latest message its worker sent (heartbeat, report or question)."""
-    out: dict[str, str] = {}
-    for message in run_messages:
-        task = _payload_of(message).get("taskId")
-        when = message.get("created_at")
-        if isinstance(task, str) and isinstance(when, str) and when > out.get(task, ""):
-            out[task] = when
-    return out
-
-
 INBOX_LIMIT = 200
 
 
-def worker_activity(run: str | None = None) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """(open worker questions, task id to when its worker last sent anything) for the Run.
+def worker_activity(run: str | None = None) -> list[dict[str, Any]]:
+    """The open worker questions of the Run.
 
     Reads `check --all` (every message to the Run, not marking any read) and `inbox --full`, which also holds the
     replies sent to dispatches. When the inbox cannot be read, questions are judged on the Run's messages alone.
     A question is about a worker that waits, so it is not the same as `turn_unobserved` (a worker that never got its
-    task, see `kick_worker`) or a rejected report (`settle`).
+    task, see `kick_worker`) or a rejected report (`settle`). Whether a worker is alive is not read from its messages
+    (workers no longer send heartbeats, see `NO_HEARTBEAT`) but from its terminal (`resume.stalled_workers`).
     """
     run_messages = _messages(_call("check", "--all", *_run_args(run)))
     try:
         replies = _messages(_call("inbox", "--full", "--limit", str(INBOX_LIMIT)))
     except OrcaError:
         replies = []
-    return open_questions(run_messages, replies), last_heard(run_messages)
+    return open_questions(run_messages, replies)
 
 
 def _take_delivery(run: str | None) -> tuple[list[dict[str, Any]], str | None]:
@@ -1632,3 +1691,50 @@ def ack_task_reports(root: Path, task_ids: set[str], run: str | None = None) -> 
         if delivery and all(report_key(report) in done for report in batch):
             _call("check", "--ack", delivery, *_run_args(run))
     return chosen
+
+
+# --- heartbeats the coordinator never needs to see ------------------------------------------------------------------
+
+HEARTBEAT = "heartbeat"
+ACK_ROUNDS = 5           # delivery batches acknowledged at most by one `ack_heartbeats`
+
+
+def is_heartbeat(message: dict[str, Any]) -> bool:
+    """An `orca orchestration send --type heartbeat` message: a worker saying it is alive, nothing to act on."""
+    return str(message.get("type") or "") == HEARTBEAT
+
+
+def _handled(message: dict[str, Any], done: set[str]) -> bool:
+    """A heartbeat, or a message the coordinator already acknowledged per task (`ack_task_reports`)."""
+    return is_heartbeat(message) or (bool(message.get("id")) and str(message["id"]) in done)
+
+
+def ack_heartbeats(root: Path, run: str | None = None, *, apply: bool = True) -> int | None:
+    """Acknowledge the unread messages of the Run when every one is a heartbeat. Returns how many, or None.
+
+    None means there is something for the coordinator: an unread message that is not a heartbeat (worker_done,
+    question, escalation, status, anything else), or no unread message at all; nothing is acknowledged then. A report
+    already acknowledged per task (`ACKED_FILE`) counts as handled. Orca acknowledges whole delivery batches, so each
+    batch is taken (`check`) and checked again before its `--ack`: a batch that gained another message meanwhile is
+    left unacknowledged (Orca replays it) and the answer is None. `apply=False` only peeks and acknowledges nothing.
+    Orca failures raise `OrcaError`.
+    """
+    done = acked_keys(root)
+    unread = _messages(_call("check", "--peek", *_run_args(run)))
+    if not unread or not all(_handled(message, done) for message in unread):
+        return None
+    if not apply:
+        return len(unread)
+    acked = 0
+    for _ in range(ACK_ROUNDS):
+        answer = _call("check", *_run_args(run))
+        batch = _messages(answer)
+        result = answer.get("result") if isinstance(answer, dict) else None
+        delivery = (result.get("deliveryId") or result.get("delivery_id")) if isinstance(result, dict) else None
+        if not batch or not isinstance(delivery, str) or not delivery:
+            break
+        if not all(_handled(message, done) for message in batch):
+            return None
+        _call("check", "--ack", delivery, *_run_args(run))
+        acked += len(batch)
+    return acked or None

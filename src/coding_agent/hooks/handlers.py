@@ -1,4 +1,5 @@
-"""The handlers the manifest binds: orca-guard, loop-guard, prompt-reset, stop-gate, pre-compact, session-restore.
+"""The handlers the manifest binds: orca-guard, loop-guard, prompt-reset, stop-gate, pre-compact, session-restore,
+the coordinator hooks (coordinator-guard, coordinator-context/-board, coordinator-heartbeat) and auto-decide.
 
 Each handler returns a HookResult. Blocking is exit 2 with the reason on stderr, and happens only
 when the hook's mode is `enforce`. Every decision is logged with `applied` (FR-003).
@@ -15,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from coding_agent import autodecide, coordinator, evaluator, events, orca, ratchet, state, transcript
+from coding_agent import autodecide, coordinator, evaluator, events, orca, orca_cli, ratchet, state, transcript
 from coding_agent.hooks import Context, HookResult
 from coding_agent.manifest import Loop
 from coding_agent.memory import record, zeromem
@@ -553,6 +554,39 @@ def coordinator_context(ctx: Context) -> HookResult:
     return HookResult(stdout=_inject(event, text))
 
 
+def coordinator_heartbeat(ctx: Context) -> HookResult:
+    """Keep a mailbox wake-up that holds only heartbeats from costing the coordinator a turn.
+
+    Orca types "You have N orchestration message(s). Run `orca orchestration check --run <run>`." into the coordinator's
+    terminal whenever its mailbox gets mail, heartbeats included, and each one started a full turn that only read
+    "alive". When the prompt is only that line and every unread message of the Run is a `heartbeat` (from a worker
+    started before workers were told to stop sending them, `orca_cli.NO_HEARTBEAT`), they are acknowledged and the
+    prompt is blocked (`decision: block`), so no model turn runs. Anything else unread (worker_done, question,
+    escalation, ...), the user's own text in the prompt, a worker session, or any Orca failure lets the prompt through
+    unchanged (fail open). In `shadow` nothing is acknowledged or blocked; the decision is only recorded.
+    """
+    prompt = str(ctx.payload.get("prompt") or "")
+    if not coordinator.orca_pointer_only(prompt) or coordinator.role_for(_cwd(ctx)) != "coordinator":
+        return HookResult()
+    run = coordinator.pointer_run(prompt)
+    if run is None:
+        orca_cli.use_stored_run(ctx.root)
+    enforce = ctx.mode == "enforce"
+    try:
+        count = orca_cli.ack_heartbeats(ctx.root, run, apply=enforce)
+    except orca_cli.OrcaError as error:
+        ctx.note(guard="coordinator-heartbeat", kind="orca-error", applied=False, detail={"run": run, "error": str(error)[:300]})
+        return HookResult()
+    if count is None:
+        ctx.note(guard="coordinator-heartbeat", kind="passed", applied=False, detail={"run": run})
+        return HookResult()
+    if not enforce:
+        ctx.note(guard="coordinator-heartbeat", kind="would-block", applied=False, detail={"run": run, "heartbeats": count})
+        return HookResult()
+    ctx.note(guard="coordinator-heartbeat", kind="blocked", applied=True, detail={"run": run, "heartbeats": count})
+    return HookResult(stdout=json.dumps({"decision": "block", "reason": f"heartbeat only, acked ({count})"}))
+
+
 def _turn_context(ctx: Context) -> str:
     """The user's latest prompt and the agent's latest text in this turn, for Fable to decide with."""
     path = ctx.payload.get("transcript_path")
@@ -595,5 +629,6 @@ REGISTRY: dict[str, Callable[[Context], HookResult]] = {
     "coordinator-guard": coordinator_guard,
     "coordinator-context": coordinator_context,
     "coordinator-board": coordinator_context,
+    "coordinator-heartbeat": coordinator_heartbeat,
     "auto-decide": auto_decide,
 }
