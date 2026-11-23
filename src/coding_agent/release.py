@@ -261,7 +261,7 @@ def _same_process(detail: dict[str, Any], dispatch: dict[str, Any]) -> bool:
     return bool(dispatch.get("process_incarnation")) and dispatch["process_incarnation"] == f"{detail.get('ptyId')}:{detail.get('incarnationId')}"
 
 
-def _judge(record: dict[str, Any], mail: _Mail, run: str | None, grace: float, now: float,
+def _judge(record: dict[str, Any], mail: _Mail, grace: float, now: float,
            processes: _Processes) -> tuple[Decision, dict[str, Any], dict[str, Any]]:
     """The decision for one settled worker, with the dispatch and terminal it was based on."""
     task_id, recorded, worktree = record["task_id"], record["dispatch"], record["worktree"]
@@ -294,7 +294,7 @@ def _judge(record: dict[str, Any], mail: _Mail, run: str | None, grace: float, n
         return out("wait", "report not acknowledged", handle)
     if mail.asking(task_id, recorded):
         return out("wait", "open question", handle)
-    if orca_cli.unread_for_terminal(handle, run):
+    if orca_cli.unread_for_terminal(handle):
         return out("wait", "unread message for the worker", handle)
     if observation["activity"] == "working":
         return out("wait", "worker is working", handle)
@@ -423,7 +423,7 @@ def sweep(root: Path, run: str | None = None, *, session: str = "worker-watch", 
             if mail is None:
                 out.waiting.append(Decision(record["task_id"], record["dispatch"], record["worktree"], "wait", "messages cannot be read"))
                 continue
-            item, dispatch, detail = _judge(record, mail, key, grace, now, processes)
+            item, dispatch, detail = _judge(record, mail, grace, now, processes)
         except orca_cli.OrcaError as error:
             out.waiting.append(Decision(record["task_id"], record["dispatch"], record["worktree"], "wait", f"Orca: {str(error)[:120]}"))
             continue

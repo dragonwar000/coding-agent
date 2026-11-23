@@ -906,6 +906,17 @@ Worker bắt đầu từ commit hiện tại của coordinator (`--base-branch`)
 của repo, và worker sẽ thiếu việc mới nhất. Commit gốc của worktree được ghi vào sổ để chỉ đếm commit do worker thêm.
 Đã kiểm với Orca cài trên máy (2026-10-05): tạo, chạy, liệt kê và xoá một worktree thật.
 
+## Tương thích đầu ra của Orca
+
+Từ Orca 1.4.271, lệnh `orca orchestration ...` mặc định in bản rút gọn (task chỉ còn `id`, `status`, `title`; tin nhắn mất `payload`;
+`worker-show` mất `observation`). Harness luôn gửi `--full` cho các lệnh này. CLI cũ từ chối cờ đó lúc đọc tham số, trước khi làm gì,
+nên lệnh được gửi lại không có `--full` và mỗi tiến trình chỉ hỏi một lần.
+
+`task-create` và `run-create` mang một `--retry-request` được ghi vào `.coding-agent/state/orca-creates.json` trước khi gửi. Nếu không
+đọc được id trong câu trả lời, hoặc Orca lỗi giữa chừng, lần chạy lại cùng nội dung dùng đúng request đó nên Orca trả lại bản đã tạo,
+không tạo trùng. Tạo xong và đọc được id thì bản ghi bị xoá, nên yêu cầu giống hệt về sau là task mới. CLI không có `--retry-request`
+thì không bao giờ tự gửi lần tạo thứ hai: lệnh báo lỗi và yêu cầu kiểm `orchestration task-list`.
+
 ## Mode và assumption
 
 - `mode` có ba giá trị: `off` (không chạy), `shadow` (ghi quyết định, không chặn), `enforce` (được chặn).

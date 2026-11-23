@@ -25,6 +25,10 @@ answers; `terminal close` drops one and records it in `closed_terminals`. `data[
 `diagnostics memory` answers. A dispatch record may set `assignee`, `creator`, `incarnation`, `observation` and
 `activity`. `data["terminal_mail"]` (handle -> messages) is what `check --terminal H --peek` answers, `check --all`
 answers every message including acknowledged ones, and `data["release_answer"]` replaces what `worker-release` answers.
+`FAKE_ORCA_CONCISE=1` answers like Orca 1.4.271 without `--full` (`_concise`), and `FAKE_ORCA_NO_FULL=1` refuses `--full`
+on everything but `inbox`, like Orca 1.4.222. `task-create` and `run-create` replay a `--retry-request` seen before, and answer
+`request_mismatch` when its input differs. `FAKE_ORCA_UNREADABLE_CREATE=1` creates the record and answers without its id.
+`data["workers"]` holds the full `worker-list` rows.
 `FAKE_ORCA_WORKER_START_FENCED=1` makes `worker-start` answer the `consumer_fenced` refusal Orca gives a coordinator
 terminal no longer bound to the Task Run; `FAKE_ORCA_WORKER_START_CRASH=1` makes it exit 3 with no JSON.
 """
@@ -52,10 +56,42 @@ def _options(argv: list[str]) -> dict[str, str]:
     return found
 
 
+def _concise(command: str, answer: dict) -> dict:
+    """The agent view Orca 1.4.271 prints without `--full`, field for field as its `*-agent-views` modules build it."""
+    result = answer.get("result")
+    if not answer.get("ok") or not isinstance(result, dict):
+        return answer
+    if command in ("task-create", "task-update") and isinstance(result.get("task"), dict):
+        view = {"taskId": result["task"]["id"], "status": result["task"]["status"]}
+    elif command == "task-list":
+        view = {"tasks": [{"id": t["id"], "status": t["status"], "title": t.get("title", "")} for t in result["tasks"]]}
+    elif command == "worker-list":
+        view = {"workers": [{"dispatchId": w.get("dispatchId"), "taskId": w.get("taskId"), "state": w.get("workerState"), "outcome": "done",
+                             "liveness": "live", "agent": "claude", "terminal": w.get("agentTerminalHandle"), "terminalState": w.get("terminalState"),
+                             "workspace": "w", "host": "local"} for w in result.get("workers", [])], "nextCursor": (result.get("page") or {}).get("nextCursor")}
+    elif command == "worker-show":
+        view = {"dispatchId": (result.get("dispatch") or {}).get("id"), "state": (result.get("worker") or {}).get("state"), "liveness": "live"}
+    elif command == "check":
+        view = {"messages": [{key: m.get(key) for key in ("id", "type", "subject", "body")} for m in result.get("messages", [])]}
+    elif command == "run-current":
+        run = result.get("run")
+        view = {"runId": run.get("id") if isinstance(run, dict) else None}
+    else:
+        return answer
+    return {"ok": True, "result": view}
+
+
+def _shown(command: str, argv: list[str], answer: dict) -> dict:
+    return _concise(command, answer) if os.environ.get("FAKE_ORCA_CONCISE") == "1" and "--full" not in argv else answer
+
+
 def main(argv: list[str]) -> int:
     if os.environ.get("FAKE_ORCA_FAIL") == "1":
         print("orca: daemon not running", file=sys.stderr)
         return 3
+    if os.environ.get("FAKE_ORCA_NO_FULL") == "1" and "--full" in argv and argv[:2] != ["orchestration", "inbox"]:
+        print(json.dumps({"ok": False, "error": {"code": "invalid_argument", "message": f"Unknown flag --full for command: {' '.join(argv[:2])}"}}))
+        return 1
     state_path = Path(os.environ["FAKE_ORCA_STATE"])
     data = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {"tasks": {}}
     config = Path(os.environ.get("CLAUDE_CONFIG_DIR", "")) / ".claude.json"
@@ -193,8 +229,21 @@ def main(argv: list[str]) -> int:
                 data.setdefault("abandoned", []).append(options["--dispatch"])
                 answer = {"ok": True, "result": {"dispatchId": options["--dispatch"], "state": "abandoned"}}
         state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        print(json.dumps(answer, ensure_ascii=False))
+        print(json.dumps(_shown(command, argv, answer), ensure_ascii=False))
         return exit_code
+    request = options.get("--retry-request")
+    sent = json.dumps({key: value for key, value in options.items() if key != "--retry-request"}, sort_keys=True)
+    if command in ("task-create", "run-create") and request:
+        earlier = data.setdefault("requests", {}).get(request)
+        if earlier is not None and earlier["input"] != sent:
+            print(json.dumps({"ok": False, "error": {"code": "request_mismatch", "message": f"Mutation request {request} was already used with different input."}}))
+            return 1
+        if earlier is not None:
+            data["replays"] = data.get("replays", 0) + 1
+            state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            replayed = {"ok": True, "result": {"accepted": True}} if os.environ.get("FAKE_ORCA_UNREADABLE_CREATE") == "1" else earlier["answer"]
+            print(json.dumps(_shown(command, argv, replayed), ensure_ascii=False))
+            return exit_code
     if command in ("task-create", "task-update", "task-list", "worker-start") and "--run" not in options:
         print(json.dumps({"id": str(uuid.uuid4()), "ok": False, "error": {"code": "run_required", "message": "No Run is bound."}}))
         return 1
@@ -224,6 +273,7 @@ def main(argv: list[str]) -> int:
         data.setdefault("orchestration_sent", []).append({key.removeprefix("--"): value for key, value in options.items()})
         answer = {"ok": True, "result": {"message": {"id": f"msg_{len(data['orchestration_sent'])}"}}}
     elif command == "run-create":
+        data["run_creates"] = data.get("run_creates", 0) + 1
         answer = {"ok": True, "id": str(uuid.uuid4()), "result": {"run": {"id": "run_created", "objective": options.get("--objective", "")}}}
     elif command == "task-create":
         task_id = f"task_{len(tasks) + 1:04d}"
@@ -275,14 +325,22 @@ def main(argv: list[str]) -> int:
                 answer["result"].update({"state": "outcome_unknown", "stage": "turn_start_unobserved", "turnStart": "unobserved",
                                          "lastError": "Dispatch input was written and submitted, but claude's turn start could not be verified"})
                 exit_code = 1
+    elif command == "run-current":
+        answer = {"ok": True, "result": {"run": data.get("bound_run")}}
+    elif command == "worker-list":
+        answer = {"ok": True, "result": {"workers": data.get("workers", []), "page": {"hasMore": False, "nextCursor": None}}}
     elif command == "task-list":
         # A task with a `run` is listed only in that Run, so a test can tell an older Run's records apart.
         answer = {"ok": True, "result": {"tasks": [task for task in tasks.values() if task.get("run") in (None, options["--run"])]}}
     else:
         answer = {"ok": False, "error": f"unknown subcommand {command}"}
 
+    if command in ("task-create", "run-create") and request and answer.get("ok"):
+        data.setdefault("requests", {})[request] = {"input": sent, "answer": answer}
     state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    print(json.dumps(answer, ensure_ascii=False))
+    if command in ("task-create", "run-create") and answer.get("ok") and os.environ.get("FAKE_ORCA_UNREADABLE_CREATE") == "1":
+        answer = {"ok": True, "result": {"accepted": True}}
+    print(json.dumps(_shown(command, argv, answer), ensure_ascii=False))
     return exit_code
 
 
