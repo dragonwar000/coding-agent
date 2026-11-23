@@ -36,6 +36,9 @@ watcher never interrupts it, never types into its terminal and keeps watching it
 that is a new episode and a new report. A worker waiting on an open question is not reported: its silence has a cause
 the coordinator already sees.
 
+Each of those three reports can also tell a person through the optional `notify` command of the manifest (`notify.py`):
+once per event, also when Orca refused the escalation, since that is when a person most needs to hear it.
+
 The loop ends when no unsettled dispatch is left that has not been reported. `ensure_running` starts it in the
 background (after `delegate`, `plan-next`, and from the board while workers are unsettled) unless one already runs for
 the Run: the loop writes `ALIVE_FILE` every scan, and a fresh file means it is alive. `CODING_AGENT_WORKER_WATCH=off`
@@ -52,7 +55,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from coding_agent import events, orca_cli, resume
+from coding_agent import events, notify, orca_cli, resume
 
 WATCH_ENV = "CODING_AGENT_WORKER_WATCH"
 WATCH_INTERVAL_S = resume.WATCH_INTERVAL_S
@@ -133,6 +136,8 @@ def report_death(root: Path, item: resume.Finding, reason: str, run: str | None 
         error = str(failure)[:300]
     if error is None and delivered is not None:
         delivered.add(key)
+    notify.fire(root, DEATH, key, task_id=item.task_id, dispatch=item.dispatch, terminal=item.terminal, title=item.title, reason=reason,
+                session=session, seen=delivered)
     orca_cli._append(root / resume.LEDGER, {"ts": int(time.time()), "kind": DEATH, "task_id": item.task_id, "dispatch": key,
                                             "terminal": item.terminal, "reason": reason, "sent": error is None})
     events.record(root, guard="worker-watch", kind="reported" if error is None else "report-failed", mode="enforce",
@@ -193,6 +198,8 @@ def report_stuck(root: Path, item: resume.Finding, run: str | None = None, *, se
         error = str(failure)[:300]
     if error is None and delivered is not None:
         delivered.add(_stuck_key(item))
+    notify.fire(root, STUCK, f"{_key(item)}:{item.episode}", task_id=item.task_id, dispatch=item.dispatch, terminal=item.terminal,
+                title=item.title, reason=reason, session=session, seen=delivered)
     orca_cli._append(root / resume.LEDGER, {"ts": int(time.time()), "kind": STUCK, "task_id": item.task_id, "dispatch": _key(item),
                                             "terminal": item.terminal, "episode": item.episode, "signal": item.signal,
                                             "stuck_s": item.stuck_s, "sent": error is None})
@@ -230,6 +237,8 @@ class _Failures:
         self.last = ""
         self.alerted = _alert_open(root)
         self.send_failed = False
+        self.since = 0.0         # when this run of failed scans started: names it for the notify command
+        self.notified: set[str] = set()
 
     def note(self, error: Exception, where: str = "") -> None:
         """Print `error` unless this run of failed scans already printed it."""
@@ -241,6 +250,7 @@ class _Failures:
                      else f"worker-watch: scan failed, still watching: {self.last}")
 
     def scan_failed(self) -> None:
+        self.since = self.since if self.streak else time.time()
         self.streak += 1
         if self.streak >= FAILED_SCANS and not self.alerted:
             self._alert()
@@ -263,6 +273,8 @@ class _Failures:
         """One escalation about the watcher itself. Refused by Orca: tried again next scan, with one event per run."""
         body = (f"worker-watch failed {self.streak} scans in a row and keeps trying.\nlast error: {self.last[:300]}\n"
                 f"log: {self.root / LOG_FILE}")
+        notify.fire(self.root, WATCH_FAILING, str(self.since), title=orca_cli.WATCH_FAILING_SUBJECT,
+                    reason=f"{self.streak} scans in a row failed: {self.last[:300]}", session=self.session, seen=self.notified)
         try:
             orca_cli.escalate(run=self.run, subject=orca_cli.WATCH_FAILING_SUBJECT, body=body, task_id="", dispatch="")
         except Exception as failure:  # noqa: BLE001 - the watcher outlives a mailbox it cannot reach

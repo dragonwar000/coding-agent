@@ -44,7 +44,8 @@
   error stays after the last resume, or it stays silent after the last reminder; seen on two scans in a row. A scan that
   fails is printed and the loop goes on; 5 failed scans in a row send one `worker-watch failing` escalation. A worker whose spinner runs with no transcript
   write or screen change for `CODING_AGENT_STUCK_MINUTES` (default 20, `off` disables) gets one `worker stuck: <task
-  title>` escalation per episode; it is never interrupted or marked dead. Exits when
+  title>` escalation per episode; it is never interrupted or marked dead. Each report can also run the manifest's
+  optional `notify` command (off by default, argv only, event in `CODING_AGENT_NOTIFY_*`). Exits when
   no unsettled, unreported dispatch is left. Liveness comes from the terminal, never from heartbeats, which workers no
   longer send. `delegate`, `plan-next` and the board start it in the background when none runs for the Run (output in
   `.coding-agent/worker-watch.log`); `CODING_AGENT_WORKER_WATCH=off` turns that off.
