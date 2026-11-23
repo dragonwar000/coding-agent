@@ -17,7 +17,8 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `integration.yaml` | Manifest duy nhất: hook, mode, assumption, verify, bộ nhớ, ngưỡng loop, cờ `verified` |
 | `src/coding_agent/manifest.py` | Đọc và kiểm manifest; cấu hình sai bị từ chối ngay lúc nạp |
 | `src/coding_agent/gen.py` | Sinh `.claude/settings.json` và `.codex/hooks.json` với đường dẫn tương đối; `--check` báo drift |
-| `src/coding_agent/hooks/` | Hook: `orca-guard`, `loop-guard`, `prompt-reset`, `stop-gate`, `pre-compact`, `session-restore`, các hook coordinator (`coordinator-guard`, `coordinator-context`, `coordinator-board`, `coordinator-heartbeat`) và `auto-decide` |
+| `src/coding_agent/hooks/` | Hook: `orca-guard`, `loop-guard`, `prompt-reset`, `stop-gate`, `pre-compact`, `session-restore`, các hook coordinator (`coordinator-guard`, `coordinator-context`, `coordinator-board`, `coordinator-heartbeat`), `auto-decide`, và sổ subagent (`subagent-assign`, `-started`, `-stopped`, `-result`, `-failed`, `-session-end`) |
+| `src/coding_agent/subagents.py` | `coordinator.dispatch: subagent`: đọc setting, sổ subagent, bảng việc, và số đo payload hook của Claude Code |
 | `src/coding_agent/transcript.py` | Đọc một lượt từ transcript, có số dòng làm bằng chứng và số lần lỗi/bị từ chối |
 | `src/coding_agent/orca.py` | Quy tắc Orca thuần: completion cần bằng chứng, task thuộc một repo, bằng chứng `CLAIMED-DONE BUT ABSENT` |
 | `src/coding_agent/orca_cli.py` | Adapter tới `orca orchestration`: tạo task, claim, đổi trạng thái, liệt kê |
@@ -350,7 +351,8 @@ Nó không tự sửa file.
 
 - **`coordinator-guard` (enforce)** chặn trong session coordinator: `Write`, `Edit`, `MultiEdit`, `NotebookEdit`; lệnh shell
   sửa nội dung file (`sed -i`, `>`, `rm`, `pip install`, ...); và tool
-  `Agent`/`Task` (subagent nội bộ không qua graph). Guard bỏ phần nằm trong dấu nháy trước khi so khớp, nên `echo "a -> b"`
+  `Agent`/`Task` (subagent nội bộ không qua graph; project đặt `coordinator.dispatch: subagent` thì được dùng, xem
+  "Coordinator: dispatch bằng subagent"). Guard bỏ phần nằm trong dấu nháy trước khi so khớp, nên `echo "a -> b"`
   hay `git commit -m "rm cũ"` không bị chặn; `$(...)` và backtick trong nháy kép vẫn được xét vì shell chạy chúng.
 - **Sửa cấu hình hook** (`.claude/settings.json`, `.claude/settings.local.json`, `integration.yaml`) bằng `Write`/`Edit`
   không bị chặn mà host hỏi người dùng xác nhận, để guard luôn tắt được từ trong phiên.
@@ -390,6 +392,44 @@ Lưu ý khi dùng:
 
 Đã kiểm với Orca cài trên máy (2026-10-04): `run-init`, `plan-apply`, `plan-next`, `board` chạy trọn một graph 2 node,
 node sau chỉ được giao khi node trước xong. Chưa kiểm: `task-update` qua `orca-status`.
+
+### Coordinator: dispatch bằng subagent
+
+Mặc định (`orca`) không đổi gì. Một project có thể giao việc cho subagent nội bộ của Claude Code (tool `Agent`) thay vì
+worker Orca:
+
+```yaml
+# integration.yaml, đặt trước khối hooks:
+coordinator:
+  dispatch: subagent   # orca (mặc định) | subagent
+```
+
+**Cách chuyển một project:** đổi setting trên, rồi cài lại để có các hook `subagent-*`: chạy lệnh nâng cấp `--add-new-hooks`
+ở mục "Cài vào một dự án" (manifest cũ chưa có các hook này), hoặc `python3 -m coding_agent.gen --apply` nếu manifest đã
+có. Giá trị `dispatch` được đọc từ manifest lúc chạy, không nằm trong lệnh hook, nên guard đổi theo ngay. Còn `mode` của
+từng hook thì nằm trong lệnh hook đã sinh và ghi đè manifest, nên đổi `mode` luôn phải cài lại. Chưa cài lại thì guard
+vẫn đúng nhưng không có sổ, và bảng việc ghi rõ `sổ subagent chưa bật`. Nên xong hết worker Orca trước khi chuyển: ở mode
+này bảng việc chỉ đọc sổ subagent, không đọc Orca.
+
+- **Guard:** phiên chính được gọi `Agent`/`Task`, vẫn không được ghi file hay chạy shell ghi file (trừ
+  `.coding-agent/plan.yaml`). Lời gọi của subagent được ghi. `CODING_AGENT_COORDINATOR_GIT=safe` chặn git phá huỷ cho cả
+  hai. Sửa cấu hình hook vẫn hỏi người dùng, kể cả khi subagent sửa.
+- **Phân biệt subagent:** chỉ dựa vào `agent_id` trong payload hook. `session_id` và `transcript_path` giống phiên chính;
+  `agent_type` cũng có ở phiên chính chạy bằng `--agent`. Số đo nằm trong docstring của `subagents.py`.
+- **`delegate`, `worker-start`, `plan-apply`, `orca-create`** bị từ chối (exit 2), không chạm Orca.
+- **Graph vẫn dùng được, không cần Orca:** `plan-next` in các node sẵn sàng kèm spec và verify; `plan-status` in trạng
+  thái. Giao mỗi node cho một subagent với `description` bắt đầu bằng `<node id>:`. Sổ lấy subagent mới nhất của node:
+  đang mở là `running`, xong là `completed`, lỗi/bị dừng/mất dấu thì node sẵn sàng lại. `completed` chỉ nghĩa là subagent
+  đã dừng: coordinator vẫn phải kiểm diff và test trước khi giao node kế.
+- **Sổ và bảng việc:** `.coding-agent/subagents.jsonl`, chỉ thêm dòng. Bảng việc liệt kê subagent đang mở và tuổi của
+  chúng, đánh dấu cái quá `CODING_AGENT_SUBAGENT_MINUTES` phút (mặc định 30, `off` để tắt) kèm lời khuyên kiểm hoặc dừng.
+  SessionStart kế tiếp đánh dấu `lost` các bản ghi của phiên đã kết thúc.
+- **Không có cách ly:** subagent dùng chung working tree. Các subagent song song không được đụng cùng file; việc có thể
+  đụng nhau thì chạy lần lượt, hoặc đặt `isolation: "worktree"` trên tool `Agent` rồi gộp nhánh của nó.
+
+Chưa đo: Esc trên subagent đang chạy trong phiên tương tác, `/clear` khi có subagent nền, và SIGKILL. Phiên mất mà không có
+`SessionEnd` chỉ được coi là `lost` sau 60 phút transcript đứng yên. Tiếp tục một subagent đã xong bằng `SendMessage`
+không mở lại bản ghi của nó.
 
 ### Coordinator: test và model theo việc
 

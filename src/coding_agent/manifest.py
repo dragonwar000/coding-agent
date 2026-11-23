@@ -27,6 +27,8 @@ AUTO_DECIDE_TIMEOUT_S = (10, 3600)
 FABLE_TIMEOUT_S = (10, 600)
 RATCHET_DIRECTIONS = ("max", "min")
 GROUNDING = ("off", "shadow", "enforce")
+# Who does the coordinator's work: `orca` workers in their own worktrees, or in-process `subagent`s (`subagents.py`).
+DISPATCH_MODES = ("orca", "subagent")
 
 
 class ManifestError(ValueError):
@@ -105,6 +107,12 @@ class Evaluator:
 
 
 @dataclass(frozen=True)
+class CoordinatorSettings:
+    """`coordinator:` of the manifest. Read at run time, never baked into a generated hook command."""
+    dispatch: str = "orca"
+
+
+@dataclass(frozen=True)
 class Manifest:
     path: Path
     verified: bool
@@ -123,6 +131,7 @@ class Manifest:
     auto_decide: AutoDecide = field(default_factory=AutoDecide)
     ratchet: Ratchet = field(default_factory=Ratchet)
     evaluator: Evaluator = field(default_factory=Evaluator)
+    coordinator: CoordinatorSettings = field(default_factory=CoordinatorSettings)
 
     @property
     def root(self) -> Path:
@@ -242,6 +251,21 @@ def evaluator_from(raw: Any) -> Evaluator:
         timeout_s=_require_int(raw.get("timeout_s", 180), "evaluator.timeout_s", 1),
         grounding=grounding,
     )
+
+
+def coordinator_from(raw: Any) -> CoordinatorSettings:
+    """The coordinator settings; a missing block is `dispatch: orca`, a wrong value or an unknown key raises ManifestError."""
+    if raw is None:
+        return CoordinatorSettings()
+    if not isinstance(raw, dict):
+        raise ManifestError("coordinator must be a mapping")
+    unknown = sorted(str(key) for key in raw if key != "dispatch")
+    if unknown:
+        raise ManifestError(f"coordinator has unknown keys: {', '.join(unknown)}")
+    dispatch = raw.get("dispatch", "orca")
+    if dispatch not in DISPATCH_MODES:
+        raise ManifestError(f"coordinator.dispatch must be one of {', '.join(DISPATCH_MODES)}")
+    return CoordinatorSettings(dispatch=dispatch)
 
 
 def _hook(item: Any, seen: set[str]) -> Hook:
@@ -376,4 +400,5 @@ def load(path: Path) -> Manifest:
         auto_decide=auto_decide_from(raw.get("auto_decide")),
         ratchet=ratchet_from(raw.get("ratchet")),
         evaluator=evaluator_from(raw.get("evaluator")),
+        coordinator=coordinator_from(raw.get("coordinator")),
     )
