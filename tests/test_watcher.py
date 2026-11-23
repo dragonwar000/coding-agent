@@ -427,3 +427,150 @@ def test_the_hook_runs_from_the_shipped_manifest(repo, monkeypatch, mailbox):
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"], check=True)
     result = call(repo, "coordinator-heartbeat", {"session_id": "c2", "cwd": str(repo), "hook_event_name": "UserPromptSubmit", "prompt": POINTER})
     assert result.returncode == 0 and json.loads(result.stdout)["decision"] == "block" and unread() == []
+
+
+# --- the watcher survives a failing scan --------------------------------------------------------------------------------
+
+def failing_scan(monkeypatch, errors: list):
+    """`resume.scan` that raises the next error of `errors`, and answers no worker... once they run out it finds one working."""
+    calls = []
+
+    def scan(root, run=None, **kwargs):
+        calls.append(1)
+        if errors:
+            raise errors.pop(0)
+        return [finding(state="working")]
+
+    monkeypatch.setattr(resume, "scan", scan)
+    return calls
+
+
+def ledger_kinds(repo) -> list[str]:
+    return [record.get("kind") for record in resume.history(repo)]
+
+
+def test_a_scan_that_raises_valueerror_does_not_end_the_loop(repo, monkeypatch):
+    calls = failing_scan(monkeypatch, [ValueError("damaged state file"), json.JSONDecodeError("bad", "x", 0)])
+    Escalations(monkeypatch)
+    said: list[str] = []
+    assert watcher.watch(repo, RUN, scans=4, sleep=lambda s: None, out=said.append) == 0
+    assert len(calls) == 4
+    assert sum("ValueError: damaged state file" in line for line in said) == 1
+    assert sum("JSONDecodeError" in line for line in said) == 1
+
+
+def test_the_same_error_is_printed_once_until_a_scan_succeeds(repo, monkeypatch):
+    failing_scan(monkeypatch, [ValueError("same"), ValueError("same"), ValueError("same")])
+    said: list[str] = []
+    watcher.watch(repo, RUN, scans=3, sleep=lambda s: None, out=said.append)
+    assert sum("ValueError: same" in line for line in said) == 1
+
+
+@pytest.mark.parametrize("stop", [KeyboardInterrupt, SystemExit])
+def test_an_interrupt_still_stops_the_loop_and_clears_the_alive_file(repo, monkeypatch, stop):
+    failing_scan(monkeypatch, [stop()])
+    with pytest.raises(stop):
+        watcher.watch(repo, RUN, scans=3, sleep=lambda s: None, out=lambda line: None)
+    assert not (repo / watcher.ALIVE_FILE).exists()
+
+
+def test_five_failed_scans_send_one_escalation(repo, monkeypatch):
+    failing_scan(monkeypatch, [ValueError(f"broken {n}") for n in range(12)])
+    escalations = Escalations(monkeypatch)
+    watcher.watch(repo, RUN, scans=4, sleep=lambda s: None, out=lambda line: None)
+    assert escalations.sent == []
+    watcher.watch(repo, RUN, scans=8, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1
+    sent = escalations.sent[0]
+    assert sent["subject"] == "worker-watch failing" and sent["run"] == RUN and sent["task_id"] == "" and sent["dispatch"] == ""
+    assert "ValueError: broken" in sent["body"] and "5 scans" in sent["body"]
+    assert ledger_kinds(repo).count(watcher.WATCH_FAILING) == 1
+
+
+def test_a_restarted_loop_does_not_repeat_the_escalation_until_a_scan_succeeds(repo, monkeypatch):
+    errors = [ValueError("x") for _ in range(watcher.FAILED_SCANS)]
+    failing_scan(monkeypatch, errors)
+    escalations = Escalations(monkeypatch)
+    watcher.watch(repo, RUN, scans=watcher.FAILED_SCANS, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1
+    errors.extend(ValueError("x") for _ in range(watcher.FAILED_SCANS))
+    watcher.watch(repo, RUN, scans=watcher.FAILED_SCANS, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1
+    # One good scan closes the episode; the next run of failures is reported again.
+    watcher.watch(repo, RUN, scans=1, sleep=lambda s: None, out=lambda line: None)
+    assert ledger_kinds(repo)[-1] == watcher.WATCH_RECOVERED
+    errors.extend(ValueError("y") for _ in range(watcher.FAILED_SCANS))
+    watcher.watch(repo, RUN, scans=watcher.FAILED_SCANS, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 2
+
+
+def test_an_escalation_orca_refused_is_tried_again_and_recorded_once(repo, monkeypatch):
+    failing_scan(monkeypatch, [ValueError("x") for _ in range(7)])
+    escalations = Escalations(monkeypatch)
+    escalations.fail = True
+    watcher.watch(repo, RUN, scans=6, sleep=lambda s: None, out=lambda line: None)
+    logged = [json.loads(line) for line in events.log_path(repo).read_text(encoding="utf-8").splitlines()]
+    assert sum(entry["guard"] == "worker-watch" and entry["kind"] == "report-failed" for entry in logged) == 1
+    escalations.fail = False
+    watcher.watch(repo, RUN, scans=1, sleep=lambda s: None, out=lambda line: None)
+    assert escalations.sent == []  # that loop's streak starts over at one failed scan
+
+
+def test_one_workers_failing_report_does_not_cost_the_others_theirs(repo, monkeypatch):
+    Workers(repo, monkeypatch, {"task_1": IDLE, "task_2": IDLE})
+    terminals = Terminals(monkeypatch)
+    terminals.kind.update({"term_task_1": "gone", "term_task_2": "gone"})
+    escalations = Escalations(monkeypatch)
+    real = watcher.report_death
+
+    def report(root, item, reason, run=None, **kwargs):
+        if item.task_id == "task_1":
+            raise ValueError("report broke")
+        return real(root, item, reason, run, **kwargs)
+
+    monkeypatch.setattr(watcher, "report_death", report)
+    said: list[str] = []
+    watcher.watch(repo, RUN, scans=3, sleep=lambda s: None, out=said.append)
+    assert [sent["task_id"] for sent in escalations.sent] == ["task_2"]
+    assert sum("task_1: ValueError: report broke" in line for line in said) == 1
+
+
+def test_a_ledger_that_cannot_be_written_does_not_repeat_a_death_report(repo, monkeypatch):
+    Workers(repo, monkeypatch, {"task_1": IDLE})
+    Terminals(monkeypatch).kind["term_task_1"] = "gone"
+    escalations = Escalations(monkeypatch)
+    real = orca_cli._append
+
+    def append(path, record):
+        if record.get("kind") == watcher.DEATH:
+            raise OSError("disk full")
+        real(path, record)
+
+    monkeypatch.setattr(orca_cli, "_append", append)
+    watcher.watch(repo, RUN, scans=5, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1
+
+
+def test_a_damaged_ledger_or_state_file_does_not_stop_the_scan(repo, monkeypatch):
+    Workers(repo, monkeypatch, {"task_1": IDLE})
+    Terminals(monkeypatch)
+    (repo / resume.LEDGER).parent.mkdir(parents=True, exist_ok=True)
+    (repo / resume.LEDGER).write_bytes(b'\xff\xfe not json\n{"kind": "resume", "dispatch": "d", "sent": true}\n')
+    (repo / resume.IDLE_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (repo / resume.IDLE_FILE).write_bytes(b"\xff\xfe")
+    assert [record["dispatch"] for record in resume.history(repo)] == ["d"]
+    assert [item.state for item in resume.scan(repo)] == ["idle"]
+
+
+def test_watcher_escalations_are_not_worker_questions():
+    assert not orca_cli.is_question({"type": "escalation", "subject": "worker-watch failing"})
+    assert orca_cli.is_question({"type": "escalation", "subject": "Blocked: no key"})
+
+
+def test_an_escalation_about_the_watcher_names_no_task_or_dispatch(monkeypatch):
+    calls: list[tuple] = []
+    monkeypatch.setattr(orca_cli, "_call", lambda *args: calls.append(args))
+    orca_cli.escalate(run=RUN, subject="worker-watch failing", body="b")
+    assert "--task-id" not in calls[0] and "--dispatch-id" not in calls[0]
+    orca_cli.escalate(run=RUN, subject="s", body="b", task_id="task_1", dispatch="ctx_1")
+    assert calls[1][calls[1].index("--task-id") + 1] == "task_1" and calls[1][calls[1].index("--dispatch-id") + 1] == "ctx_1"

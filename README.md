@@ -621,7 +621,11 @@ coordinator khi worker chết hoặc kẹt hẳn.
   mới báo. Báo bằng MỘT tin `orca orchestration send --to run:<run> --type escalation`, subject `worker dead: <tên task>`, body
   có task id, dispatch id, terminal, lý do và các dòng cuối màn hình (tối đa 15 dòng). Lần báo ghi vào `.coding-agent/resumes.jsonl`
   với `kind: death`, nên mỗi dispatch chỉ được báo một lần; Orca từ chối thì lượt sau gửi lại. Vòng lặp tự thoát khi không còn
-  dispatch chưa xong nào chưa bị báo. Event `guard: worker-watch`: `started`, `start-failed`, `reported`, `report-failed`.
+  dispatch chưa xong nào chưa bị báo. Event `guard: worker-watch`: `started`, `start-failed`, `reported`, `report-failed`, `watch-failing`, `recovered`.
+- **Watcher không chết vì một lượt quét lỗi:** mọi `Exception` của một lượt quét hoặc của báo cáo một worker (file state hỏng, lỗi
+  JSON, không ghi được sổ) được bắt, in một dòng cho mỗi lỗi khác nhau, rồi quét tiếp; `KeyboardInterrupt` và `SystemExit` vẫn dừng
+  vòng lặp. Sau 5 lượt lỗi liên tiếp, watcher gửi MỘT escalation subject `worker-watch failing` kèm lỗi cuối, ghi vào sổ với
+  `kind: watch-failing`, nên không lặp lại (kể cả sau khi khởi động lại) cho đến khi có một lượt quét thành công (`kind: watch-recovered`).
 - **Tự chạy nền:** `delegate`, `plan-next` (khi có worker mới) và bảng việc (khi còn worker chưa xong) chạy nền `worker-watch`
   cho Run đó nếu chưa có cái nào chạy (vòng lặp ghi `.coding-agent/state/worker-watch.json` mỗi lượt; file cũ hơn 3 phút là
   vòng lặp đã mất). Log ở `.coding-agent/worker-watch.log`. Tắt bằng `CODING_AGENT_WORKER_WATCH=off`. `worker-resume --watch`

@@ -1341,13 +1341,13 @@ def terminal_state(handle: str) -> dict[str, Any]:
     return out
 
 
-def escalate(*, run: str | None, subject: str, body: str, task_id: str, dispatch: str) -> None:
+def escalate(*, run: str | None, subject: str, body: str, task_id: str = "", dispatch: str = "") -> None:
     """Send the coordinator an `escalation` through the Run's mailbox (`--to run:<id>`, the address Orca names for raising
-    something with the Run's own coordinator), carrying the task and dispatch ids."""
+    something with the Run's own coordinator), carrying the task and dispatch ids when it is about one worker."""
     chosen = run_id(run)
     target = ["--to", f"run:{chosen}"] if chosen else []
-    _call("send", *target, "--type", "escalation", "--subject", subject, "--body", body, "--task-id", task_id,
-          "--dispatch-id", dispatch, *_run_args(run))
+    ids = [*(["--task-id", task_id] if task_id else []), *(["--dispatch-id", dispatch] if dispatch else [])]
+    _call("send", *target, "--type", "escalation", "--subject", subject, "--body", body, *ids, *_run_args(run))
 
 
 def send_line(handle: str, text: str) -> None:
@@ -1540,15 +1540,18 @@ def _when(message: dict[str, Any]) -> tuple[str, int]:
 
 # Subject of the escalation `watcher.report_death` sends: a report about a worker, not a worker asking anything.
 DEATH_SUBJECT = "worker dead: "
+# Subject of the escalation the watcher sends about itself after `watcher.FAILED_SCANS` failed scans in a row.
+WATCH_FAILING_SUBJECT = "worker-watch failing"
+WATCHER_SUBJECTS = (DEATH_SUBJECT, WATCH_FAILING_SUBJECT)
 
 
 def is_question(message: dict[str, Any]) -> bool:
     """A worker waiting on the coordinator: `orca orchestration ask` (type `question`, `payload.question`) or an escalation.
 
-    The death watcher's own escalation (`DEATH_SUBJECT`) is not one: no worker waits on it, and the board lists the
+    The death watcher's own escalations (`WATCHER_SUBJECTS`) are not: no worker waits on them, and the board lists the
     dead or stuck worker in its own group.
     """
-    if str(message.get("subject") or "").startswith(DEATH_SUBJECT):
+    if str(message.get("subject") or "").startswith(WATCHER_SUBJECTS):
         return False
     return message.get("type") in ("question", "escalation") or "question" in _payload_of(message)
 

@@ -297,7 +297,8 @@ def resume_text(task_id: str) -> str:
 def history(root: Path) -> list[dict[str, Any]]:
     """Every resume recorded in the ledger, oldest first."""
     try:
-        lines = (root / LEDGER).read_text(encoding="utf-8").splitlines()
+        # A damaged byte costs its own line (it fails to parse below), not the whole ledger.
+        lines = (root / LEDGER).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
     out: list[dict[str, Any]] = []
@@ -513,7 +514,7 @@ def scan(root: Path, run: str | None = None, *, task_ids: list[str] | None = Non
 def _load_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):  # ValueError: bad JSON, or bytes that are not UTF-8
         return {}
     return data if isinstance(data, dict) else {}
 

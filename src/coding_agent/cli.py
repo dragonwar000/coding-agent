@@ -41,7 +41,8 @@
   worker that is dead or stuck for good to the coordinator with ONE `escalation` (`worker dead: <task title>`, task and
   dispatch ids, the reason, the last screen lines), once per dispatch (`kind: death` in `.coding-agent/resumes.jsonl`).
   Dead or stuck: its terminal or agent process is gone, its screen shows an API error a retry does not fix, a transient
-  error stays after the last resume, or it stays silent after the last reminder; seen on two scans in a row. Exits when
+  error stays after the last resume, or it stays silent after the last reminder; seen on two scans in a row. A scan that
+  fails is printed and the loop goes on; 5 failed scans in a row send one `worker-watch failing` escalation. Exits when
   no unsettled, unreported dispatch is left. Liveness comes from the terminal, never from heartbeats, which workers no
   longer send. `delegate`, `plan-next` and the board start it in the background when none runs for the Run (output in
   `.coding-agent/worker-watch.log`); `CODING_AGENT_WORKER_WATCH=off` turns that off.
