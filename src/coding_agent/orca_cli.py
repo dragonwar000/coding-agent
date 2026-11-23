@@ -1542,7 +1542,9 @@ def _when(message: dict[str, Any]) -> tuple[str, int]:
 DEATH_SUBJECT = "worker dead: "
 # Subject of the escalation the watcher sends about itself after `watcher.FAILED_SCANS` failed scans in a row.
 WATCH_FAILING_SUBJECT = "worker-watch failing"
-WATCHER_SUBJECTS = (DEATH_SUBJECT, WATCH_FAILING_SUBJECT)
+# Subject of the escalation `watcher.report_stuck` sends: the spinner runs but nothing has progressed.
+STUCK_SUBJECT = "worker stuck: "
+WATCHER_SUBJECTS = (DEATH_SUBJECT, WATCH_FAILING_SUBJECT, STUCK_SUBJECT)
 
 
 def is_question(message: dict[str, Any]) -> bool:

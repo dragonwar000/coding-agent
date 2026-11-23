@@ -626,6 +626,17 @@ coordinator khi worker chết hoặc kẹt hẳn.
   JSON, không ghi được sổ) được bắt, in một dòng cho mỗi lỗi khác nhau, rồi quét tiếp; `KeyboardInterrupt` và `SystemExit` vẫn dừng
   vòng lặp. Sau 5 lượt lỗi liên tiếp, watcher gửi MỘT escalation subject `worker-watch failing` kèm lỗi cuối, ghi vào sổ với
   `kind: watch-failing`, nên không lặp lại (kể cả sau khi khởi động lại) cho đến khi có một lượt quét thành công (`kind: watch-recovered`).
+- **Worker treo mà spinner vẫn chạy (`stuck`):** màn hình có spinner là `working`, nhưng đồng hồ spinner vẫn đếm dù agent không làm
+  gì. Worker `working` không có tiến triển trong `CODING_AGENT_STUCK_MINUTES` phút (mặc định `20`, số lẻ được; `off` hoặc `0` là tắt)
+  thành `stuck`. Tín hiệu chính là thời điểm ghi transcript Claude Code của worker và của subagent (`<session>/subagents/*.jsonl`).
+  Đo ngày 2026-11-23: payload của `SessionStart`, `UserPromptSubmit`, `Stop` đều có `session_id` và `transcript_path`, Orca không lộ
+  hai giá trị đó, nên hook `prompt-reset` ghi chúng vào `coding-agent-transcripts.jsonl` cạnh sổ worker, theo task và dispatch.
+  Không biết transcript (worker Codex, thiếu bản ghi, file chưa tạo) thì dùng dấu vân tay màn hình đã bỏ spinner, đồng hồ, số token, tip.
+  **Giới hạn đã đo:** một lệnh Bash foreground 239 giây không ghi gì vào transcript, nên lệnh chạy lâu hơn ngưỡng cũng trông như treo.
+  Vì vậy watcher chỉ báo: MỘT escalation `worker stuck: <tên task>` cho mỗi đợt không tiến triển (task, dispatch, terminal, số phút,
+  tín hiệu, các dòng cuối màn hình; ghi sổ `kind: stuck`). Không ngắt, không gõ vào terminal, không đánh dấu chết. Worker chạy tiếp
+  rồi lại treo thì được báo lần mới; worker đang chờ câu trả lời (`ask`) thì không báo. Bảng việc có nhóm riêng, lời khuyên: đọc
+  terminal rồi mới quyết định. Event `guard: worker-watch`: `stuck-reported`, `transcript-unrecorded`.
 - **Tự chạy nền:** `delegate`, `plan-next` (khi có worker mới) và bảng việc (khi còn worker chưa xong) chạy nền `worker-watch`
   cho Run đó nếu chưa có cái nào chạy (vòng lặp ghi `.coding-agent/state/worker-watch.json` mỗi lượt; file cũ hơn 3 phút là
   vòng lặp đã mất). Log ở `.coding-agent/worker-watch.log`. Tắt bằng `CODING_AGENT_WORKER_WATCH=off`. `worker-resume --watch`

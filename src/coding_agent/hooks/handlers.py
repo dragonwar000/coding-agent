@@ -139,7 +139,20 @@ def prompt_reset(ctx: Context) -> HookResult:
     data["tree_at_prompt"] = coordinator.tree_fingerprint(ctx.root)
     _remember_permission_mode(ctx, data)
     state.save(ctx.root, ctx.session, data)
+    _remember_transcript(ctx)
     return HookResult()
+
+
+def _remember_transcript(ctx: Context) -> None:
+    """Keep where a worker session's transcript is, for the stuck check (`resume.track_stuck`). Never stops the hook."""
+    from coding_agent import resume
+
+    try:
+        record = coordinator.worker_record(_cwd(ctx))
+        if record is not None:
+            resume.remember_transcript(_cwd(ctx), record, ctx.payload.get("transcript_path"), ctx.payload.get("session_id"))
+    except Exception as error:  # noqa: BLE001 - without the record the watcher falls back to the screen
+        ctx.note(guard="worker-watch", kind="transcript-unrecorded", applied=False, detail={"error": f"{type(error).__name__}: {error}"[:300]})
 
 
 def _remember_permission_mode(ctx: Context, data: dict[str, Any] | None) -> None:

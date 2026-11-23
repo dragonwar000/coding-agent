@@ -2,6 +2,7 @@
 (`worker-watch`) and its one escalation per dispatch, and the coordinator hook that drops heartbeat-only wake-ups."""
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -120,6 +121,7 @@ def test_terminal_state_reads_orca_terminal_show(tmp_path, monkeypatch):
 def test_the_board_measures_quiet_on_the_screen_not_on_messages(repo, monkeypatch, clock):
     """With reminders off a quiet worker stays in the running group, and its note comes from the screen's idle time."""
     monkeypatch.setenv(resume.SILENT_ENV, "off")
+    monkeypatch.setenv(resume.STUCK_ENV, "off")  # task_2's screen stands still too, which would make it `stuck`
     workers = Workers(repo, monkeypatch, {"task_1": IDLE, "task_2": WORKING})
     Terminals(monkeypatch)
     coordinator.read_board(repo, run=RUN)
@@ -574,3 +576,226 @@ def test_an_escalation_about_the_watcher_names_no_task_or_dispatch(monkeypatch):
     assert "--task-id" not in calls[0] and "--dispatch-id" not in calls[0]
     orca_cli.escalate(run=RUN, subject="s", body="b", task_id="task_1", dispatch="ctx_1")
     assert calls[1][calls[1].index("--task-id") + 1] == "task_1" and calls[1][calls[1].index("--dispatch-id") + 1] == "ctx_1"
+
+
+# --- a worker that hangs with its spinner on ------------------------------------------------------------------------------
+
+SESSION = "11111111-2222-3333-4444-555555555555"
+HUNG = """⏺ Bash(python3 long_job.py)
+  ⎿  Running… (3m 12s)
+
+✶ Ideating… (21m 3s · ↓ 1.2k tokens · esc to interrupt)
+""" + FOOTER
+
+
+def transcript_for(repo, tmp_path, task="task_1", dispatch="ctx_task_1", written=None) -> Path:
+    path = tmp_path / "transcripts" / f"{SESSION}.jsonl"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+    if written is not None:
+        os.utime(path, (written, written))
+    assert resume.remember_transcript(repo, {"task_id": task, "dispatch": dispatch, "worktree": str(repo)}, str(path), SESSION)
+    return path
+
+
+def only(repo) -> resume.Finding:
+    return resume.scan(repo)[0]
+
+
+def test_stuck_minutes_env(monkeypatch):
+    monkeypatch.delenv(resume.STUCK_ENV, raising=False)
+    assert resume.stuck_after_s() == 1200
+    for value, expected in (("5", 300), ("0.5", 30), ("off", None), ("0", None), ("no", None), ("junk", 1200)):
+        monkeypatch.setenv(resume.STUCK_ENV, value)
+        assert resume.stuck_after_s() == expected
+
+
+def test_a_transcript_without_a_write_reaches_the_threshold_exactly(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    path = transcript_for(repo, tmp_path, written=clock[0])
+    clock[0] += 1199
+    assert only(repo).state == "working"
+    clock[0] += 1
+    item = only(repo)
+    assert (item.state, item.signal, item.stuck_s) == ("stuck", "transcript", 1200) and item.attention
+    os.utime(path, (clock[0], clock[0]))
+    assert only(repo).state == "working"
+
+
+def test_a_subagents_write_counts_as_progress(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    path = transcript_for(repo, tmp_path, written=clock[0])
+    clock[0] += 1300
+    assert only(repo).state == "stuck"
+    agent = path.with_suffix("") / "subagents" / "agent-a1.jsonl"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("{}\n", encoding="utf-8")
+    os.utime(agent, (clock[0], clock[0]))
+    assert only(repo).state == "working"
+
+
+def test_the_screen_fallback_ignores_the_spinner_timers_tokens_and_tips(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": HUNG})
+    first = only(repo)
+    assert first.signal == "screen" and first.state == "working"
+    clock[0] += 1200
+    workers.screens["task_1"] = HUNG.replace("3m 12s", "23m 12s").replace("21m 3s", "41m 3s").replace("1.2k", "9.9k").replace(
+        "✶ Ideating…", "✻ Crystallizing…") + ""
+    item = only(repo)
+    assert (item.state, item.signal, item.stuck_s) == ("stuck", "screen", 1200)
+
+
+def test_a_screen_that_really_changes_restarts_the_fallback_clock(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": HUNG})
+    only(repo)
+    clock[0] += 1100
+    workers.screens["task_1"] = HUNG.replace("long_job.py", "next_job.py")
+    assert only(repo).stuck_s == 0
+    clock[0] += 1100
+    assert only(repo).state == "working"
+
+
+def test_a_transcript_file_not_created_yet_uses_the_screen(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    missing = tmp_path / f"{SESSION}.jsonl"
+    assert resume.remember_transcript(repo, {"task_id": "task_1", "dispatch": "ctx_task_1"}, str(missing), SESSION)
+    assert only(repo).signal == "screen"
+
+
+def test_only_a_claude_code_transcript_path_is_recorded(repo, tmp_path):
+    record = {"task_id": "task_1", "dispatch": "ctx_1"}
+    assert not resume.remember_transcript(repo, record, str(tmp_path / "rollout-2026-abc.jsonl"), SESSION)
+    assert not resume.remember_transcript(repo, record, None, SESSION)
+    assert not resume.remember_transcript(repo, record, str(tmp_path / "x.jsonl"), "")
+    assert resume.remember_transcript(repo, record, str(tmp_path / f"{SESSION}.jsonl"), SESSION)
+    assert not resume.remember_transcript(repo, record, str(tmp_path / f"{SESSION}.jsonl"), SESSION)
+
+
+def test_the_prompt_hook_records_a_workers_transcript(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODING_AGENT_MODE_PROMPT_RESET", "shadow")
+    orca_cli.record_worker(repo, worktree=str(repo), task_id="task_1", dispatch="ctx_1")
+    path = str(tmp_path / f"{SESSION}.jsonl")
+    hooks.run("prompt-reset", {"cwd": str(repo), "session_id": SESSION, "transcript_path": path, "prompt": "go"}, handlers.prompt_reset)
+    assert resume._read_transcripts(resume.transcripts_file(repo)) == {("task_1", "ctx_1"): path}
+
+
+def test_stuck_is_off_with_the_env(repo, tmp_path, monkeypatch, clock):
+    monkeypatch.setenv(resume.STUCK_ENV, "off")
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    escalations = Escalations(monkeypatch)
+    transcript_for(repo, tmp_path, written=clock[0] - 99_999)
+    assert only(repo).state == "working"
+    watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=lambda line: None)
+    assert escalations.sent == []
+
+
+def asking_nothing(monkeypatch):
+    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: [])
+
+
+def test_a_stuck_worker_is_reported_once_and_never_touched(repo, tmp_path, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": HUNG})
+    Terminals(monkeypatch)
+    escalations = Escalations(monkeypatch)
+    asking_nothing(monkeypatch)
+    transcript_for(repo, tmp_path, written=clock[0] - 1500)
+    said: list[str] = []
+    watcher.watch(repo, RUN, scans=4, sleep=lambda s: None, out=said.append)
+    watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=said.append)
+    assert len(escalations.sent) == 1
+    sent = escalations.sent[0]
+    assert sent["subject"] == "worker stuck: Viec task_1" and sent["task_id"] == "task_1" and sent["dispatch"] == "ctx_task_1"
+    for part in ("terminal: term_task_1", "no progress for 25 min", "signal: transcript", "long foreground tool", "Ideating"):
+        assert part in sent["body"]
+    assert workers.sent == [] and workers.messages == []
+    assert watcher.DEATH not in [record.get("kind") for record in resume.history(repo)]
+    assert any("reported stuck" in line for line in said)
+
+
+def test_a_worker_that_progresses_and_sticks_again_is_reported_again(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    escalations = Escalations(monkeypatch)
+    asking_nothing(monkeypatch)
+    path = transcript_for(repo, tmp_path, written=clock[0] - 1300)
+    watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1
+    os.utime(path, (clock[0], clock[0]))
+    watcher.watch(repo, RUN, scans=1, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1
+    clock[0] += 1300
+    watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 2
+
+
+def test_the_screen_signal_reports_once_per_episode(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": HUNG})
+    escalations = Escalations(monkeypatch)
+    asking_nothing(monkeypatch)
+    only(repo)
+    clock[0] += 1300
+    watcher.watch(repo, RUN, scans=3, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1 and "signal: screen" in escalations.sent[0]["body"]
+    workers.screens["task_1"] = HUNG.replace("long_job.py", "next_job.py")
+    only(repo)
+    clock[0] += 1300
+    watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 2
+
+
+def test_a_stuck_report_orca_refused_is_sent_on_the_next_scan(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    escalations = Escalations(monkeypatch)
+    asking_nothing(monkeypatch)
+    transcript_for(repo, tmp_path, written=clock[0] - 1300)
+    escalations.fail = True
+    watcher.watch(repo, RUN, scans=1, sleep=lambda s: None, out=lambda line: None)
+    escalations.fail = False
+    watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1
+
+
+def test_a_worker_waiting_on_an_answer_is_not_reported_stuck(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    escalations = Escalations(monkeypatch)
+    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: [{"task_id": "task_1"}])
+    transcript_for(repo, tmp_path, written=clock[0] - 1300)
+    watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=lambda line: None)
+    assert escalations.sent == []
+
+
+def test_an_unreadable_question_list_holds_the_report_for_a_later_scan(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    escalations = Escalations(monkeypatch)
+
+    def unreadable(run=None):
+        raise orca_cli.OrcaError("orca check exited 1")
+
+    monkeypatch.setattr(orca_cli, "worker_activity", unreadable)
+    transcript_for(repo, tmp_path, written=clock[0] - 1300)
+    watcher.watch(repo, RUN, scans=1, sleep=lambda s: None, out=lambda line: None)
+    assert escalations.sent == []
+    asking_nothing(monkeypatch)
+    watcher.watch(repo, RUN, scans=1, sleep=lambda s: None, out=lambda line: None)
+    assert len(escalations.sent) == 1
+
+
+def test_the_board_lists_stuck_workers_in_their_own_group(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG, "task_2": WORKING})
+    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: [])
+    transcript_for(repo, tmp_path, written=clock[0] - 1500)
+    lines, error = coordinator.read_board(repo, run=RUN)
+    text = "\n".join(lines)
+    assert error is None
+    assert "worker có thể bị treo, spinner vẫn chạy mà không có tiến triển (1):" in text
+    assert "task_1 [dispatched] Viec task_1: 25 phút không có tiến triển (transcript không được ghi)" in text
+    assert "đọc terminal của worker rồi mới quyết định" in text
+    running = text.split("đang chạy (1):")[1]
+    assert "task_2" in running and "task_1" not in running
+
+
+def test_a_stuck_escalation_is_not_a_worker_question():
+    assert not orca_cli.is_question({"type": "escalation", "subject": "worker stuck: Fix parse"})
+
+
+def test_the_contract_names_the_stuck_report():
+    assert "worker stuck:" in coordinator.contract("src")
