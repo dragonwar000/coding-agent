@@ -104,11 +104,11 @@ notify:
   command: []
   timeout_s: 10
 
-# Coordinator giao việc cho ai. orca (mặc định): worker Orca, mỗi node một worktree. subagent: subagent nội bộ của Claude Code
-# (tool Agent), dùng chung working tree; phiên chính vẫn không sửa file, không tạo task/worktree/terminal Orca.
-# Giá trị này được đọc từ manifest lúc chạy, không nằm trong lệnh hook. Đổi xong cài lại để có các hook subagent-* (sổ và bảng việc).
+# Coordinator giao việc cho ai. subagent (mặc định): subagent nội bộ của Claude Code (tool Agent), dùng chung working tree;
+# phiên chính vẫn không sửa file, không tạo task/worktree/terminal Orca. orca: worker Orca, mỗi node một worktree.
+# Giá trị này được đọc từ manifest lúc chạy, không nằm trong lệnh hook. Worker Orca đã giao trước khi đổi vẫn được theo dõi.
 coordinator:
-  dispatch: orca
+  dispatch: subagent
 
 # Hook. `mode` có ba giá trị: off (không chạy), shadow (ghi quyết định, không chặn), enforce (được chặn).
 # Mặc định là shadow (FR-010). Mọi hook không off bắt buộc có `assumption`: câu nêu điều hook giả định về model.

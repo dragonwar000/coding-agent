@@ -33,6 +33,7 @@ def project(repo: Path, dispatch: str | None = "subagent") -> Path:
     path = repo / "integration.yaml"
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     doc["hooks"].append(GUARD)
+    doc.pop("coordinator", None)
     if dispatch is not None:
         doc["coordinator"] = {"dispatch": dispatch}
     path.write_text(yaml.safe_dump(doc), encoding="utf-8")
@@ -81,19 +82,22 @@ def only(repo: Path) -> subagents.Subagent:
 # The setting
 
 
-def test_dispatch_defaults_to_orca_and_is_validated(repo):
-    assert load(project(repo, None) / "integration.yaml").coordinator.dispatch == "orca"
-    assert coordinator_from({"dispatch": "subagent"}).dispatch == "subagent"
+def test_dispatch_defaults_to_subagent_and_is_validated(repo):
+    assert load(project(repo, None) / "integration.yaml").coordinator.dispatch == "subagent"
+    assert subagents.dispatch_mode(repo) == "subagent"
+    assert coordinator_from(None).dispatch == coordinator_from({}).dispatch == "subagent"
+    assert coordinator_from({"dispatch": "orca"}).dispatch == "orca"
+    assert load(project(repo, "orca") / "integration.yaml").coordinator.dispatch == "orca"
     for bad in ({"dispatch": "threads"}, {"dispatch": "orca", "other": 1}, "subagent"):
         with pytest.raises(ManifestError, match="coordinator"):
             coordinator_from(bad)
 
 
-def test_the_shipped_files_default_to_orca_and_declare_the_ledger_hooks():
+def test_the_shipped_files_default_to_subagent_and_declare_the_ledger_hooks():
     root = Path(__file__).resolve().parents[1]
     for path in (root / "integration.yaml", root / "src" / "coding_agent" / "template.yaml"):
         shipped = load(path)
-        assert shipped.coordinator.dispatch == "orca"
+        assert shipped.coordinator.dispatch == "subagent"
         events = {hook.id: (hook.event, hook.matcher) for hook in shipped.hooks if hook.id.startswith("subagent-")}
         assert events == {
             "subagent-assign": ("PreToolUse", "Agent|Task"),

@@ -396,21 +396,25 @@ node sau chỉ được giao khi node trước xong. Chưa kiểm: `task-update`
 
 ### Coordinator: dispatch bằng subagent
 
-Mặc định (`orca`) không đổi gì. Một project có thể giao việc cho subagent nội bộ của Claude Code (tool `Agent`) thay vì
-worker Orca:
+Mặc định, coordinator giao việc cho subagent nội bộ của Claude Code (tool `Agent`). Manifest ghi rõ `dispatch: orca` thì
+giữ worker Orca:
 
 ```yaml
 # integration.yaml, đặt trước khối hooks:
 coordinator:
-  dispatch: subagent   # orca (mặc định) | subagent
+  dispatch: subagent   # subagent (mặc định) | orca
 ```
 
 **Cách chuyển một project:** đổi setting trên, rồi cài lại để có các hook `subagent-*`: chạy lệnh nâng cấp `--add-new-hooks`
 ở mục "Cài vào một dự án" (manifest cũ chưa có các hook này), hoặc `python3 -m coding_agent.gen --apply` nếu manifest đã
 có. Giá trị `dispatch` được đọc từ manifest lúc chạy, không nằm trong lệnh hook, nên guard đổi theo ngay. Còn `mode` của
 từng hook thì nằm trong lệnh hook đã sinh và ghi đè manifest, nên đổi `mode` luôn phải cài lại. Chưa cài lại thì guard
-vẫn đúng nhưng không có sổ, và bảng việc ghi rõ `sổ subagent chưa bật`. Nên xong hết worker Orca trước khi chuyển: ở mode
-này bảng việc chỉ đọc sổ subagent, không đọc Orca.
+vẫn đúng nhưng không có sổ, và bảng việc ghi rõ `sổ subagent chưa bật`.
+
+**Worker Orca đang chạy lúc chuyển không bị mất.** Chỉ việc tạo task hay worker Orca MỚI bị từ chối. Còn bản ghi worker nào
+thì bảng việc vẫn đọc Orca cho chúng (báo cáo, worker chết, resume, watcher, dọn worktree), và `inbox`, `worker-resume`,
+`worker-watch`, `worker-settle`, `worktree-list`, `worktree-clean` chạy như cũ. `plan-next` không giao lại node đang có
+worker Orca, và tính node Orca đã `completed` là xong. Orca không đọc được thì node đó hiện `orca-unreadable`, không sẵn sàng.
 
 - **Guard:** phiên chính được gọi `Agent`/`Task`, vẫn không được ghi file hay chạy shell ghi file (trừ
   `.coding-agent/plan.yaml`). Lời gọi của subagent được ghi. `CODING_AGENT_COORDINATOR_GIT=safe` chặn git phá huỷ cho cả

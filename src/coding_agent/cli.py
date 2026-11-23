@@ -87,10 +87,12 @@
 - `wikieval [--root DIR] [--evals-dir DIR] [--outputs FILE] [--check|--write-baseline|--self-test]`: the wiki goldens
   eval suite (`wiki/evaluate.py`); the baseline defaults to `<root>/harness/metrics/eval-baseline.json`.
   Both take their own options after the command name and touch neither Orca nor the memory store.
-- With `coordinator: {dispatch: subagent}` in the manifest of `--root` or of the coordinator's directory, `delegate`,
-  `worker-start`, `plan-apply` and `orca-create` are refused (exit 2) and touch nothing in Orca. `plan-next` prints the
-  ready nodes with their specs for the Agent tool, and `plan-next` and `plan-status` read node states from the subagent
-  ledger (`subagents.py`): a subagent whose description starts with `<node id>:` works on that node.
+- `coordinator.dispatch` defaults to `subagent`; the coordinator's manifest decides, else the one of `--root`. In that
+  mode `delegate`, `worker-start`, `plan-apply` and `orca-create` are refused (exit 2) and touch nothing in Orca.
+  `plan-next` prints the ready nodes with their specs for the Agent tool, and `plan-next` and `plan-status` read node
+  states from the subagent ledger (`subagents.py`): a subagent whose description starts with `<node id>:` works on that
+  node. A node whose Orca task was applied before the switch keeps its Orca state. The commands for workers already
+  dispatched (`inbox`, `worker-resume`, `worker-watch`, `worker-settle`, `worktree-list`, `worktree-clean`) still work.
 """
 
 from __future__ import annotations
@@ -261,7 +263,7 @@ def _subagent_dispatch(args: argparse.Namespace, root: Path) -> int | None:
     """The exit code when `dispatch: subagent` answers this command without Orca, else None."""
     if args.command not in SUBAGENT_REFUSED | SUBAGENT_GRAPH:
         return None
-    if "subagent" not in {subagents.dispatch_mode(root), subagents.dispatch_mode(orca_cli.coordinator_root())}:
+    if subagents.command_mode(root, orca_cli.coordinator_root()) != "subagent":
         return None
     if args.command in SUBAGENT_REFUSED:
         print(subagents.REFUSAL.format(command=args.command), file=sys.stderr)
@@ -271,7 +273,7 @@ def _subagent_dispatch(args: argparse.Namespace, root: Path) -> int | None:
     except (plan_graph.PlanError, OSError) as error:
         print(f"cli: {error}", file=sys.stderr)
         return 1
-    print("\n".join(subagents.plan_lines(root, nodes, ready_specs=args.command == "plan-next")))
+    print("\n".join(subagents.plan_lines(root, nodes, ready_specs=args.command == "plan-next", run=args.run)))
     return 0
 
 

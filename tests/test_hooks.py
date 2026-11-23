@@ -26,6 +26,7 @@ def manifest(repo: Path, *, verify: list[str], mode: str = "enforce", loop_stop:
         "memory": {"ingest": "both", "embedder": "hash", "change_tools": ["Write", "Edit", "MultiEdit"],
                    "transient_markers": ["for now"], "max_episode_chars": 6000},
         "loop": {"remind_at": 3, "stop_at": loop_stop, "max_tool_calls_per_turn": 400},
+        "coordinator": {"dispatch": "orca"},  # these tests are about Orca mode; subagent mode has its own test files
         "hooks": [
             {"id": "orca-guard", "host": ["claude_code"], "event": "PreToolUse", "matcher": "Bash", "mode": "enforce",
              "assumption": "a wrong status is wrong"},

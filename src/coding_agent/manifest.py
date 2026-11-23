@@ -31,6 +31,7 @@ NOTIFY_MODES = ("off", "on")
 NOTIFY_TIMEOUT_S = (1, 120)
 # Who does the coordinator's work: `orca` workers in their own worktrees, or in-process `subagent`s (`subagents.py`).
 DISPATCH_MODES = ("orca", "subagent")
+DEFAULT_DISPATCH = "subagent"
 
 
 class ManifestError(ValueError):
@@ -119,7 +120,7 @@ class Notify:
 @dataclass(frozen=True)
 class CoordinatorSettings:
     """`coordinator:` of the manifest. Read at run time, never baked into a generated hook command."""
-    dispatch: str = "orca"
+    dispatch: str = DEFAULT_DISPATCH
 
 
 @dataclass(frozen=True)
@@ -283,7 +284,7 @@ def notify_from(raw: Any) -> Notify:
 
 
 def coordinator_from(raw: Any) -> CoordinatorSettings:
-    """The coordinator settings; a missing block is `dispatch: orca`, a wrong value or an unknown key raises ManifestError."""
+    """The coordinator settings; a missing block or key is `DEFAULT_DISPATCH`, a wrong value or an unknown key raises ManifestError."""
     if raw is None:
         return CoordinatorSettings()
     if not isinstance(raw, dict):
@@ -291,7 +292,7 @@ def coordinator_from(raw: Any) -> CoordinatorSettings:
     unknown = sorted(str(key) for key in raw if key != "dispatch")
     if unknown:
         raise ManifestError(f"coordinator has unknown keys: {', '.join(unknown)}")
-    dispatch = raw.get("dispatch", "orca")
+    dispatch = raw.get("dispatch", DEFAULT_DISPATCH)
     if dispatch not in DISPATCH_MODES:
         raise ManifestError(f"coordinator.dispatch must be one of {', '.join(DISPATCH_MODES)}")
     return CoordinatorSettings(dispatch=dispatch)

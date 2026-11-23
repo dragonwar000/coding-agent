@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from coding_agent import orca_cli
 from coding_agent import plan as plan_graph
 from coding_agent.manifest import load
 
@@ -68,14 +69,26 @@ REFUSAL = (
 
 
 def dispatch_mode(root: Path) -> str:
-    """The project's dispatch mode, read from its manifest now. No manifest, or one that cannot be read, is `orca`."""
+    """The project's dispatch mode, read from its manifest now (`subagent` unless it says `orca`).
+
+    No manifest, or one that cannot be read, is `orca`: the guard then keeps refusing the Agent tool.
+    """
     path = Path(os.path.abspath(root / "integration.yaml"))
     if not path.exists():
         return "orca"
     try:
         return load(path).coordinator.dispatch
-    except Exception:  # a broken manifest keeps today's stricter behavior; the hooks and gate report it
+    except Exception:  # a broken manifest keeps the stricter behavior; the hooks and gate report it
         return "orca"
+
+
+def command_mode(root: Path, coordinator_dir: Path) -> str:
+    """The dispatch mode a CLI command runs under: the coordinator's manifest decides, else the one of `--root`.
+
+    So a coordinator that says `dispatch: orca` can still delegate into a repository that has no setting of its own.
+    """
+    has_manifest = (coordinator_dir / "integration.yaml").exists()
+    return dispatch_mode(coordinator_dir if has_manifest else root)
 
 
 def overdue_minutes() -> int | None:
@@ -345,9 +358,55 @@ def node_states(root: Path, nodes: list[plan_graph.Node]) -> dict[str, str]:
     return states
 
 
-def plan_lines(root: Path, nodes: list[plan_graph.Node], *, ready_specs: bool) -> list[str]:
-    """The graph's state; with `ready_specs` (`plan-next`), first the ready nodes with what a subagent needs."""
+def earlier_orca_workers(root: Path) -> list[dict[str, Any]]:
+    """Worker records still in place, of `root` and the repositories it delegated into: Orca work from before the switch."""
+    seen: dict[str, dict[str, Any]] = {}
+    for owner in orca_cli.all_roots(root):
+        for record in orca_cli.worker_records(owner):
+            seen.setdefault(record["worktree"], record)
+    return list(seen.values())
+
+
+def graph_states(root: Path, nodes: list[plan_graph.Node], run: str | None = None) -> dict[str, str]:
+    """`node_states`, with the Orca task of a node applied before the switch counted, so its work is not given out twice.
+
+    A subagent's record of the node wins. Otherwise the node takes its Orca status: `completed` counts for its
+    dependents, a task with no worker yet (`pending`, `ready`) can go to a subagent, and any other status keeps it from
+    being ready. A task Orca does not list is free unless a worker record still holds it. When Orca cannot be read the
+    node is `orca-unreadable` and not ready, since it may be running or already done.
+    """
     states = node_states(root, nodes)
+    mapped = plan_graph.ledger(root)
+    earlier = [node for node in nodes if node.id in mapped and states[node.id] == "pending"]
+    if not earlier:
+        return states
+    orca_cli.use_stored_run(root)
+    if run is None:
+        orca_cli.sync_bound_run(root)
+    current = orca_cli.run_id(run)
+    held = {record["task_id"]: record for record in earlier_orca_workers(root)}
+    wanted = {mapped[node.id] for node in earlier}
+    runs = list(dict.fromkeys([current, *(held[task]["run"] or current for task in wanted if task in held)]))
+    statuses: dict[str, str] = {}
+    unread = False
+    for name in runs:
+        try:
+            statuses.update({str(task.get("id")): str(task.get("status")) for task in orca_cli.list_tasks(name)})
+        except orca_cli.OrcaError:
+            unread = True
+    for node in earlier:
+        task = mapped[node.id]
+        status = statuses.get(task)
+        if status is None:
+            states[node.id] = "orca-unreadable" if unread else "missing" if task in held else "pending"
+        elif status not in plan_graph.WAITING:
+            states[node.id] = status
+    return states
+
+
+def plan_lines(root: Path, nodes: list[plan_graph.Node], *, ready_specs: bool, run: str | None = None) -> list[str]:
+    """The graph's state; with `ready_specs` (`plan-next`), first the ready nodes with what a subagent needs."""
+    states = graph_states(root, nodes, run)
     lines: list[str] = []
     if ready_specs:
         ready = plan_graph.ready(nodes, states)

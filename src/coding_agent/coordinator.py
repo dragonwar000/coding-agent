@@ -496,6 +496,7 @@ def subagent_contract(auto_decide: bool = False) -> str:
         "- Graph vẫn dùng được: ghi plan vào .coding-agent/plan.yaml, `python3 -m coding_agent.cli plan-next .coding-agent/plan.yaml` in các node sẵn sàng kèm spec. Giao mỗi node cho một subagent với `description` bắt đầu bằng `<node id>:`; sổ subagent dùng tiền tố đó để biết node đang chạy hay đã xong. Xem graph: `plan-status`.",
         "- Bạn kiểm kết quả trước khi nói với người dùng là xong: đọc diff và chạy test hợp với việc đó. Lời báo của subagent chưa phải bằng chứng. Việc chưa đạt thì giao lại.",
         "- Bảng việc liệt kê subagent đang mở và tuổi của chúng, đánh dấu cái quá hạn (`CODING_AGENT_SUBAGENT_MINUTES`, mặc định 30, `off` để tắt). Gặp dấu đó thì kiểm hoặc dừng nó. Subagent 'mất dấu' là phiên của nó đã kết thúc: đọc diff rồi giao lại phần chưa xong.",
+        "- Worker Orca đã giao trước khi project chuyển sang mode này vẫn là việc của bạn: bảng việc liệt kê chúng. Dùng `inbox`, `worker-resume`, `worker-settle`, gộp nhánh và `worktree-clean` như cũ, và không giao lại node đang có worker Orca.",
         "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái.",
     ]
     if auto_decide:
@@ -718,10 +719,11 @@ def read_board(root: Path, run: str | None = None, session: str = "board") -> tu
     While any worker is unsettled, the death watcher is kept running in the background (`watcher.ensure_running`).
     Settled worker worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists
     only the ones that still hold work; that group does not depend on the inbox being readable.
-    With `coordinator.dispatch: subagent` the board is the subagent ledger and Orca is not called.
+    With `coordinator.dispatch: subagent` the board is the subagent ledger. Orca is called only while worker records from
+    before the switch are still in place (`_earlier_orca_lines`), and an Orca failure then never hides the ledger.
     """
     if subagents.dispatch_mode(root) == "subagent":
-        return subagents.board_lines(root), None
+        return subagents.board_lines(root) + _earlier_orca_lines(root, run, session), None
     orca_cli.use_stored_run(root)
     notes: list[str] = []
     if run is None:
@@ -733,6 +735,49 @@ def read_board(root: Path, run: str | None = None, session: str = "board") -> tu
         notes = [f"bảng {note}"] if note else []
         lines, error, fenced = _board(root, run, session)
     return notes + lines, error
+
+
+def _earlier_orca_lines(root: Path, run: str | None, session: str) -> list[str]:
+    """The Orca workers a project still has from before it switched to `dispatch: subagent`. Empty when it has none.
+
+    The full board (resume, death watcher, reports, worktree cleanup) follows one Run, because a root keeps one watcher
+    and one scan file: the current Run when a worker belongs to it, else the Run of the newest worker. Unsettled tasks
+    of any other Run are listed with the `--run` that reaches them.
+    """
+    records = subagents.earlier_orca_workers(root)
+    if not records:
+        return []
+    orca_cli.use_stored_run(root)
+    if run is None:
+        orca_cli.sync_bound_run(root, session=session)
+    current = orca_cli.run_id(run)
+    runs = list(dict.fromkeys(record["run"] or current for record in records))
+    followed = current if current in runs else runs[-1]
+    head = (f"worker Orca giao trước khi chuyển sang subagent ({len(records)} worktree), vẫn theo dõi ở Run {followed}. "
+            "`inbox`, `worker-settle`, gộp nhánh và `worktree-clean` dùng như cũ; chỉ việc tạo task Orca mới bị từ chối:")
+    lines, error, fenced = _board(root, followed, session)
+    lines = [line for line in lines if not line.startswith("bảng việc: chưa có task")]
+    if error is not None:
+        lines.append(f"không đọc được từ Orca: {error}. Worker cũ có thể vẫn chạy: không giao lại việc của chúng.")
+    elif fenced:
+        lines.append(f"terminal này gắn với Run {fenced}, nên chưa đọc đủ Run {followed}: dùng `inbox --run {followed}`.")
+    for other in runs:
+        if other != followed:
+            lines += _other_run_lines(other, {record["task_id"] for record in records if (record["run"] or current) == other})
+    return [head, *lines]
+
+
+def _other_run_lines(run: str | None, task_ids: set[str]) -> list[str]:
+    """The unsettled worker tasks of a Run the board does not follow."""
+    try:
+        tasks = orca_cli.list_tasks(run)
+    except orca_cli.OrcaError as error:
+        return [f"worker Orca của Run {run} không đọc được: {str(error)[:160]}. Không giao lại việc của chúng."]
+    open_tasks = [task for task in tasks if str(task.get("id")) in task_ids and task.get("status") not in ("completed", "failed")]
+    if not open_tasks:
+        return []
+    rows = [f"  - {task.get('id')} [{task.get('status')}] {task.get('task_title') or task.get('title') or ''}".rstrip() for task in open_tasks]
+    return [f"worker Orca chưa xong ở Run {run} ({len(open_tasks)}), đọc bằng `inbox --run {run}`:", *rows]
 
 
 def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | None, str | None]:
