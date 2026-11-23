@@ -20,6 +20,11 @@ the repository. `FAKE_ORCA_REAL_WORKTREE=1` makes `worktree create` add a real g
 `FAKE_ORCA_SCREEN` replaces what `terminal read` shows (lines separated by `\\n`). With `$CLAUDE_CONFIG_DIR` set,
 `worktree create` and `terminal create` copy `.claude.json` as it is at that moment to `$FAKE_ORCA_STATE.<word>-create.json`,
 so a test can see what was trusted when each call came.
+`data["terminals"]` (handle -> record) replaces what `terminal show` answers for that handle and is what `terminal list`
+answers; `terminal close` drops one and records it in `closed_terminals`. `data["pty_pids"]` (ptyId -> pid) is what
+`diagnostics memory` answers. A dispatch record may set `assignee`, `creator`, `incarnation`, `observation` and
+`activity`. `data["terminal_mail"]` (handle -> messages) is what `check --terminal H --peek` answers, `check --all`
+answers every message including acknowledged ones, and `data["release_answer"]` replaces what `worker-release` answers.
 `FAKE_ORCA_WORKER_START_FENCED=1` makes `worker-start` answer the `consumer_fenced` refusal Orca gives a coordinator
 terminal no longer bound to the Task Run; `FAKE_ORCA_WORKER_START_CRASH=1` makes it exit 3 with no JSON.
 """
@@ -109,8 +114,30 @@ def main(argv: list[str]) -> int:
             tail = os.environ["FAKE_ORCA_SCREEN"].split("\n")
         print(json.dumps({"ok": True, "result": {"terminal": {"handle": handle, "status": "running", "tail": tail, "source": "screen"}}}, ensure_ascii=False))
         return exit_code
+    if argv[:2] == ["terminal", "list"]:
+        print(json.dumps({"ok": True, "result": {"terminals": list(data.get("terminals", {}).values()), "truncated": False}}))
+        return exit_code
+    if argv[:2] == ["terminal", "close"]:
+        handle = _options(argv[2:]).get("--terminal", "")
+        data.setdefault("closed_terminals", []).append(handle)
+        data.get("terminals", {}).pop(handle, None)
+        gone = data.setdefault("gone_terminals", [])
+        gone.append(handle)
+        state_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps({"ok": True, "result": {"closed": True}}))
+        return exit_code
+    if argv[:2] == ["diagnostics", "memory"]:
+        sessions = [{"sessionId": pty, "paneKey": None, "pid": pid} for pty, pid in data.get("pty_pids", {}).items()]
+        print(json.dumps({"ok": True, "result": {"worktrees": [{"sessions": sessions}]}}))
+        return exit_code
     if argv[:2] == ["terminal", "show"]:
         handle = _options(argv[2:]).get("--terminal", "")
+        if handle in data.get("gone_terminals", []):
+            print(json.dumps({"ok": False, "error": {"code": "terminal_handle_stale", "message": "terminal_handle_stale"}}))
+            return 1
+        if handle in data.get("terminals", {}):
+            print(json.dumps({"ok": True, "result": {"terminal": data["terminals"][handle]}}))
+            return exit_code
         if handle in os.environ.get("FAKE_ORCA_GONE_TERMINALS", "").split(","):
             print(json.dumps({"ok": False, "error": {"code": "terminal_handle_stale", "message": "terminal_handle_stale"}}))
             return 1
@@ -146,14 +173,17 @@ def main(argv: list[str]) -> int:
                 answer = {"ok": False, "error": {"code": "dispatch_not_found", "message": f"no dispatch for task {options.get('--task')}"}}
             else:
                 d_id, d = found[-1]
-                answer = {"ok": True, "result": {"dispatch": {"id": d_id, "task_id": d["task"], "assignee_handle": f"term_{d['task']}", "status": d.get("status", "pending")}}}
+                answer = {"ok": True, "result": {"dispatch": {"id": d_id, "task_id": d["task"], "assignee_handle": d.get("assignee", f"term_{d['task']}"), "status": d.get("status", "pending"),
+                                                               "creator_handle": d.get("creator"), "process_incarnation": d.get("incarnation")}}}
         elif command == "worker-show":
             d = dispatches.get(options.get("--dispatch", ""))
             if d is None:
                 answer = {"ok": False, "error": {"code": "dispatch_not_found", "message": "no such dispatch"}}
             else:
                 answer = {"ok": True, "result": {"dispatch": {"id": options["--dispatch"], "status": d.get("status", "pending")},
-                                                 "worker": {"dispatchId": options["--dispatch"], "state": d.get("state", "start_unknown")}}}
+                                                 "worker": {"dispatchId": options["--dispatch"], "state": d.get("state", "start_unknown")},
+                                                 "observation": d.get("observation", {"status": "live", "exactWorker": True, "agentWait": None}),
+                                                 "projection": {"stage": {"activity": d.get("activity", "done")}}}}
         else:
             d = dispatches.get(options.get("--dispatch", ""))
             if d is None:
@@ -171,12 +201,19 @@ def main(argv: list[str]) -> int:
 
     if command == "worker-release":
         data.setdefault("released", []).append(options.get("--dispatch"))
-        answer = {"ok": True, "result": {"dispatchId": options.get("--dispatch"), "state": "released"}}
+        answer = {"ok": True, "result": {"dispatchId": options.get("--dispatch"), **data.get("release_answer", {"state": "released"})}}
     elif command == "check":
         messages = data.setdefault("messages", [])
         if "--ack" in options:
+            data.setdefault("acked_messages", []).extend(m for m in messages if m.get("delivery") == options["--ack"])
             data["messages"] = [m for m in messages if m.get("delivery") != options["--ack"]]
             answer = {"ok": True, "result": {"runId": options.get("--run"), "messages": [], "count": 0}}
+        elif "--terminal" in options:
+            mail = data.get("terminal_mail", {}).get(options["--terminal"], [])
+            answer = {"ok": True, "result": {"messages": mail, "count": len(mail)}}
+        elif "--all" in argv:
+            everything = data.get("acked_messages", []) + messages
+            answer = {"ok": True, "result": {"runId": options.get("--run"), "messages": everything, "count": len(everything)}}
         elif "--peek" in argv:
             answer = {"ok": True, "result": {"runId": options.get("--run"), "messages": messages, "count": len(messages)}}
         else:
@@ -239,7 +276,8 @@ def main(argv: list[str]) -> int:
                                          "lastError": "Dispatch input was written and submitted, but claude's turn start could not be verified"})
                 exit_code = 1
     elif command == "task-list":
-        answer = {"ok": True, "result": {"tasks": list(tasks.values())}}
+        # A task with a `run` is listed only in that Run, so a test can tell an older Run's records apart.
+        answer = {"ok": True, "result": {"tasks": [task for task in tasks.values() if task.get("run") in (None, options["--run"])]}}
     else:
         answer = {"ok": False, "error": f"unknown subcommand {command}"}
 

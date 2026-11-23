@@ -273,6 +273,8 @@ class Terminals:
 
     def call(self, *args: str) -> dict:
         self.calls.append(args)
+        if args[0] == "dispatch-show":  # these records name a dispatch Orca no longer shows
+            raise orca_cli.OrcaRefused("orca dispatch-show answered ok:false: dispatch_not_found")
         assert args[0] == "worker-release"
         return {"ok": True, "result": self.release}
 

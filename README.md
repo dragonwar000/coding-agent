@@ -28,8 +28,9 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/brief.py` | Brief cho một task của PLAN: Global constraints, Files, Interfaces (SC-005) |
 | `src/coding_agent/memory/` | Zero-Mem: spool, truy hồi qua `zm mcp`, episode, ghi lượt |
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
-| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-watch`, `worker-settle`, `wiki-sync`, `wikieval` |
+| `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-watch`, `worker-sweep`, `worker-settle`, `wiki-sync`, `wikieval` |
 | `src/coding_agent/watcher.py` | `worker-watch`: theo dõi worker bằng terminal (không model, không heartbeat), báo coordinator đúng một lần khi worker chết hoặc kẹt |
+| `src/coding_agent/release.py` | Đóng phiên agent của worker đã xong và đã được đọc báo cáo, giữ nguyên worktree, nhánh và file |
 | `src/coding_agent/notify.py` | Khối `notify` (mặc định tắt): chạy lệnh argv của người dùng để báo cho người khi watcher báo sự cố |
 | `src/coding_agent/wiki/` | Công cụ wiki của dự án: neo đồng bộ code→wiki (`sync.py`) và bộ eval goldens (`evaluate.py`) |
 | `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
@@ -790,8 +791,18 @@ ghi nó thành `base_branch`. Nhánh khác không tính: nhánh tách từ nhán
 Bản ghi cũ chưa có `base_branch`, hoặc nhánh base đã bị xoá, thì chỉ so với HEAD. Việc tự dọn chạy khi dựng bảng việc (mỗi prompt của
 coordinator) và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`; mỗi worktree xoá được in một dòng
 `auto-clean: removed <tên> (<task>)` và ghi event `worktree-auto-removed`. Lỗi khi tự dọn chỉ là cảnh báo, không đổi mã thoát
-của lệnh. Đặt `CODING_AGENT_AUTO_CLEAN=off` để tắt.
+của lệnh. Đặt `CODING_AGENT_AUTO_CLEAN=off` để tắt (mọi đường chạy, kể cả watcher nền).
 
+Worktree đã gộp vẫn được giữ khi worker còn cần phiên của nó: báo cáo chưa đọc, câu hỏi chưa trả lời, agent đang chạy hoặc đang
+chờ, hoặc trong worktree có terminal của agent khác hay của coordinator. Bảng việc in lý do (`giữ worktree ...`, event
+`worktree-kept-for-session`). Khi không có coordinator, watcher chặt hơn: điều gì Orca không xác nhận được thì giữ worktree, và
+terminal shell đang chạy chương trình cũng giữ worktree.
+
+- **Bytecode Python không phải việc:** file chưa track trong `__pycache__/` và `*.pyc` không làm worktree "chưa sạch", ở cả kiểm
+  tra thường, kiểm tra checkout mất đăng ký và thư mục sót lại. File `.pyc` đã track mà đổi, hoặc đã `git add`, vẫn tính. Lệnh
+  hook sinh ra có `PYTHONDONTWRITEBYTECODE=1` để không tạo bytecode nữa; bản cài cũ vẫn qua `gate`, và lần `gen --apply` hay cài
+  lại kế tiếp ghi lệnh mới. Dự án đã commit cả `__pycache__` thì các `.pyc` đã track đó vẫn tính là thay đổi: phải khôi phục
+  (`git checkout -- <đường dẫn>`) hoặc bỏ track chúng thì worktree mới được dọn.
 - **Theo Run của từng worker:** sổ worker ghi Run của task (`run`) lúc worker được tạo, nên task được đọc trong đúng Run đó dù
   coordinator đã chuyển sang Run mới (`run-init` lại sau khi bị fence); mỗi Run chỉ đọc `task-list` một lần. Bản ghi cũ chưa có
   `run` thì đọc trong Run hiện tại.
@@ -840,11 +851,56 @@ python3 -m coding_agent.cli worktree-clean --task-id <id> --discard --yes   # b�
 - File harness tự ghi vào worktree (`.coding-agent/events.jsonl`, `.coding-agent/state/`, `orca-run`, `links.jsonl`,
   `workers.jsonl`, `plan.json`, `installed.json`, `backups/`, `roots.json`, `acked.jsonl`, `worktree-links.json`) không tính là việc; `.coding-agent/plan.yaml` thì có. Trên Windows,
   thay đổi chỉ ở bit thực thi (repo clone bằng git của WSL/Linux) cũng không tính.
-- Tự dọn chỉ thấy task của Run đang dùng (`CODING_AGENT_ORCA_RUN`, hoặc Run đã lưu); worktree của task thuộc Run cũ phải xoá tay.
+- Tự dọn đọc mỗi task trong Run mà sổ worker ghi cho nó. Bản ghi cũ chưa có `run` thì đọc trong Run đang dùng
+  (`CODING_AGENT_ORCA_RUN`, hoặc Run đã lưu); worktree của loại bản ghi đó thuộc Run cũ phải xoá tay.
 - Xoá gồm: nhả terminal của worker, gỡ link bộ cài (xem "Khởi động worker"), `orca worktree rm` (xoá cả nhánh), và ghi
   `removed` vào sổ worker. Link được gỡ trước, như link: symlink và junction bị xoá mà không đi vào thư mục chúng trỏ tới, bản sao
   chỉ bị xoá khi vẫn là file thường trong worktree, và đường dẫn không còn là thứ harness tạo thì để nguyên. Bộ cài ở checkout
   của coordinator không bị đụng. Link bộ cài cũng không tính là việc khi kiểm worktree sạch.
+
+### Đóng phiên worker đã xong (giữ worktree)
+
+Worker đã xong nhưng nhánh chưa gộp không còn giữ phiên agent mãi. Phiên chỉ bị đóng khi **tất cả** điều sau đúng, đọc mới từ Orca:
+
+- task là `completed` hoặc `failed`, và dispatch Orca đang giữ đúng là dispatch trong sổ worker;
+- coordinator đã ack báo cáo của task (`inbox --ack`). Báo cáo chưa đọc, hoặc task không có báo cáo nào, thì giữ worker;
+- worker không có câu hỏi mở, không có tin chưa đọc, không `working`, không chờ prompt (`agentWait` phải có và bằng null), màn hình `idle`;
+- terminal không xuất gì trong thời gian chờ (mặc định 15 phút);
+- terminal đúng là của worker: cùng handle, cùng worktree, cùng process (`process_incarnation`), không phải của coordinator;
+- không tiến trình con nào ngoài agent giữ cổng TCP đang listen (`ps` + `lsof`). Không kiểm được (Windows, thiếu `lsof`) thì giữ worker.
+
+Việc đóng đi qua `worker-release`. Chỉ khi Orca trả `retained` / `external_terminal` thì đóng đúng một terminal đó; lý do `retained`
+khác được tôn trọng, và câu trả lời không chắc chắn không bao giờ bị thay bằng lệnh đóng. Worktree, nhánh và file luôn còn nguyên.
+Kết quả ghi ở `coding-agent-released.jsonl` (cạnh sổ worker) nên không thử lại mãi: lỗi thử tối đa 3 lần rồi thôi. Event:
+`worker-session-released`, `worker-session-release-failed`. Lỗi chỉ là cảnh báo, không chặn bảng việc.
+
+Bảng việc liệt kê worker đã đóng phiên mà worktree còn việc, kèm lệnh tiếp tục: `cd <worktree> && claude --resume <session>`.
+
+```sh
+python3 -m coding_agent.cli worker-sweep --dry-run   # in quyết định cho từng worker, không đóng gì
+python3 -m coding_agent.cli worker-sweep             # chạy một lượt ngay
+```
+
+| Biến | Mặc định | Tác dụng |
+|------|----------|----------|
+| `CODING_AGENT_AUTO_RELEASE` | `on` | `off` tắt việc đóng phiên ở mọi đường chạy |
+| `CODING_AGENT_RELEASE_IDLE_MINUTES` | `15` | Số phút terminal phải im lặng trước khi đóng |
+| `CODING_AGENT_AUTO_CLEAN` | `on` | `off` tắt tự xoá worktree ở mọi đường chạy |
+| `CODING_AGENT_WORKER_WATCH` | `on` | `off` không tự khởi động watcher nền |
+
+### Dọn khi coordinator đã dừng
+
+`worker-watch` chạy thêm một lượt dọn và đóng phiên mỗi 5 phút. Hook `SessionEnd` của coordinator khởi động nó (ở cả
+`dispatch: orca` và `dispatch: subagent`), nên việc dọn vẫn chạy sau khi phiên coordinator kết thúc. Bản cài có manifest chưa có
+hook `subagent-session-end` thì chỉ watcher đã chạy từ trước mới tiếp tục.
+
+- **Một watcher cho mỗi dự án** (khoá OS ở `.coding-agent/state/worker-watch.lock`). Lệnh khởi động cho Run khác chỉ nhờ watcher
+  đang chạy theo dõi thêm Run đó.
+- **Có điểm dừng:** hết worker chưa xong và không còn gì để chờ thì thoát. Nếu còn chờ (ack, thời gian im lặng) thì quét 5 phút một
+  lần, tối đa 6 giờ. Orca không tới được 6 giờ liền cũng thoát. Bảng việc hoặc lần `SessionEnd` sau sẽ khởi động lại.
+- **Chi phí thấp:** mỗi lượt đọc sâu tối đa 10 worker và đóng tối đa 3 phiên; bỏ qua lượt khi load 1 phút vượt 2 lần số CPU.
+- **Orca không tới được:** không xoá, không đóng, không đánh dấu gì; lượt sau thử lại.
+- Biến môi trường được đọc lúc watcher khởi động: đổi công tắc thì watcher đang chạy chỉ nhận ở lần khởi động sau.
 
 Worker bắt đầu từ commit hiện tại của coordinator (`--base-branch`). Không truyền thì Orca tạo worktree từ nhánh gốc mặc định
 của repo, và worker sẽ thiếu việc mới nhất. Commit gốc của worktree được ghi vào sổ để chỉ đếm commit do worker thêm.

@@ -617,6 +617,8 @@ def close_worktree_terminals(worktree: str) -> tuple[list[str], list[str]]:
         handle, path = terminal.get("handle"), terminal.get("worktreePath")
         if not (isinstance(handle, str) and handle and isinstance(path, str) and path and _same_dir(path, worktree)):
             continue
+        if handle == os.environ.get("ORCA_TERMINAL_HANDLE"):
+            continue  # the terminal running this command, which is the coordinator's
         try:
             _call_tool("terminal", "close", "--terminal", handle)
         except OrcaError as error:
@@ -1281,9 +1283,11 @@ def kickoff_text(task_id: str, dispatch: str) -> str:
 
 
 def dispatch_of(task_id: str) -> dict[str, Any]:
-    """The dispatch record of a task from `dispatch-show`: `{id, status, assignee_handle}` with both key spellings read.
+    """The dispatch record of a task from `dispatch-show`: `{id, status, assignee_handle, creator_handle,
+    process_incarnation}` with both key spellings read.
 
-    `dispatch-show` takes no `--run`; it reads the dispatch by task id alone.
+    `dispatch-show` takes no `--run`; it reads the dispatch by task id alone. `process_incarnation` is
+    `<ptyId>:<incarnationId>` of the process the dispatch went to (measured on Orca 1.4.222).
     """
     answer = _call("dispatch-show", "--task", task_id)
     result = answer.get("result") if isinstance(answer, dict) else None
@@ -1294,6 +1298,8 @@ def dispatch_of(task_id: str) -> dict[str, Any]:
         "id": str(record.get("id") or ""),
         "status": str(record.get("status") or ""),
         "assignee_handle": str(record.get("assignee_handle") or record.get("assigneeHandle") or ""),
+        "creator_handle": str(record.get("creator_handle") or record.get("creatorHandle") or ""),
+        "process_incarnation": str(record.get("process_incarnation") or record.get("processIncarnation") or ""),
     }
 
 
@@ -1339,6 +1345,83 @@ def terminal_state(handle: str) -> dict[str, Any]:
     if "agentIdentity" in terminal:
         out["agent"] = terminal.get("agentIdentity") or None
     return out
+
+
+def terminal_detail(handle: str) -> dict[str, Any] | None:
+    """Orca's full `terminal show` record, or None when the handle is stale (the terminal was closed)."""
+    try:
+        answer = _call_tool("terminal", "show", "--terminal", handle)
+    except OrcaRefused as error:
+        if any(code in str(error) for code in TERMINAL_GONE_CODES):
+            return None
+        raise
+    result = answer.get("result") if isinstance(answer, dict) else None
+    terminal = result.get("terminal", result) if isinstance(result, dict) else None
+    if not isinstance(terminal, dict):
+        raise OrcaError(f"terminal show answered no terminal for {handle}")
+    return terminal
+
+
+def terminals() -> list[dict[str, Any]]:
+    """Every live terminal Orca lists. A truncated list raises: a caller deciding what is safe needs all of it."""
+    answer = _call_tool("terminal", "list")
+    result = answer.get("result") if isinstance(answer, dict) else None
+    if not isinstance(result, dict) or result.get("truncated") or not isinstance(result.get("terminals"), list):
+        raise OrcaError("terminal list is truncated or has no terminals")
+    return [terminal for terminal in result["terminals"] if isinstance(terminal, dict)]
+
+
+def close_terminal(handle: str) -> None:
+    """Close exactly one terminal pane."""
+    _call_tool("terminal", "close", "--terminal", handle)
+
+
+def worker_observation(dispatch: str) -> dict[str, Any]:
+    """What `worker-show` observed: `{status, exact, wait_known, agent_wait, activity}`.
+
+    Orca documents `observation.agentWait`: null means it looked and found no wait, an absent field means it never
+    looked, so `wait_known` tells them apart. Measured on Orca 1.4.222: `status` is `live` or `exited`, and
+    `projection.stage.activity` is `working`, `done` or `unknown`.
+    """
+    answer = _call("worker-show", "--dispatch", dispatch)
+    result = answer.get("result") if isinstance(answer, dict) else None
+    result = result if isinstance(result, dict) else {}
+    observation = result.get("observation") if isinstance(result.get("observation"), dict) else {}
+    projection = result.get("projection") if isinstance(result.get("projection"), dict) else {}
+    stage = projection.get("stage") if isinstance(projection.get("stage"), dict) else {}
+    return {"status": str(observation.get("status") or ""), "exact": observation.get("exactWorker") is True,
+            "wait_known": "agentWait" in observation, "agent_wait": observation.get("agentWait"),
+            "activity": str(stage.get("activity") or "")}
+
+
+def pty_pids() -> dict[str, int]:
+    """Each terminal's root process by `ptyId`, from `diagnostics memory` (`worktrees[].sessions[]`, measured on Orca
+    1.4.222: `sessionId` equals the terminal's `ptyId`)."""
+    answer = _call_tool("diagnostics", "memory")
+    result = answer.get("result") if isinstance(answer, dict) else None
+    found: dict[str, int] = {}
+    for worktree in (result.get("worktrees") if isinstance(result, dict) else None) or []:
+        for session in (worktree.get("sessions") if isinstance(worktree, dict) else None) or []:
+            if isinstance(session, dict) and isinstance(session.get("pid"), int) and session.get("sessionId"):
+                found[str(session["sessionId"])] = session["pid"]
+    return found
+
+
+def unread_for_terminal(handle: str, run: str | None = None) -> list[dict[str, Any]]:
+    """Messages waiting in one terminal's mailbox, without marking them read. Heartbeats are not counted."""
+    answer = _call("check", "--terminal", handle, "--peek", *_run_args(run))
+    return [message for message in _messages(answer) if not is_heartbeat(message)]
+
+
+def run_mail(run: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """(every message of the Run, its worker reports not acknowledged in Orca, replies from any inbox). Reads only."""
+    messages = _messages(_call("check", "--all", *_run_args(run)))
+    unread = unread_reports(run)
+    try:
+        replies = _messages(_call("inbox", "--full", "--limit", str(INBOX_LIMIT)))
+    except OrcaError:
+        replies = []
+    return messages, unread, replies
 
 
 def escalate(*, run: str | None, subject: str, body: str, task_id: str = "", dispatch: str = "") -> None:
