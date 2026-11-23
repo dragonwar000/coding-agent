@@ -19,7 +19,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from coding_agent import orca, orca_cli, roots as root_discovery
+from coding_agent import orca, orca_cli, roots as root_discovery, subagents
 
 ROLE_ENV = "CODING_AGENT_ROLE"
 ROLES = ("coordinator", "worker", "maintainer")
@@ -398,35 +398,63 @@ def needs_user_confirmation(tool: str, tool_input: Any, root: Path | None = None
 CHAINING = re.compile(r"(&&|\|\||;|\||`|\$\()")
 
 
-def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python_src: str | None = None) -> str | None:
+SUBAGENT_HOW = (
+    "Không dừng lượt, không hỏi người dùng, không viết lại lệnh để lách guard: giao việc này ngay cho một subagent bằng "
+    "tool Agent (dispatch: subagent)."
+)
+
+
+def _destructive_git_reason(shell: str, how: str) -> str | None:
+    """The refusal of a destructive git form when the session set `CODING_AGENT_COORDINATOR_GIT=safe`, else None."""
+    if os.environ.get(COORDINATOR_GIT_ENV) != "safe":
+        return None
+    form = destructive_git(shell)
+    if not form:
+        return None
+    return (
+        f"[coordinator] `{form}` là dạng git phá huỷ: làm mất dữ liệu không lấy lại được, nên bị chặn "
+        f"vì phiên đặt {COORDINATOR_GIT_ENV}=safe. Muốn cho coordinator chạy cả dạng này: khởi động phiên "
+        f"không đặt biến đó (hoặc {COORDINATOR_GIT_ENV}=all). {how}"
+    )
+
+
+def subagent_call_reason(tool: str, tool_input: Any) -> str | None:
+    """Why a subagent must not make this call (`dispatch: subagent`). It may write; only the destructive-git rule binds it."""
+    if tool != "Bash" or not isinstance(tool_input, dict):
+        return None
+    how = "Không viết lại lệnh để lách guard: báo coordinator việc cần làm và lý do."
+    return _destructive_git_reason(checked_shell(str(tool_input.get("command") or "")), how)
+
+
+def guard_reason(tool: str, tool_input: Any, root: Path | None = None, *, python_src: str | None = None,
+                 dispatch: str = "orca") -> str | None:
     """Why the coordinator must not do this call itself, or None when the call is allowed.
 
     Allowed: read-only shell, a single `coding_agent.cli` command, and writing the plan file.
     Refused: any other file write, a shell command that changes files, a destructive git form (only with
-    `CODING_AGENT_COORDINATOR_GIT=safe`), and an in-process subagent, which would bypass the graph.
-    Every refusal ends with the delegate command, with `python_src` in it when the caller knows the path.
+    `CODING_AGENT_COORDINATOR_GIT=safe`), and, with `dispatch` `orca`, an in-process subagent, which would bypass the
+    graph. With `dispatch` `subagent` the Agent tool is how work is handed out, so it is allowed.
+    A refusal ends with the way to hand the work out: the delegate command, with `python_src` in it when the caller
+    knows the path, or the Agent tool.
     """
     data = tool_input if isinstance(tool_input, dict) else {}
-    how = f"{HOW} {delegate_now(python_src)}"
+    how = SUBAGENT_HOW if dispatch == "subagent" else f"{HOW} {delegate_now(python_src)}"
     if tool in WRITE_TOOLS:
         if root is not None and is_plan_file(root, data.get("file_path") or data.get("notebook_path")):
             return None
         return f"[coordinator] {tool} là sửa trực tiếp. {how}"
     if tool in DELEGATING_TOOLS:
+        if dispatch == "subagent":
+            return None
         return f"[coordinator] subagent nội bộ không qua graph, nên bảng việc không thấy nó. {how}"
     if tool == "Bash":
         command = str(data.get("command") or "")
         shell = checked_shell(command)
         if DELEGATE_CALL.search(command) and not CHAINING.search(shell):
             return None
-        if os.environ.get(COORDINATOR_GIT_ENV) == "safe":
-            form = destructive_git(shell)
-            if form:
-                return (
-                    f"[coordinator] `{form}` là dạng git phá huỷ: làm mất dữ liệu không lấy lại được, nên bị chặn "
-                    f"vì phiên đặt {COORDINATOR_GIT_ENV}=safe. Muốn cho coordinator chạy cả dạng này: khởi động phiên "
-                    f"không đặt biến đó (hoặc {COORDINATOR_GIT_ENV}=all). {how}"
-                )
+        refusal = _destructive_git_reason(shell, how)
+        if refusal:
+            return refusal
         if MUTATING_BASH.search(GIT_CALL.sub("git", shell)):
             return f"[coordinator] lệnh shell này làm thay đổi file. {how}"
     return None
@@ -456,8 +484,29 @@ AUTO_DECIDE_LINE = (
 )
 
 
-def contract(python_src: str, auto_decide: bool = False) -> str:
+def subagent_contract(auto_decide: bool = False) -> str:
+    """The coordinator contract of a project with `coordinator.dispatch: subagent`."""
+    lines = [
+        "[coordinator] Bạn là coordinator của repo này (dispatch: subagent). Vai trò: nhận yêu cầu, lập kế hoạch, giao việc cho subagent, kiểm kết quả, và trả lời người dùng.",
+        "- Mọi thay đổi file do subagent làm: giao bằng tool Agent. Mode này không tạo task, worktree hay terminal Orca; `delegate`, `worker-start`, `plan-apply`, `orca-create` bị từ chối.",
+        "- Phiên chính không sửa file: ở mode enforce, hook chặn Write/Edit và lệnh shell ghi file. Bạn vẫn đọc file, chạy lệnh đọc và test, ghi đúng một file (.coding-agent/plan.yaml), và chạy lệnh git. Không viết lại lệnh bị chặn để lách guard.",
+        f"- Phiên đặt `{COORDINATOR_GIT_ENV}=safe` thì các dạng git phá huỷ bị chặn cho cả bạn và subagent.",
+        "- Subagent dùng chung working tree với bạn, KHÔNG có cách ly: các subagent chạy song song không được đụng cùng file. Việc có thể đụng nhau thì chạy lần lượt, hoặc đặt `isolation: \"worktree\"` trên tool Agent khi có; subagent đó làm trên nhánh riêng và bạn phải gộp nhánh đó lại.",
+        "- Mỗi lần gọi Agent: `description` ngắn nói rõ việc, `prompt` đủ ngữ cảnh vì subagent không thấy hội thoại, và `model`: `sonnet` cho việc máy móc hoặc spec rõ, `opus` cho việc khó hoặc rủi ro cao (bảo mật, concurrency, migrate dữ liệu, kiến trúc, debug mơ hồ). Chưa chắc thì `opus`.",
+        "- Graph vẫn dùng được: ghi plan vào .coding-agent/plan.yaml, `python3 -m coding_agent.cli plan-next .coding-agent/plan.yaml` in các node sẵn sàng kèm spec. Giao mỗi node cho một subagent với `description` bắt đầu bằng `<node id>:`; sổ subagent dùng tiền tố đó để biết node đang chạy hay đã xong. Xem graph: `plan-status`.",
+        "- Bạn kiểm kết quả trước khi nói với người dùng là xong: đọc diff và chạy test hợp với việc đó. Lời báo của subagent chưa phải bằng chứng. Việc chưa đạt thì giao lại.",
+        "- Bảng việc liệt kê subagent đang mở và tuổi của chúng, đánh dấu cái quá hạn (`CODING_AGENT_SUBAGENT_MINUTES`, mặc định 30, `off` để tắt). Gặp dấu đó thì kiểm hoặc dừng nó. Subagent 'mất dấu' là phiên của nó đã kết thúc: đọc diff rồi giao lại phần chưa xong.",
+        "- Mỗi lượt, đọc bảng việc bên dưới trước khi nói về tiến độ. Không bịa trạng thái.",
+    ]
+    if auto_decide:
+        lines.append(AUTO_DECIDE_LINE)
+    return "\n".join(lines)
+
+
+def contract(python_src: str, auto_decide: bool = False, dispatch: str = "orca") -> str:
     """The coordinator contract injected at session start and after a compaction."""
+    if dispatch == "subagent":
+        return subagent_contract(auto_decide)
     lines = [
         "[coordinator] Bạn là coordinator của repo này. Vai trò: nhận yêu cầu, lập kế hoạch, giao việc, và trả lời người dùng.",
         "- Mọi thay đổi file đi qua graph: bạn viết plan, worker Orca làm từng node trong worktree riêng. Ở mode enforce, hook chặn sửa trực tiếp, lệnh shell ghi file, và subagent nội bộ.",
@@ -669,7 +718,10 @@ def read_board(root: Path, run: str | None = None, session: str = "board") -> tu
     While any worker is unsettled, the death watcher is kept running in the background (`watcher.ensure_running`).
     Settled worker worktrees that are merged and clean are removed first (`cleanup.auto_clean`), so the board lists
     only the ones that still hold work; that group does not depend on the inbox being readable.
+    With `coordinator.dispatch: subagent` the board is the subagent ledger and Orca is not called.
     """
+    if subagents.dispatch_mode(root) == "subagent":
+        return subagents.board_lines(root), None
     orca_cli.use_stored_run(root)
     notes: list[str] = []
     if run is None:

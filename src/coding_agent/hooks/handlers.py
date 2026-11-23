@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from coding_agent import autodecide, coordinator, evaluator, events, orca, orca_cli, ratchet, state, transcript
+from coding_agent import autodecide, coordinator, evaluator, events, orca, orca_cli, ratchet, state, subagents, transcript
 from coding_agent.hooks import Context, HookResult
 from coding_agent.manifest import Loop
 from coding_agent.memory import record, zeromem
@@ -435,10 +435,13 @@ def _note_direct_changes(ctx: Context, data: dict[str, Any]) -> None:
     """Record files the coordinator's tree gained during the turn while the graph was mandatory.
 
     Detection only: a change is already made when the turn ends. It also counts files the user changed by hand in that time.
+    With `dispatch: subagent` subagents write in this same tree, so a new dirty file says nothing about the coordinator.
     """
     guard = ctx.manifest.hook("coordinator-guard") if ctx.manifest is not None else None
     before = data.get("dirty_at_prompt")
     if guard is None or guard.mode != "enforce" or not isinstance(before, list) or coordinator.role_for(_cwd(ctx)) != "coordinator":
+        return
+    if _dispatch(ctx) == "subagent":
         return
     now = coordinator.dirty_paths(ctx.root)
     new = sorted(set(now or []) - set(before))
@@ -506,10 +509,17 @@ def _cwd(ctx: Context) -> Path:
     return Path(str(ctx.payload.get("cwd") or ctx.root))
 
 
+def _dispatch(ctx: Context) -> str:
+    """The project's dispatch mode, from the manifest at run time. Without a usable manifest it is `orca`."""
+    return ctx.manifest.coordinator.dispatch if ctx.manifest is not None else "orca"
+
+
 def coordinator_guard(ctx: Context) -> HookResult:
     """In the coordinator's session, block direct writes and mutating shell commands; workers are never affected.
 
     A maintainer session is let through, and each call the guard would have blocked is logged as `maintainer-allowed`.
+    With `dispatch: subagent` the main session may call Agent, and a call whose payload has `agent_id` is a subagent's
+    (see `subagents`): it may write, and only the destructive-git rule binds it.
     """
     role = coordinator.role_for(_cwd(ctx))
     if role not in ("coordinator", "maintainer"):
@@ -528,7 +538,11 @@ def coordinator_guard(ctx: Context) -> HookResult:
             "hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": question,
         }}, ensure_ascii=False))
     python_src = ctx.manifest.python_src if ctx.manifest is not None else None
-    reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"), ctx.root, python_src=python_src)
+    dispatch = _dispatch(ctx)
+    if dispatch == "subagent" and ctx.payload.get("agent_id"):
+        reason = coordinator.subagent_call_reason(tool, ctx.payload.get("tool_input"))
+    else:
+        reason = coordinator.guard_reason(tool, ctx.payload.get("tool_input"), ctx.root, python_src=python_src, dispatch=dispatch)
     if reason is None:
         return HookResult()
     if role == "maintainer":
@@ -550,6 +564,11 @@ def coordinator_context(ctx: Context) -> HookResult:
         data = state.load(ctx.root, ctx.session)
         _remember_permission_mode(ctx, data)
         state.save(ctx.root, ctx.session, data)
+        if _dispatch(ctx) == "subagent":
+            closed = subagents.sweep(ctx.root, ctx.session, ctx.payload.get("source"))
+            if closed:
+                ctx.note(guard="subagent-ledger", kind="swept", applied=False,
+                         detail={"closed": [{"id": entry.id, "outcome": entry.outcome} for entry in closed[:20]]})
     else:
         # prompt-reset owns the session state on UserPromptSubmit; both hooks may run at once, so only the mode file is written here.
         _remember_permission_mode(ctx, None)
@@ -562,7 +581,7 @@ def coordinator_context(ctx: Context) -> HookResult:
             text = coordinator.collision_context(user_text) + "\n" + text
     if event == "SessionStart":
         auto = autodecide.effective(ctx.root, ctx.manifest.auto_decide).enabled
-        text = coordinator.contract(ctx.manifest.python_src, auto_decide=auto) + "\n" + text
+        text = coordinator.contract(ctx.manifest.python_src, auto_decide=auto, dispatch=_dispatch(ctx)) + "\n" + text
     ctx.note(guard="coordinator-context", kind="injected", applied=False, detail={"event": event, "board_lines": len(board), "error": error})
     return HookResult(stdout=_inject(event, text))
 
@@ -598,6 +617,14 @@ def coordinator_heartbeat(ctx: Context) -> HookResult:
         return HookResult()
     ctx.note(guard="coordinator-heartbeat", kind="blocked", applied=True, detail={"run": run, "heartbeats": count})
     return HookResult(stdout=json.dumps({"decision": "block", "reason": f"heartbeat only, acked ({count})"}))
+
+
+def subagent_ledger(ctx: Context) -> HookResult:
+    """Record a subagent's assignment, start, result and its session's end. Never blocks; does nothing in `orca` mode."""
+    if _dispatch(ctx) != "subagent":
+        return HookResult()
+    subagents.record_event(ctx.root, ctx.payload)
+    return HookResult()
 
 
 def _turn_context(ctx: Context) -> str:
@@ -644,4 +671,10 @@ REGISTRY: dict[str, Callable[[Context], HookResult]] = {
     "coordinator-board": coordinator_context,
     "coordinator-heartbeat": coordinator_heartbeat,
     "auto-decide": auto_decide,
+    "subagent-assign": subagent_ledger,
+    "subagent-started": subagent_ledger,
+    "subagent-stopped": subagent_ledger,
+    "subagent-result": subagent_ledger,
+    "subagent-failed": subagent_ledger,
+    "subagent-session-end": subagent_ledger,
 }
