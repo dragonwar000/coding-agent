@@ -476,7 +476,7 @@ def contract(python_src: str, auto_decide: bool = False) -> str:
         "- Task giao bằng `delegate`/`plan-next` với `--root <repo khác>` vẫn hiện trên bảng (kèm tên repo) và được tự dọn như task của repo này: repo trong cây thư mục của bạn được tự tìm (có .coding-agent/links.jsonl), repo ngoài cây được ghi vào .coding-agent/roots.json. Task giao trước khi có roots.json được tự tìm lại repo từ Orca; nếu bảng vẫn thiếu, chạy `roots-add <path>`, xem bằng `roots-list`.",
         "- " + RECOVER,
         "- Worker dừng vì lỗi API tạm thời (mất mạng, quá tải, rate limit) được tự resume khi dựng bảng việc, sau khi kiểm thấy mạng đã có lại; bảng việc ghi rõ worker nào đã resume, đang chờ mạng, hay bị chặn cần người xử lý.",
-        "- Worker không gửi heartbeat: coding-agent theo dõi terminal của worker, không cần model. `delegate`/`plan-next` (và bảng việc khi còn worker chưa xong) tự chạy nền `worker-watch` (thay cho `worker-resume --watch`): mỗi phút nó resume, nhắc, và chỉ khi worker chết hoặc kẹt hẳn (terminal hay agent đã mất, lỗi không tạm thời, resume hay nhắc đủ số lần mà vẫn vậy) mới gửi bạn MỘT tin escalation 'worker dead: <task>' kèm lý do và các dòng cuối màn hình. Nhận tin đó thì đọc diff của worktree rồi xử lý (gộp và `worker-settle` nếu đạt, giao lại nếu chưa). Thông báo hộp thư mà chỉ có heartbeat (từ worker cũ) bị hook chặn và ack, không tốn lượt của bạn.",
+        "- Worker không gửi heartbeat: coding-agent theo dõi terminal của worker, không cần model. `delegate`/`plan-next` (và bảng việc khi còn worker chưa xong) tự chạy nền `worker-watch` (thay cho `worker-resume --watch`): mỗi phút nó resume, nhắc, và chỉ khi worker chết hoặc kẹt hẳn (terminal hay agent đã mất, lỗi không tạm thời, resume hay nhắc đủ số lần mà vẫn vậy) mới gửi bạn MỘT tin escalation 'worker dead: <task>' kèm lý do và các dòng cuối màn hình. Nhận tin đó thì đọc diff của worktree rồi xử lý (gộp và `worker-settle` nếu đạt, giao lại nếu chưa). Worker còn spinner mà lâu không có tiến triển thì bạn nhận MỘT tin 'worker stuck: <task>': đọc terminal của nó rồi mới quyết định, vì lệnh chạy lâu cũng trông như vậy; coding-agent không ngắt worker đó. Thông báo hộp thư mà chỉ có heartbeat (từ worker cũ) bị hook chặn và ack, không tốn lượt của bạn.",
         "- Worker im lặng (task còn dispatched, terminal đứng ở ô nhập trống quá 10 phút, chưa có worker_done trong hộp thư) được tự nhắc tối đa 2 lần: việc xong thì commit và gửi worker_done, chưa xong thì làm tiếp. Bảng việc tách riêng nhóm 'worker im lặng, chưa báo' kèm số lần đã nhắc; nhắc đủ 2 lần mà vẫn im thì đọc màn hình terminal và diff của worktree rồi xử lý (gộp và `worker-settle` nếu đạt).",
         "- Worktree của worker đã xong, đã gộp và sạch thì tự được xoá (khi dựng bảng việc và sau `plan-next`, `plan-status`, `inbox`, `delegate`, `worktree-list`), không cần hỏi người dùng. Bảng việc chỉ còn liệt kê worktree có việc chưa gộp hoặc chưa commit: kiểm rồi gộp nhánh vào HEAD, hoặc vào nhánh base của task khi worker được tạo từ nhánh đó (`base:`/`--base-branch`), lượt sau nó tự được dọn. Muốn bỏ việc đó thì hỏi người dùng trong hội thoại trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp; host cũng hỏi xác nhận, trừ khi phiên đang bypass permissions).",
         "- Khi bảng việc ghi 'worker đang hỏi, chờ trả lời': worker đó đang đứng chờ, không chạy. Trả lời ngay bằng lệnh in trên bảng (`orca orchestration reply --id <msg> --run <run> --body \"...\"`). Câu hỏi cần người dùng quyết (phạm vi, xoá/ghi đè, commit/push, chọn hướng) thì hỏi người dùng trong hội thoại trước rồi mới trả lời worker. Dòng task có '(màn hình đứng yên X phút)' là terminal của worker không đổi đã lâu: đọc terminal của nó trước khi coi là đang chạy.",
@@ -515,7 +515,7 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
                 questions: list[dict[str, Any]] | None = None, quiet: dict[str, int] | None = None,
                 run: str | None = None, stalled: dict[str, str] | None = None,
                 silent: dict[str, str] | None = None, models: dict[str, str] | None = None,
-                dead: dict[str, str] | None = None) -> list[str]:
+                dead: dict[str, str] | None = None, hung: dict[str, str] | None = None) -> list[str]:
     """The task board for this repository, one line per task, grouped by state.
 
     `models` maps a task to the model its worker started with (`worker_models`); the task's line ends with `[model]`.
@@ -527,7 +527,8 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
     `dead` maps a task whose worker's terminal or agent is gone to why (`resume.dead_notes`); those are listed first.
     `stalled` maps a task whose worker stopped on an API error to what was done about it (`resume.board_notes`); those
     tasks are listed next, in a group of their own, and not as running. `silent` does the same for a worker that went
-    quiet without reporting (`resume.silent_notes`), in the group after it.
+    quiet without reporting (`resume.silent_notes`), in the group after it. `hung` maps a task whose spinner runs with no
+    progress to how long (`resume.stuck_notes`), in the group after that, unless the worker is waiting on an answer.
     """
     shown = {project, *others}
     dead = dead or {}
@@ -540,6 +541,7 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
     asking = [question for question in questions or []
               if str(question.get("task_id")) in ids or str(question.get("task_id")) not in known]
     waiting = {str(question.get("task_id")) for question in asking}
+    hung = {task: note for task, note in (hung or {}).items() if task not in {*dead, *stalled, *silent, *waiting}}
     lines: list[str] = question_lines(asking, owners, project, run)
     if not mine:
         return lines + ["bảng việc: chưa có task nào của repo này"]
@@ -553,7 +555,8 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
     gone = [task for task in mine if str(task.get("id")) in dead]
     halted = [task for task in mine if str(task.get("id")) in stalled]
     hushed = [task for task in mine if str(task.get("id")) in silent]
-    apart = {*dead, *stalled, *silent}
+    frozen = [task for task in mine if str(task.get("id")) in hung]
+    apart = {*dead, *stalled, *silent, *hung}
     groups = orca.reconcile([task for task in mine if str(task.get("id")) not in apart])
     groups["running"] = [task for task in groups["running"] if str(task.get("id")) not in waiting]
     labels = {
@@ -577,6 +580,11 @@ def board_lines(tasks: list[dict[str, Any]], owners: dict[str, str], project: st
         lines += [f"{row(task)}: {silent[str(task.get('id'))]}" for task in hushed]
         lines.append("  việc cần làm: worker vừa được nhắc hoặc chờ nhắc lại thì không cần làm gì; worker 'cần người xử lý' thì đọc màn hình "
                      "terminal và diff của worktree: việc đã xong thì kiểm, gộp rồi `worker-settle`, chưa xong thì báo người dùng.")
+    if frozen:
+        lines.append(f"worker có thể bị treo, spinner vẫn chạy mà không có tiến triển ({len(frozen)}):")
+        lines += [f"{row(task)}: {hung[str(task.get('id'))]}" for task in frozen]
+        lines.append("  việc cần làm: đọc terminal của worker rồi mới quyết định (lệnh chạy lâu cũng trông như vậy); "
+                     "coding-agent không ngắt và không gõ gì vào terminal đó.")
     for key, label in labels.items():
         items = groups.get(key) or []
         if not items:
@@ -699,7 +707,8 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
         watcher.ensure_running(root, run, session=session)
     lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]}, questions,
                         resume.quiet_minutes(found), run=orca_cli.run_id(run), stalled=resume.board_notes(found),
-                        silent=resume.silent_notes(found), models=worker_models(roots), dead=resume.dead_notes(found))
+                        silent=resume.silent_notes(found), models=worker_models(roots), dead=resume.dead_notes(found),
+                        hung=resume.stuck_notes(found))
     if activity_error:
         lines.append(f"câu hỏi của worker không đọc được: {activity_error}")
     try:

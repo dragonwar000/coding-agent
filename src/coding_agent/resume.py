@@ -26,6 +26,27 @@ A worker is alive or dead by its terminal: `stalled_workers` asks Orca about the
 is not `working` (`terminal_death`), and a closed terminal or an agent that left it is `dead`. `watcher` turns the
 findings that no resume or reminder can fix into one escalation to the coordinator.
 
+A worker that hangs with its spinner on (2026-11-23): `classify` calls any screen with a spinner `working`, and the
+spinner's timer keeps counting whatever the agent does. `track_stuck` calls a `working` worker `stuck` when nothing has
+progressed for `stuck_after_s()` (`CODING_AGENT_STUCK_MINUTES`, default 20; `off` or `0` turns it off). It only reports:
+nothing here interrupts a stuck worker, types into its terminal or marks it dead.
+
+The primary signal is the modification time of the worker's Claude Code transcript and of its subagents' transcripts.
+Measured on Claude Code under Orca (2026-11-23), with a headless session and a hook that dumped its stdin:
+- `SessionStart`, `UserPromptSubmit` and `Stop` payloads all carry `session_id` and `transcript_path`, and the file's name
+  is `<session_id>.jsonl`. At `SessionStart` and `UserPromptSubmit` of a new session the file does not exist yet.
+- `orca terminal show` exposes no session id or transcript path, so the `prompt-reset` hook records them
+  (`remember_transcript`) in `TRANSCRIPTS`, next to the workers ledger, keyed by task and dispatch.
+- Subagents write to `<session_id>/subagents/agent-*.jsonl`, so a worker waiting on a subagent still shows progress.
+- The transcript got no write during a 239-second foreground Bash call. A foreground tool call running longer than the
+  threshold therefore looks stuck; the report says so, and the coordinator reads the terminal before deciding.
+
+The fallback, for a worker with no known transcript (a Codex worker, a missing record, a file not created yet), is a
+fingerprint of the screen above the prompt with the spinner line, elapsed timers, token counters, tips and the mode
+footer removed (`progress_fingerprint`), tracked over the scans like `track_idle`. Assumption, not measured: Codex prints
+its elapsed time in a form `TIMER` matches. A path that is not `<session_id>.jsonl` is not recorded, because how such a
+file is written was not measured.
+
 The stalled screen of 2026-10-12 was not measured on a live terminal: `classify` lists what was measured and what is assumed.
 """
 
@@ -63,6 +84,10 @@ IDLE_FORGET_S = 86400    # an idle record not seen by any scan for this long is 
 LEDGER = Path(".coding-agent") / "resumes.jsonl"
 SCAN_FILE = Path(".coding-agent") / "state" / "resume-scan.json"
 IDLE_FILE = Path(".coding-agent") / "state" / "idle-since.json"
+STUCK_ENV = "CODING_AGENT_STUCK_MINUTES"
+STUCK_AFTER_S = 1200     # a working worker with no progress for this long is `stuck` (20 minutes)
+STUCK_FILE = Path(".coding-agent") / "state" / "progress.json"
+TRANSCRIPTS = "coding-agent-transcripts.jsonl"  # next to the workers ledger, so every worktree of a repository shares it
 DONE_STATUSES = frozenset({"completed", "failed"})
 
 # An agent's own error line: `API Error: ...`, bare or behind the turn bullet. Text a tool printed is indented deeper
@@ -74,6 +99,10 @@ TURN_LINE = re.compile(r"^\s*[⏺●]\s*\S")
 # of a finished turn (`✻ Worked for 3h 5m · done 9:24 PM`) has no ellipsis.
 SPINNER_LINE = re.compile(r"^\s*[^\s\w⏺●⎿❯]\s+[A-Z][a-z]+…")
 RULE_LINE = re.compile(r"^[\s─━═╭╮╰╯│-]+$")
+# What changes on a screen while nothing progresses: elapsed time, token counts, and the tip under the spinner.
+TIMER = re.compile(r"\b\d+(?:\.\d+)?\s?(?:ms|[hms])\b")
+TOKENS = re.compile(r"[↑↓]?\s*\d+(?:[.,]\d+)?k?\s*tokens?\b", re.IGNORECASE)
+TIP_LINE = re.compile(r"^\s*(?:⎿\s*)?Tip:")
 # What makes an `API Error` line transient: waiting and trying again can fix it. Extend here, with a test, and keep each
 # mark tight: a permanent error (`PERMANENT_MARKS`) wins anyway, but an unknown error must stay `blocked`.
 TRANSIENT_MARKS = (
@@ -97,11 +126,13 @@ PERMANENT = re.compile("|".join(PERMANENT_MARKS), re.IGNORECASE)
 
 @dataclass(frozen=True)
 class Screen:
-    """One screen sorted by `classify`. `error` is the error line; `fingerprint` identifies the lines above the prompt."""
+    """One screen sorted by `classify`. `error` is the error line; `fingerprint` identifies the lines above the prompt;
+    `progress` is a `working` screen's `progress_fingerprint`."""
 
     state: str
     error: str = ""
     fingerprint: str = ""
+    progress: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,7 +142,9 @@ class Finding:
     `state` is `classify`'s, `silent` (`nudge_silent`), or `dead` (`terminal_death`; `error` then says why). `title` is
     the task's title. `action` is empty for a worker that needs nothing. `attempt` counts the resumes sent to the dispatch so far, or
     for a `silent` worker the reminders (`nudge_silent`). `status` is the task's status; `idle_s` how long the screen
-    has been idle and unchanged, as far as the scans saw.
+    has been idle and unchanged, as far as the scans saw. `stuck` is a `working` worker with no progress for
+    `stuck_after_s()` (`track_stuck`): `stuck_s` is how long, `signal` what measured it (`transcript` or `screen`), and
+    `episode` names this stretch without progress, so it is reported once and a later one can be reported again.
     """
 
     task_id: str
@@ -125,10 +158,14 @@ class Finding:
     status: str = ""
     idle_s: int = 0
     title: str = ""
+    progress: str = ""
+    stuck_s: int = 0
+    signal: str = ""
+    episode: str = ""
 
     @property
     def attention(self) -> bool:
-        return self.state in ("stalled", "blocked", "silent", "dead")
+        return self.state in ("stalled", "blocked", "silent", "dead", "stuck")
 
     @property
     def halted(self) -> bool:
@@ -148,6 +185,21 @@ def silent_after_s() -> float | None:
         minutes = float(value)
     except ValueError:
         return float(SILENT_AFTER_S)
+    return minutes * 60 if minutes > 0 else None
+
+
+def stuck_after_s() -> float | None:
+    """How long a `working` worker may show no progress: `CODING_AGENT_STUCK_MINUTES` (20 by default; a number of minutes,
+    fractions allowed). `off` or `0` turns the check off and answers None."""
+    value = os.environ.get(STUCK_ENV, "").strip().lower()
+    if not value:
+        return float(STUCK_AFTER_S)
+    if value in ("off", "false", "no"):
+        return None
+    try:
+        minutes = float(value)
+    except ValueError:
+        return float(STUCK_AFTER_S)
     return minutes * 60 if minutes > 0 else None
 
 
@@ -182,6 +234,15 @@ def _error_text(lines: list[str], index: int) -> str:
     return " ".join(parts)
 
 
+def progress_fingerprint(lines: list[str]) -> str:
+    """A hash of `lines` (a screen above its prompt) without what moves while nothing progresses: the spinner line,
+    elapsed timers, token counters, tips, rules and the mode footer."""
+    kept = [TOKENS.sub("#", TIMER.sub("#", line.strip())) for line in lines
+            if line.strip() and not SPINNER_LINE.match(line) and not RULE_LINE.match(line) and not TIP_LINE.match(line)
+            and not line.strip().startswith("⏵⏵")]
+    return hashlib.sha256("\n".join(kept).encode("utf-8")).hexdigest()[:16]
+
+
 def classify(screen: str) -> Screen:
     """Sort one worker screen into `working`, `idle`, `stalled`, `blocked` or `unreadable`.
 
@@ -211,7 +272,7 @@ def classify(screen: str) -> Screen:
     # Earlier `❯ text` lines are the user's messages, and a resume leaves one; only the last is the prompt itself.
     current = "\n".join(line for index, line in enumerate(lines) if index not in prompts[:-1])
     if not orca_cli._composer_idle(current) or any(SPINNER_LINE.match(line) for line in lines[:composer]):
-        return Screen("working")
+        return Screen("working", progress=progress_fingerprint(lines[:composer]))
     window = [line for line in lines[:composer] if line.strip() and not RULE_LINE.match(line)][-WINDOW_LINES:]
     fingerprint = hashlib.sha256("\n".join(line.strip() for line in window).encode("utf-8")).hexdigest()[:16]
     found = [index for index, line in enumerate(window) if ERROR_LINE.match(line) or PERMANENT_LINE.match(line)]
@@ -284,7 +345,7 @@ def stalled_workers(root: Path, run: str | None = None, *, task_ids: list[str] |
             seen = Screen("dead", error=death, fingerprint=seen.fingerprint)
         found.append(Finding(task_id=task_id, dispatch=dispatch["id"], terminal=dispatch["assignee_handle"], state=seen.state,
                              error=seen.error, fingerprint=seen.fingerprint, status=str(task.get("status") or ""),
-                             title=str(task.get("task_title") or task.get("title") or "")))
+                             title=str(task.get("task_title") or task.get("title") or ""), progress=seen.progress))
     return found
 
 
@@ -297,7 +358,8 @@ def resume_text(task_id: str) -> str:
 def history(root: Path) -> list[dict[str, Any]]:
     """Every resume recorded in the ledger, oldest first."""
     try:
-        lines = (root / LEDGER).read_text(encoding="utf-8").splitlines()
+        # A damaged byte costs its own line (it fails to parse below), not the whole ledger.
+        lines = (root / LEDGER).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
     out: list[dict[str, Any]] = []
@@ -417,6 +479,130 @@ def track_idle(root: Path, findings: list[Finding], now: float | None = None) ->
     return out
 
 
+def transcripts_file(root: Path) -> Path:
+    """Where the workers' transcript paths are kept: next to the workers ledger of `root`'s repository."""
+    return orca_cli.workers_ledger(root).with_name(TRANSCRIPTS)
+
+
+def _read_transcripts(path: Path) -> dict[tuple[str, str], str]:
+    """(task, dispatch) to its latest transcript path in one `TRANSCRIPTS` file. A damaged line is skipped."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("transcript_path"), str):
+            out[(str(record.get("task_id") or ""), str(record.get("dispatch") or ""))] = record["transcript_path"]
+    return out
+
+
+def remember_transcript(cwd: Path, record: dict[str, Any], transcript_path: Any, session_id: Any) -> bool:
+    """Record the transcript of the worker `record` describes, from a hook payload. True when a line was written.
+
+    Only a path named `<session_id>.jsonl` is kept (measured for Claude Code, see the module docstring). The file need
+    not exist yet. A line is written only when the dispatch's transcript changed.
+    """
+    if not isinstance(transcript_path, str) or not isinstance(session_id, str) or not session_id:
+        return False
+    if Path(transcript_path).name != f"{session_id}.jsonl":
+        return False
+    path = transcripts_file(cwd)
+    task, dispatch = str(record.get("task_id") or ""), str(record.get("dispatch") or "")
+    if _read_transcripts(path).get((task, dispatch)) == transcript_path:
+        return False
+    orca_cli._append(path, {"ts": int(time.time()), "task_id": task, "dispatch": dispatch, "worktree": str(record.get("worktree") or ""),
+                            "session_id": session_id, "transcript_path": transcript_path})
+    return True
+
+
+def _known_transcripts(root: Path) -> dict[tuple[str, str], str]:
+    """Every recorded transcript, over every repository this coordinator delegated into."""
+    known: dict[tuple[str, str], str] = {}
+    for place in orca_cli.all_roots(root):
+        known.update(_read_transcripts(transcripts_file(place)))
+    return known
+
+
+def transcript_write(path: str) -> float | None:
+    """The latest modification time of a transcript and its subagents' transcripts, or None when the file is not there."""
+    try:
+        latest = os.stat(path).st_mtime
+    except OSError:
+        return None
+    try:
+        with os.scandir(Path(path).with_suffix("") / "subagents") as entries:
+            for entry in entries:
+                if entry.name.endswith(".jsonl"):
+                    latest = max(latest, entry.stat().st_mtime)
+    except OSError:
+        pass
+    return latest
+
+
+def _number(value: Any, default: float) -> float:
+    """`value` as a float, or `default` for what a damaged state file may hold there."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def track_stuck(root: Path, findings: list[Finding], now: float | None = None) -> list[Finding]:
+    """Turn each `working` finding with no progress for `stuck_after_s()` into `stuck`. Reads files only; sends nothing.
+
+    With a known transcript the time without progress is `now` minus its last write (`transcript_write`), and the
+    episode is that write. Without one it is how long `progress_fingerprint` has stood still over the scans, kept in
+    `STUCK_FILE`, and the episode is when it last changed; the first scan that sees a screen starts the clock. A worker
+    seen in any other state is forgotten, except on an unreadable screen, which changes nothing. Any write or screen
+    change ends the episode, so a worker that sticks again later is a new one. `CODING_AGENT_STUCK_MINUTES=off` leaves
+    every finding as it is.
+    """
+    after = stuck_after_s()
+    if after is None:
+        return findings
+    now = time.time() if now is None else now
+    path = root / STUCK_FILE
+    seen = _load_json(path)
+    known: dict[tuple[str, str], str] | None = None
+    out: list[Finding] = []
+    for item in findings:
+        key = item.dispatch or item.task_id
+        if item.state != "working":
+            if item.state != "unreadable":
+                seen.pop(key, None)
+            out.append(item)
+            continue
+        known = _known_transcripts(root) if known is None else known
+        # A hook can fire before the ledger names the dispatch (`""`), and an adopted worker has none of its own.
+        transcript = next((known[(item.task_id, name)] for name in (item.dispatch, "", "adopted") if (item.task_id, name) in known), None)
+        written = transcript_write(transcript) if transcript else None
+        if written is not None:
+            seen.pop(key, None)
+            signal, since, episode = "transcript", written, f"transcript:{written}"
+        else:
+            record = seen.get(key)
+            if not isinstance(record, dict) or record.get("fingerprint") != item.progress:
+                record = {"since": now, "fingerprint": item.progress}
+            record["seen"] = now
+            seen[key] = record
+            since = _number(record.get("since"), now)
+            signal, episode = "screen", f"screen:{since}"
+        quiet = max(0, int(now - since))
+        out.append(replace(item, state="stuck" if quiet >= after else item.state, stuck_s=quiet, signal=signal, episode=episode))
+    kept = {key: record for key, record in seen.items()
+            if isinstance(record, dict) and now - _number(record.get("seen"), 0) < IDLE_FORGET_S}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(kept, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+    return out
+
+
 def _reported(run: str | None) -> set[tuple[str, str]]:
     """(task, dispatch) of every `worker_done` in the coordinator's inbox that Orca has not marked handled (`check --peek`),
     acknowledged per task or not; dispatch is empty when the report names none."""
@@ -502,18 +688,18 @@ def nudge_silent(root: Path, findings: list[Finding], run: str | None = None, *,
 
 def scan(root: Path, run: str | None = None, *, task_ids: list[str] | None = None, dry_run: bool = False, session: str = "cli",
          tasks: list[dict[str, Any]] | None = None, budget_s: float | None = None) -> list[Finding]:
-    """Read every unsettled worker, resume the stalled ones and remind the silent ones. Raises `orca_cli.OrcaError` when
-    the tasks cannot be listed. `budget_s` covers both steps."""
+    """Read every unsettled worker, resume the stalled ones, remind the silent ones and mark the stuck ones. Raises
+    `orca_cli.OrcaError` when the tasks cannot be listed. `budget_s` covers the resumes and the reminders."""
     deadline = None if budget_s is None else time.monotonic() + budget_s
     found = resume_stalled(root, stalled_workers(root, run, task_ids=task_ids, tasks=tasks), dry_run=dry_run, session=session,
                            budget_s=budget_s)
-    return nudge_silent(root, found, run, dry_run=dry_run, session=session, deadline=deadline)
+    return track_stuck(root, nudge_silent(root, found, run, dry_run=dry_run, session=session, deadline=deadline))
 
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):  # ValueError: bad JSON, or bytes that are not UTF-8
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -593,6 +779,13 @@ def dead_notes(findings: list[Finding]) -> dict[str, str]:
     return {item.task_id: f"worker chết, cần người xử lý — {item.error}" for item in findings if item.state == "dead"}
 
 
+def stuck_notes(findings: list[Finding]) -> dict[str, str]:
+    """Task id to what the board says about a worker whose spinner runs with no progress."""
+    measured = {"transcript": "transcript không được ghi", "screen": "màn hình không đổi ngoài spinner"}
+    return {item.task_id: f"{_minutes(item.stuck_s)} phút không có tiến triển ({measured.get(item.signal, item.signal)})"
+            for item in findings if item.state == "stuck"}
+
+
 def quiet_minutes(findings: list[Finding]) -> dict[str, int]:
     """Task id to how many minutes a worker's screen has stood idle and unchanged (`track_idle`), for the ones it has.
 
@@ -648,6 +841,8 @@ def describe(item: Finding) -> str:
         "send-failed": "stalled, the resume could not be sent to its terminal",
         "blocked": "BLOCKED by an error a retry does not fix, not resumed: needs a person",
     }).get(item.action) or ("working again" if item.state == "working" else f"DEAD: {item.error}" if item.state == "dead"
+                             else f"STUCK: spinner on, no progress for {_minutes(item.stuck_s)} min ({item.signal}), not interrupted"
+                             if item.state == "stuck"
                              else f"{item.state}, no API error on screen")
     return f"worker-resume: {item.task_id} {said}" + (f": {item.error}" if item.error and item.attention and item.state != "dead" else "")
 

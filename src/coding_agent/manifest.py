@@ -27,6 +27,8 @@ AUTO_DECIDE_TIMEOUT_S = (10, 3600)
 FABLE_TIMEOUT_S = (10, 600)
 RATCHET_DIRECTIONS = ("max", "min")
 GROUNDING = ("off", "shadow", "enforce")
+NOTIFY_MODES = ("off", "on")
+NOTIFY_TIMEOUT_S = (1, 120)
 
 
 class ManifestError(ValueError):
@@ -105,6 +107,14 @@ class Evaluator:
 
 
 @dataclass(frozen=True)
+class Notify:
+    """The command the worker watcher runs to tell a person about a death, a stuck worker or its own failure (`notify.py`)."""
+    mode: str = "off"
+    command: tuple[str, ...] = ()
+    timeout_s: int = 10
+
+
+@dataclass(frozen=True)
 class Manifest:
     path: Path
     verified: bool
@@ -123,6 +133,7 @@ class Manifest:
     auto_decide: AutoDecide = field(default_factory=AutoDecide)
     ratchet: Ratchet = field(default_factory=Ratchet)
     evaluator: Evaluator = field(default_factory=Evaluator)
+    notify: Notify = field(default_factory=Notify)
 
     @property
     def root(self) -> Path:
@@ -242,6 +253,24 @@ def evaluator_from(raw: Any) -> Evaluator:
         timeout_s=_require_int(raw.get("timeout_s", 180), "evaluator.timeout_s", 1),
         grounding=grounding,
     )
+
+
+def notify_from(raw: Any) -> Notify:
+    """The notify settings; a missing block is `off`, a wrong value raises ManifestError."""
+    if raw is None:
+        return Notify()
+    if not isinstance(raw, dict):
+        raise ManifestError("notify must be a mapping")
+    mode = raw.get("mode", "off")
+    if isinstance(mode, bool):
+        raise ManifestError("notify.mode is a YAML boolean: quote 'off' or 'on', since unquoted they parse as false and true")
+    if mode not in NOTIFY_MODES:
+        raise ManifestError(f"notify.mode must be one of {', '.join(NOTIFY_MODES)}")
+    command = _str_list(raw.get("command", []), "notify.command")
+    if mode == "on" and not command:
+        raise ManifestError("notify.mode is 'on' and needs a command: an argv list, run without a shell")
+    return Notify(mode=mode, command=command,
+                  timeout_s=_require_range(raw.get("timeout_s", 10), "notify.timeout_s", *NOTIFY_TIMEOUT_S))
 
 
 def _hook(item: Any, seen: set[str]) -> Hook:
@@ -376,4 +405,5 @@ def load(path: Path) -> Manifest:
         auto_decide=auto_decide_from(raw.get("auto_decide")),
         ratchet=ratchet_from(raw.get("ratchet")),
         evaluator=evaluator_from(raw.get("evaluator")),
+        notify=notify_from(raw.get("notify")),
     )

@@ -95,6 +95,15 @@ evaluator:
   timeout_s: 180              # ASSUMPTION: 3 phút là đủ để Haiku đọc workspace và trả báo cáo
   grounding: shadow
 
+# Báo cho người (tuỳ chọn, mặc định tắt): `worker-watch` chạy `command` khi báo worker chết, worker treo, hoặc chính nó lỗi.
+# `command` là danh sách argv, chạy không qua shell. Nội dung đi qua biến môi trường CODING_AGENT_NOTIFY_KIND (death, stuck,
+# watch-failing), _TASK_ID, _DISPATCH, _TERMINAL, _TITLE, _REASON. Lệnh lỗi hoặc quá timeout_s (1 đến 120) chỉ ghi event
+# `notify-failed`, watcher vẫn chạy. Ví dụ macOS và webhook: xem README, mục "Báo cho người".
+notify:
+  mode: "off"                 # "off" | "on" (phải có nháy: YAML đọc off/on không nháy thành true/false)
+  command: []
+  timeout_s: 10
+
 # Hook. `mode` có ba giá trị: off (không chạy), shadow (ghi quyết định, không chặn), enforce (được chặn).
 # Mặc định là shadow (FR-010). Mọi hook không off bắt buộc có `assumption`: câu nêu điều hook giả định về model.
 # Chỉ hook đã khai enforce mới được chặn. Hiện orca-guard (FR-009), stop-gate (SC-002), coordinator-guard (bắt buộc chia việc theo graph) và coordinator-heartbeat (chặn lượt chỉ có heartbeat) ở enforce.

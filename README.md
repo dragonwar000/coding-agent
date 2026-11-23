@@ -29,6 +29,7 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/install.py` | Cài và gỡ an toàn: không xoá thư mục không có dấu của harness |
 | `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-watch`, `worker-settle`, `wiki-sync`, `wikieval` |
 | `src/coding_agent/watcher.py` | `worker-watch`: theo dõi worker bằng terminal (không model, không heartbeat), báo coordinator đúng một lần khi worker chết hoặc kẹt |
+| `src/coding_agent/notify.py` | Khối `notify` (mặc định tắt): chạy lệnh argv của người dùng để báo cho người khi watcher báo sự cố |
 | `src/coding_agent/wiki/` | Công cụ wiki của dự án: neo đồng bộ code→wiki (`sync.py`) và bộ eval goldens (`evaluate.py`) |
 | `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
 | `install.sh` | Lệnh một dòng cho `project_install` |
@@ -621,7 +622,71 @@ coordinator khi worker chết hoặc kẹt hẳn.
   mới báo. Báo bằng MỘT tin `orca orchestration send --to run:<run> --type escalation`, subject `worker dead: <tên task>`, body
   có task id, dispatch id, terminal, lý do và các dòng cuối màn hình (tối đa 15 dòng). Lần báo ghi vào `.coding-agent/resumes.jsonl`
   với `kind: death`, nên mỗi dispatch chỉ được báo một lần; Orca từ chối thì lượt sau gửi lại. Vòng lặp tự thoát khi không còn
-  dispatch chưa xong nào chưa bị báo. Event `guard: worker-watch`: `started`, `start-failed`, `reported`, `report-failed`.
+  dispatch chưa xong nào chưa bị báo. Event `guard: worker-watch`: `started`, `start-failed`, `reported`, `report-failed`, `watch-failing`, `recovered`.
+- **Watcher không chết vì một lượt quét lỗi:** mọi `Exception` của một lượt quét hoặc của báo cáo một worker (file state hỏng, lỗi
+  JSON, không ghi được sổ) được bắt, in một dòng cho mỗi lỗi khác nhau, rồi quét tiếp; `KeyboardInterrupt` và `SystemExit` vẫn dừng
+  vòng lặp. Sau 5 lượt lỗi liên tiếp, watcher gửi MỘT escalation subject `worker-watch failing` kèm lỗi cuối, ghi vào sổ với
+  `kind: watch-failing`, nên không lặp lại (kể cả sau khi khởi động lại) cho đến khi có một lượt quét thành công (`kind: watch-recovered`).
+- **Worker treo mà spinner vẫn chạy (`stuck`):** màn hình có spinner là `working`, nhưng đồng hồ spinner vẫn đếm dù agent không làm
+  gì. Worker `working` không có tiến triển trong `CODING_AGENT_STUCK_MINUTES` phút (mặc định `20`, số lẻ được; `off` hoặc `0` là tắt)
+  thành `stuck`. Tín hiệu chính là thời điểm ghi transcript Claude Code của worker và của subagent (`<session>/subagents/*.jsonl`).
+  Đo ngày 2026-11-23: payload của `SessionStart`, `UserPromptSubmit`, `Stop` đều có `session_id` và `transcript_path`, Orca không lộ
+  hai giá trị đó, nên hook `prompt-reset` ghi chúng vào `coding-agent-transcripts.jsonl` cạnh sổ worker, theo task và dispatch.
+  Không biết transcript (worker Codex, thiếu bản ghi, file chưa tạo) thì dùng dấu vân tay màn hình đã bỏ spinner, đồng hồ, số token, tip.
+  **Giới hạn đã đo:** một lệnh Bash foreground 239 giây không ghi gì vào transcript, nên lệnh chạy lâu hơn ngưỡng cũng trông như treo.
+  Vì vậy watcher chỉ báo: MỘT escalation `worker stuck: <tên task>` cho mỗi đợt không tiến triển (task, dispatch, terminal, số phút,
+  tín hiệu, các dòng cuối màn hình; ghi sổ `kind: stuck`). Không ngắt, không gõ vào terminal, không đánh dấu chết. Worker chạy tiếp
+  rồi lại treo thì được báo lần mới; worker đang chờ câu trả lời (`ask`) thì không báo. Bảng việc có nhóm riêng, lời khuyên: đọc
+  terminal rồi mới quyết định. Event `guard: worker-watch`: `stuck-reported`, `transcript-unrecorded`.
+- **Báo cho người (khối `notify`, mặc định tắt):** khi watcher báo worker chết, worker treo, hoặc chính nó lỗi, nó chạy `command`
+  trong `integration.yaml` đúng một lần cho mỗi sự kiện, kể cả khi Orca từ chối escalation. `command` là danh sách argv, không qua
+  shell. Nội dung nằm trong biến môi trường `CODING_AGENT_NOTIFY_KIND` (`death`, `stuck`, `watch-failing`), `_TASK_ID`, `_DISPATCH`,
+  `_TERMINAL`, `_TITLE`, `_REASON`. Lệnh lỗi hoặc chạy quá `timeout_s` (1 đến 120 giây, mặc định 10; quá giờ thì bị kill cả nhóm tiến
+  trình) chỉ ghi event `notify-failed`, không thử lại, watcher vẫn chạy. Event thành công là `notified`; sổ ghi `kind: notify`.
+
+  Thông báo macOS. Dùng JavaScript vì `system attribute` của AppleScript làm hỏng tiếng Việt (đã đo):
+
+  ```yaml
+  notify:
+    mode: "on"
+    timeout_s: 10
+    command:
+      - osascript
+      - -l
+      - JavaScript
+      - -e
+      - >-
+        ObjC.import("stdlib"); const app = Application.currentApplication(); app.includeStandardAdditions = true;
+        app.displayNotification($.getenv("CODING_AGENT_NOTIFY_REASON"), {withTitle: "coding-agent: " + $.getenv("CODING_AGENT_NOTIFY_KIND"),
+        subtitle: $.getenv("CODING_AGENT_NOTIFY_TITLE")});
+  ```
+
+  Webhook chung (cần curl 8.3 trở lên cho `--variable`; `:json` escape dấu nháy và xuống dòng). URL có chứa khoá bí mật thì đừng ghi
+  vào manifest được commit: đặt lệnh curl trong một script ngoài repo và để `command` gọi script đó.
+
+  ```yaml
+  notify:
+    mode: "on"
+    timeout_s: 10
+    command:
+      - curl
+      - -fsS
+      - --max-time
+      - "8"
+      - --variable
+      - "%CODING_AGENT_NOTIFY_KIND"
+      - --variable
+      - "%CODING_AGENT_NOTIFY_TASK_ID"
+      - --variable
+      - "%CODING_AGENT_NOTIFY_TITLE"
+      - --variable
+      - "%CODING_AGENT_NOTIFY_REASON"
+      - -H
+      - "Content-Type: application/json"
+      - --expand-data
+      - '{"text":"{{CODING_AGENT_NOTIFY_KIND:json}} {{CODING_AGENT_NOTIFY_TASK_ID:json}}: {{CODING_AGENT_NOTIFY_TITLE:json}} - {{CODING_AGENT_NOTIFY_REASON:json}}"}'
+      - https://hooks.example.com/REPLACE-ME
+  ```
 - **Tự chạy nền:** `delegate`, `plan-next` (khi có worker mới) và bảng việc (khi còn worker chưa xong) chạy nền `worker-watch`
   cho Run đó nếu chưa có cái nào chạy (vòng lặp ghi `.coding-agent/state/worker-watch.json` mỗi lượt; file cũ hơn 3 phút là
   vòng lặp đã mất). Log ở `.coding-agent/worker-watch.log`. Tắt bằng `CODING_AGENT_WORKER_WATCH=off`. `worker-resume --watch`
