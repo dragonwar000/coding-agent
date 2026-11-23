@@ -104,6 +104,12 @@ notify:
   command: []
   timeout_s: 10
 
+# Coordinator giao việc cho ai. orca (mặc định): worker Orca, mỗi node một worktree. subagent: subagent nội bộ của Claude Code
+# (tool Agent), dùng chung working tree; phiên chính vẫn không sửa file, không tạo task/worktree/terminal Orca.
+# Giá trị này được đọc từ manifest lúc chạy, không nằm trong lệnh hook. Đổi xong cài lại để có các hook subagent-* (sổ và bảng việc).
+coordinator:
+  dispatch: orca
+
 # Hook. `mode` có ba giá trị: off (không chạy), shadow (ghi quyết định, không chặn), enforce (được chặn).
 # Mặc định là shadow (FR-010). Mọi hook không off bắt buộc có `assumption`: câu nêu điều hook giả định về model.
 # Chỉ hook đã khai enforce mới được chặn. Hiện orca-guard (FR-009), stop-gate (SC-002), coordinator-guard (bắt buộc chia việc theo graph) và coordinator-heartbeat (chặn lượt chỉ có heartbeat) ở enforce.
@@ -159,6 +165,39 @@ hooks:
     event: UserPromptSubmit
     mode: shadow
     assumption: "Bảng việc đọc từ Orca ở mỗi prompt đủ mới để trả lời người dùng về tiến độ."
+  - id: subagent-assign
+    host: [claude_code]
+    event: PreToolUse
+    matcher: "Agent|Task"
+    mode: shadow
+    assumption: "Mỗi lời gọi Agent là một việc giao cho subagent; ghi lúc gọi, lời gọi bị từ chối sẽ không có SubagentStart và được đóng ở lần quét sau. Chỉ chạy khi coordinator.dispatch là subagent."
+  - id: subagent-started
+    host: [claude_code]
+    event: SubagentStart
+    mode: shadow
+    assumption: "SubagentStart cho biết agent_id của subagent vừa chạy. Chỉ ghi sổ, không chặn."
+  - id: subagent-stopped
+    host: [claude_code]
+    event: SubagentStop
+    mode: shadow
+    assumption: "SubagentStop báo subagent chạy xong, cả foreground và background (đo trên Claude Code 2.1.330). Chỉ ghi sổ, không chặn."
+  - id: subagent-result
+    host: [claude_code]
+    event: PostToolUse
+    matcher: "Agent|Task|TaskStop"
+    mode: shadow
+    assumption: "PostToolUse của Agent nối tool_use_id với agentId; với agent nền nó chạy lúc khởi động nên không đóng bản ghi. TaskStop không sinh SubagentStop nên được đóng ở đây."
+  - id: subagent-failed
+    host: [claude_code]
+    event: PostToolUseFailure
+    matcher: "Agent|Task"
+    mode: shadow
+    assumption: "PostToolUseFailure của Agent nghĩa là subagent không chạy được. Chỉ ghi sổ, không chặn."
+  - id: subagent-session-end
+    host: [claude_code]
+    event: SessionEnd
+    mode: shadow
+    assumption: "Phiên kết thúc thì subagent nền của nó không còn chạy; SessionStart kế tiếp đánh dấu các bản ghi còn mở là mất dấu."
   - id: auto-decide
     host: [claude_code]
     event: PreToolUse

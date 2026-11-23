@@ -87,6 +87,10 @@
 - `wikieval [--root DIR] [--evals-dir DIR] [--outputs FILE] [--check|--write-baseline|--self-test]`: the wiki goldens
   eval suite (`wiki/evaluate.py`); the baseline defaults to `<root>/harness/metrics/eval-baseline.json`.
   Both take their own options after the command name and touch neither Orca nor the memory store.
+- With `coordinator: {dispatch: subagent}` in the manifest of `--root` or of the coordinator's directory, `delegate`,
+  `worker-start`, `plan-apply` and `orca-create` are refused (exit 2) and touch nothing in Orca. `plan-next` prints the
+  ready nodes with their specs for the Agent tool, and `plan-next` and `plan-status` read node states from the subagent
+  ledger (`subagents.py`): a subagent whose description starts with `<node id>:` works on that node.
 """
 
 from __future__ import annotations
@@ -100,7 +104,7 @@ from pathlib import Path
 import os
 import uuid
 
-from coding_agent import autodecide, cleanup, coordinator, events, orca, orca_cli, resume, roots, watcher
+from coding_agent import autodecide, cleanup, coordinator, events, orca, orca_cli, resume, roots, subagents, watcher
 from coding_agent import plan as plan_graph
 from coding_agent.brief import BriefError, brief
 from coding_agent.hooks import utf8_output
@@ -248,6 +252,27 @@ def _read_inbox(args: argparse.Namespace, root: Path) -> list[dict]:
 
 
 WIKI_COMMANDS = {"wiki-sync": wiki_sync.main, "wikieval": wiki_eval.main}
+# With `dispatch: subagent` these would create Orca tasks or worktrees, and these two read the graph from the ledger.
+SUBAGENT_REFUSED = frozenset({"delegate", "worker-start", "plan-apply", "orca-create"})
+SUBAGENT_GRAPH = frozenset({"plan-next", "plan-status"})
+
+
+def _subagent_dispatch(args: argparse.Namespace, root: Path) -> int | None:
+    """The exit code when `dispatch: subagent` answers this command without Orca, else None."""
+    if args.command not in SUBAGENT_REFUSED | SUBAGENT_GRAPH:
+        return None
+    if "subagent" not in {subagents.dispatch_mode(root), subagents.dispatch_mode(orca_cli.coordinator_root())}:
+        return None
+    if args.command in SUBAGENT_REFUSED:
+        print(subagents.REFUSAL.format(command=args.command), file=sys.stderr)
+        return 2
+    try:
+        nodes = plan_graph.load(args.file, default_agent=getattr(args, "agent", None))
+    except (plan_graph.PlanError, OSError) as error:
+        print(f"cli: {error}", file=sys.stderr)
+        return 1
+    print("\n".join(subagents.plan_lines(root, nodes, ready_specs=args.command == "plan-next")))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -372,6 +397,9 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     root = _root(args.root)
+    answered = _subagent_dispatch(args, root)
+    if answered is not None:
+        return answered
     orca_cli.use_stored_run(root)
     if args.command in TERMINAL_RUN and getattr(args, "run", None) is None:
         note = orca_cli.sync_bound_run(root)

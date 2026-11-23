@@ -29,6 +29,8 @@ RATCHET_DIRECTIONS = ("max", "min")
 GROUNDING = ("off", "shadow", "enforce")
 NOTIFY_MODES = ("off", "on")
 NOTIFY_TIMEOUT_S = (1, 120)
+# Who does the coordinator's work: `orca` workers in their own worktrees, or in-process `subagent`s (`subagents.py`).
+DISPATCH_MODES = ("orca", "subagent")
 
 
 class ManifestError(ValueError):
@@ -115,6 +117,12 @@ class Notify:
 
 
 @dataclass(frozen=True)
+class CoordinatorSettings:
+    """`coordinator:` of the manifest. Read at run time, never baked into a generated hook command."""
+    dispatch: str = "orca"
+
+
+@dataclass(frozen=True)
 class Manifest:
     path: Path
     verified: bool
@@ -134,6 +142,7 @@ class Manifest:
     ratchet: Ratchet = field(default_factory=Ratchet)
     evaluator: Evaluator = field(default_factory=Evaluator)
     notify: Notify = field(default_factory=Notify)
+    coordinator: CoordinatorSettings = field(default_factory=CoordinatorSettings)
 
     @property
     def root(self) -> Path:
@@ -273,6 +282,21 @@ def notify_from(raw: Any) -> Notify:
                   timeout_s=_require_range(raw.get("timeout_s", 10), "notify.timeout_s", *NOTIFY_TIMEOUT_S))
 
 
+def coordinator_from(raw: Any) -> CoordinatorSettings:
+    """The coordinator settings; a missing block is `dispatch: orca`, a wrong value or an unknown key raises ManifestError."""
+    if raw is None:
+        return CoordinatorSettings()
+    if not isinstance(raw, dict):
+        raise ManifestError("coordinator must be a mapping")
+    unknown = sorted(str(key) for key in raw if key != "dispatch")
+    if unknown:
+        raise ManifestError(f"coordinator has unknown keys: {', '.join(unknown)}")
+    dispatch = raw.get("dispatch", "orca")
+    if dispatch not in DISPATCH_MODES:
+        raise ManifestError(f"coordinator.dispatch must be one of {', '.join(DISPATCH_MODES)}")
+    return CoordinatorSettings(dispatch=dispatch)
+
+
 def _hook(item: Any, seen: set[str]) -> Hook:
     if not isinstance(item, dict):
         raise ManifestError("each hooks entry must be a mapping")
@@ -406,4 +430,5 @@ def load(path: Path) -> Manifest:
         ratchet=ratchet_from(raw.get("ratchet")),
         evaluator=evaluator_from(raw.get("evaluator")),
         notify=notify_from(raw.get("notify")),
+        coordinator=coordinator_from(raw.get("coordinator")),
     )
