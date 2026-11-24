@@ -25,6 +25,7 @@ once the coordinator has checked the result.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -120,7 +122,7 @@ def bound_run() -> str | None:
     except OrcaError:
         return None
     result = answer.get("result") if isinstance(answer, dict) else None
-    run = result.get("run") if isinstance(result, dict) else None
+    run = (result.get("run") or result.get("runId")) if isinstance(result, dict) else None  # `runId`: the concise view
     if isinstance(run, dict):
         run = run.get("id") or run.get("runId")
     return run if isinstance(run, str) and run else None
@@ -268,19 +270,91 @@ def run_init(root: Path, objective: str) -> str:
     """Create an Orca Run from this terminal and store its id for later commands and hooks. Returns the Run id.
 
     Assumption, unverified against a live Orca: run-create answers the id at `result.run.id`, `result.id`, or `result.runId`.
+    An answer whose id cannot be read is not created again by the next call (`_create`).
     """
-    answer = _call("run-create", "--objective", objective)
+    intent = _create_intent(root, "run", [objective])
+    answer = _create(root, intent, "run-create", "--objective", objective)
     result = answer.get("result") if isinstance(answer, dict) else None
     run = None
     if isinstance(result, dict):
         nested = result.get("run")
         run = (nested.get("id") if isinstance(nested, dict) else None) or result.get("runId") or result.get("id")
     if not isinstance(run, str) or not run:
-        raise OrcaError("the run-create answer has no run id")
+        raise OrcaError(f"the run-create answer has no run id; run-init again to read the same Run (request {intent['request']})")
     path = root / RUN_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(run + "\n", encoding="utf-8")
+    _create_done(root, intent)
     return run
+
+
+# --- creating once ----------------------------------------------------------------------------------------------------
+
+CREATES_FILE = Path(".coding-agent") / "state" / "orca-creates.json"
+CREATE_KEEP_S = 7 * 86400
+# Refusals that mean Orca applied nothing. Any other failure may have landed, so its request id is kept for the next try.
+NOT_APPLIED = ("invalid_argument", "run_required", "consumer_fenced", "run_not_found", "legacy_read_only",
+               "worker_cannot_coordinate_own_run")
+
+
+def _creates(root: Path) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads((root / CREATES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    now = time.time()
+    return {key: value for key, value in data.items()
+            if isinstance(value, dict) and isinstance(value.get("at"), (int, float)) and now - value["at"] < CREATE_KEEP_S}
+
+
+def _save_creates(root: Path, data: dict[str, dict[str, Any]]) -> None:
+    path = root / CREATES_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _create_intent(root: Path, kind: str, fields: list[Any], **kept: str) -> dict[str, Any]:
+    """The request for one create, written down before it is sent.
+
+    The same create whose earlier answer was never confirmed gets that attempt's request id and `kept` values back, so
+    Orca replays it (`--retry-request`, same id and same input) instead of making a second one. Once a create is
+    confirmed its record is dropped (`_create_done`), so asking for the same thing again later is a new create.
+    """
+    key = hashlib.sha256(json.dumps([kind, run_id(None) or "", *fields], ensure_ascii=False).encode("utf-8")).hexdigest()
+    data = _creates(root)
+    earlier = data.get(key)
+    if earlier is not None and isinstance(earlier.get("request"), str):
+        return {**earlier, "key": key, "replay": True}
+    record = {"request": str(uuid.uuid4()), "at": time.time(), **kept}
+    data[key] = record
+    _save_creates(root, data)
+    return {**record, "key": key, "replay": False}
+
+
+def _create_done(root: Path, intent: dict[str, Any]) -> None:
+    data = _creates(root)
+    if data.pop(intent["key"], None) is not None:
+        _save_creates(root, data)
+
+
+def _create(root: Path, intent: dict[str, Any], *args: str) -> Any:
+    """Send a create with its request id. A CLI without `--retry-request` gets it plainly, but never a second time."""
+    try:
+        return _call(*args, "--retry-request", intent["request"])
+    except OrcaRefused as error:
+        text = str(error)
+        if "--retry-request" in text and re.search(r"unknown (?:flag|option)", text, re.IGNORECASE):
+            if intent["replay"]:
+                raise OrcaError(f"an earlier {args[0]} may have succeeded and this Orca cannot replay it: "
+                                "check `orchestration task-list` before creating it again") from error
+            return _call(*args)
+        if any(f"{code}:" in text for code in NOT_APPLIED):
+            _create_done(root, intent)
+        raise
 
 
 def _run_args(run: str | None) -> list[str]:
@@ -305,7 +379,27 @@ def _command(*words: str) -> list[str]:
     return [*prefix, *words, "--json"]
 
 
+# Orca 1.4.271 prints a concise view of `orchestration` commands unless `--full` is passed: task rows lose `deps` and
+# `result`, messages lose `payload`, and `worker-show` loses `observation`. Orca 1.4.222 knows `--full` only on `inbox`.
+# A CLI that refuses the flag does so while parsing, before anything runs, so the command is safe to send again without it.
+FULL_REFUSED = re.compile(r"unknown (?:flag|option)\b.*--full\b", re.IGNORECASE)
+_no_full: set[str] = set()  # binaries that refused `--full`, so each is asked once per process
+
+
 def _run_orca(*words: str, timeout: float = TIMEOUT_S) -> Any:
+    """Run one Orca command, asking `orchestration` commands for the full record when the CLI knows `--full`."""
+    if words[0] != "orchestration" or "--full" in words or binary() in _no_full:
+        return _run_orca_once(*words, timeout=timeout)
+    try:
+        return _run_orca_once(*words, "--full", timeout=timeout)
+    except OrcaError as error:
+        if not FULL_REFUSED.search(str(error)):
+            raise
+    _no_full.add(binary())
+    return _run_orca_once(*words, timeout=timeout)
+
+
+def _run_orca_once(*words: str, timeout: float = TIMEOUT_S) -> Any:
     """Run one Orca command and return its parsed answer.
 
     An `ok: true` answer is returned even when the process exits non-zero: Orca uses the exit code for an
@@ -342,11 +436,14 @@ def _error_message(answer: dict[str, Any]) -> str:
 
 
 def task_id_of(answer: Any) -> str:
-    """The `task_xxx` id from a task-create or task-update answer. The envelope `id` is a different uuid."""
-    try:
-        return str(answer["result"]["task"]["id"])
-    except (KeyError, TypeError) as error:
-        raise OrcaError("the answer has no result.task.id") from error
+    """The `task_xxx` id from a task-create or task-update answer: `result.task.id`, or `result.taskId` in the concise
+    view of Orca 1.4.271. The envelope `id` is a different uuid."""
+    result = answer.get("result") if isinstance(answer, dict) else None
+    task = result.get("task") if isinstance(result, dict) else None
+    found = (task.get("id") if isinstance(task, dict) else None) or (result.get("taskId") if isinstance(result, dict) else None)
+    if not isinstance(found, str) or not found:
+        raise OrcaError("the answer has no result.task.id")
+    return found
 
 
 def tasks_of(answer: Any) -> list[dict[str, Any]]:
@@ -405,13 +502,22 @@ def create_task(root: Path, *, project: str, t_id: str, spec: str, title: str, r
     """Create an Orca task that carries the durable `T-id` and the `project`, then link the two ids (FR-006).
 
     `deps` are the Orca task ids this task depends on; Orca records them with the task. The spec ends with
-    `NO_HEARTBEAT`, which overrides the preamble's heartbeat instruction.
+    `NO_HEARTBEAT`, which overrides the preamble's heartbeat instruction. A create whose answer could not be read is
+    replayed by the next identical call, with the `t_id` of that first attempt, and makes no duplicate (`_create_intent`).
     """
+    intent = _create_intent(root, "task", [run_id(run) or "", project, title, spec, list(deps)], t_id=t_id)
+    t_id = intent["t_id"]
     header = f"project: {project}\nt_id: {t_id}\n\n"
     dep_args = ["--deps", json.dumps(list(deps))] if deps else []
     text = header + spec.rstrip("\n") + "\n\n" + NO_HEARTBEAT
-    task_id = task_id_of(_call("task-create", "--spec", text, "--task-title", title, *dep_args, *_run_args(run)))
+    answer = _create(root, intent, "task-create", "--spec", text, "--task-title", title, *dep_args, *_run_args(run))
+    try:
+        task_id = task_id_of(answer)
+    except OrcaError as error:
+        raise OrcaError(f"{error}; the task may exist. Running the same command again reads it without a duplicate "
+                        f"(request {intent['request']})") from error
     orca.link(root, t_id=t_id, task_id=task_id, project=project)
+    _create_done(root, intent)
     return task_id
 
 
@@ -617,6 +723,8 @@ def close_worktree_terminals(worktree: str) -> tuple[list[str], list[str]]:
         handle, path = terminal.get("handle"), terminal.get("worktreePath")
         if not (isinstance(handle, str) and handle and isinstance(path, str) and path and _same_dir(path, worktree)):
             continue
+        if handle == os.environ.get("ORCA_TERMINAL_HANDLE"):
+            continue  # the terminal running this command, which is the coordinator's
         try:
             _call_tool("terminal", "close", "--terminal", handle)
         except OrcaError as error:
@@ -1281,9 +1389,11 @@ def kickoff_text(task_id: str, dispatch: str) -> str:
 
 
 def dispatch_of(task_id: str) -> dict[str, Any]:
-    """The dispatch record of a task from `dispatch-show`: `{id, status, assignee_handle}` with both key spellings read.
+    """The dispatch record of a task from `dispatch-show`: `{id, status, assignee_handle, creator_handle,
+    process_incarnation}` with both key spellings read.
 
-    `dispatch-show` takes no `--run`; it reads the dispatch by task id alone.
+    `dispatch-show` takes no `--run`; it reads the dispatch by task id alone. `process_incarnation` is
+    `<ptyId>:<incarnationId>` of the process the dispatch went to (measured on Orca 1.4.222).
     """
     answer = _call("dispatch-show", "--task", task_id)
     result = answer.get("result") if isinstance(answer, dict) else None
@@ -1294,6 +1404,8 @@ def dispatch_of(task_id: str) -> dict[str, Any]:
         "id": str(record.get("id") or ""),
         "status": str(record.get("status") or ""),
         "assignee_handle": str(record.get("assignee_handle") or record.get("assigneeHandle") or ""),
+        "creator_handle": str(record.get("creator_handle") or record.get("creatorHandle") or ""),
+        "process_incarnation": str(record.get("process_incarnation") or record.get("processIncarnation") or ""),
     }
 
 
@@ -1339,6 +1451,86 @@ def terminal_state(handle: str) -> dict[str, Any]:
     if "agentIdentity" in terminal:
         out["agent"] = terminal.get("agentIdentity") or None
     return out
+
+
+def terminal_detail(handle: str) -> dict[str, Any] | None:
+    """Orca's full `terminal show` record, or None when the handle is stale (the terminal was closed)."""
+    try:
+        answer = _call_tool("terminal", "show", "--terminal", handle)
+    except OrcaRefused as error:
+        if any(code in str(error) for code in TERMINAL_GONE_CODES):
+            return None
+        raise
+    result = answer.get("result") if isinstance(answer, dict) else None
+    terminal = result.get("terminal", result) if isinstance(result, dict) else None
+    if not isinstance(terminal, dict):
+        raise OrcaError(f"terminal show answered no terminal for {handle}")
+    return terminal
+
+
+def terminals() -> list[dict[str, Any]]:
+    """Every live terminal Orca lists. A truncated list raises: a caller deciding what is safe needs all of it."""
+    answer = _call_tool("terminal", "list")
+    result = answer.get("result") if isinstance(answer, dict) else None
+    if not isinstance(result, dict) or result.get("truncated") or not isinstance(result.get("terminals"), list):
+        raise OrcaError("terminal list is truncated or has no terminals")
+    return [terminal for terminal in result["terminals"] if isinstance(terminal, dict)]
+
+
+def close_terminal(handle: str) -> None:
+    """Close exactly one terminal pane."""
+    _call_tool("terminal", "close", "--terminal", handle)
+
+
+def worker_observation(dispatch: str) -> dict[str, Any]:
+    """What `worker-show` observed: `{status, exact, wait_known, agent_wait, activity}`.
+
+    Orca documents `observation.agentWait`: null means it looked and found no wait, an absent field means it never
+    looked, so `wait_known` tells them apart. Measured on Orca 1.4.222: `status` is `live` or `exited`, and
+    `projection.stage.activity` is `working`, `done` or `unknown`.
+    """
+    answer = _call("worker-show", "--dispatch", dispatch)
+    result = answer.get("result") if isinstance(answer, dict) else None
+    result = result if isinstance(result, dict) else {}
+    observation = result.get("observation") if isinstance(result.get("observation"), dict) else {}
+    projection = result.get("projection") if isinstance(result.get("projection"), dict) else {}
+    stage = projection.get("stage") if isinstance(projection.get("stage"), dict) else {}
+    return {"status": str(observation.get("status") or ""), "exact": observation.get("exactWorker") is True,
+            "wait_known": "agentWait" in observation, "agent_wait": observation.get("agentWait"),
+            "activity": str(stage.get("activity") or "")}
+
+
+def pty_pids() -> dict[str, int]:
+    """Each terminal's root process by `ptyId`, from `diagnostics memory` (`worktrees[].sessions[]`, measured on Orca
+    1.4.222: `sessionId` equals the terminal's `ptyId`)."""
+    answer = _call_tool("diagnostics", "memory")
+    result = answer.get("result") if isinstance(answer, dict) else None
+    found: dict[str, int] = {}
+    for worktree in (result.get("worktrees") if isinstance(result, dict) else None) or []:
+        for session in (worktree.get("sessions") if isinstance(worktree, dict) else None) or []:
+            if isinstance(session, dict) and isinstance(session.get("pid"), int) and session.get("sessionId"):
+                found[str(session["sessionId"])] = session["pid"]
+    return found
+
+
+def unread_for_terminal(handle: str) -> list[dict[str, Any]]:
+    """Messages waiting in one terminal's mailbox, without marking them read. Heartbeats are not counted.
+
+    No `--run`: the terminal names the mailbox, and Orca 1.4.271 refuses `--run` from a worker of that Run.
+    """
+    answer = _call("check", "--terminal", handle, "--peek")
+    return [message for message in _messages(answer) if not is_heartbeat(message)]
+
+
+def run_mail(run: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """(every message of the Run, its worker reports not acknowledged in Orca, replies from any inbox). Reads only."""
+    messages = _messages(_call("check", "--all", *_run_args(run)))
+    unread = unread_reports(run)
+    try:
+        replies = _messages(_call("inbox", "--full", "--limit", str(INBOX_LIMIT)))
+    except OrcaError:
+        replies = []
+    return messages, unread, replies
 
 
 def escalate(*, run: str | None, subject: str, body: str, task_id: str = "", dispatch: str = "") -> None:

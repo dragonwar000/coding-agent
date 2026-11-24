@@ -802,6 +802,8 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
     found = resume.auto(root, tasks, run, session)
     if found:
         watcher.ensure_running(root, run, session=session)
+    else:
+        watcher.ensure_for_cleanup(root, run, session=session)
     lines = board_lines(tasks, owners, home, {orca.project_name(other) for other in roots[1:]}, questions,
                         resume.quiet_minutes(found), run=orca_cli.run_id(run), stalled=resume.board_notes(found),
                         silent=resume.silent_notes(found), models=worker_models(roots), dead=resume.dead_notes(found),
@@ -817,13 +819,14 @@ def _board(root: Path, run: str | None, session: str) -> tuple[list[str], str | 
     else:
         lines += report_lines(reports, plan_ids(roots), owners, home)
     try:
-        from coding_agent import cleanup
+        from coding_agent import cleanup, release
 
         warnings: list[str] = []
         found = cleanup.candidates(root, run, warnings=warnings, session=session)
         removed = {item.worktree for item, outcome in cleanup.auto_clean(root, run, session=session, found=found, warnings=warnings)
                    if outcome == "removed"}
-        lines = lines + cleanup.board_lines([item for item in found if item.worktree not in removed])
+        remaining = [item for item in found if item.worktree not in removed]
+        lines = lines + cleanup.board_lines(remaining) + release.board_lines(root, remaining)
         lines = lines + [f"dọn worktree, cảnh báo: {warning}" for warning in warnings]
     except orca_cli.OrcaError as error:
         lines.append(f"danh sách worktree chờ dọn không đọc được: {str(error)[:160]}")

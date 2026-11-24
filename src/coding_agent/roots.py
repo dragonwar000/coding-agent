@@ -103,7 +103,7 @@ def task_worktrees(run: str | None = None) -> dict[str, list[tuple[str, str]]]:
                 if (repo_id, path) not in out.setdefault(worker["taskId"], []):
                     out[worker["taskId"]].append((repo_id, path))
         page = result.get("page")
-        cursor = page.get("nextCursor") if isinstance(page, dict) else None
+        cursor = page.get("nextCursor") if isinstance(page, dict) else result.get("nextCursor")  # the concise view has it at the top
         if not cursor:
             break
     return out

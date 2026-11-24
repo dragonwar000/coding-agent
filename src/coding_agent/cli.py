@@ -36,6 +36,9 @@
   The same scan reminds a silent worker (task `dispatched`, screen idle and unchanged for `CODING_AGENT_SILENT_MINUTES`,
   default 10, and no `worker_done` in the inbox) through `orca orchestration send` and its terminal, twice at most;
   `--dry-run` lists stalled and silent workers alike.
+- `worker-sweep [--dry-run]`: one pass of `release.sweep`: end the agent sessions of finished workers whose report was
+  acknowledged and that have been idle for the grace period, keeping their worktrees. `--dry-run` prints each decision
+  and ends nothing. `CODING_AGENT_AUTO_RELEASE=off` turns it off.
 - `worker-watch [--task-id ID ...] [--interval SECONDS]`: the death watcher (`watcher.py`). Every `--interval` seconds
   (default 60) it runs the `worker-resume` scan (Orca CLI reads, no model, the same resumes and reminders) and reports a
   worker that is dead or stuck for good to the coordinator with ONE `escalation` (`worker dead: <task title>`, task and
@@ -106,7 +109,7 @@ from pathlib import Path
 import os
 import uuid
 
-from coding_agent import autodecide, cleanup, coordinator, events, orca, orca_cli, resume, roots, subagents, watcher
+from coding_agent import autodecide, cleanup, coordinator, events, orca, orca_cli, release, resume, roots, subagents, watcher
 from coding_agent import plan as plan_graph
 from coding_agent.brief import BriefError, brief
 from coding_agent.hooks import utf8_output
@@ -174,7 +177,7 @@ ROOT_REGISTERED = frozenset({"delegate", "plan-next"})
 # Commands that act in an Orca Run. Without `--run` they use the Run Orca has bound to this terminal ahead of the
 # shared `.coding-agent/orca-run` (`orca_cli.sync_bound_run`); `board` resolves it in `coordinator.read_board`.
 TERMINAL_RUN = frozenset({"orca-create", "orca-status", "claim", "status", "worker-start", "worker-adopt", "worker-kick",
-                          "worker-resume", "worker-watch", "worker-settle", "worktree-list", "worktree-clean", "inbox", "delegate", "plan-apply",
+                          "worker-resume", "worker-watch", "worker-sweep", "worker-settle", "worktree-list", "worktree-clean", "inbox", "delegate", "plan-apply",
                           "plan-next", "plan-status"})
 
 
@@ -344,6 +347,9 @@ def main(argv: list[str] | None = None) -> int:
     watching.add_argument("--task-id", action="append", default=[], help="only this task's worker (repeatable; default: every unsettled worker of the Run)")
     watching.add_argument("--interval", type=float, default=watcher.WATCH_INTERVAL_S, help="seconds between scans (default 60)")
     watching.add_argument("--run")
+    swept = sub.add_parser("worker-sweep", help="end the sessions of finished, acknowledged, idle workers; worktrees stay")
+    swept.add_argument("--dry-run", action="store_true", help="print each decision and end nothing")
+    swept.add_argument("--run")
     settle = sub.add_parser("worker-settle", help="abandon the task's dispatch and complete the task after checking its result")
     settle.add_argument("--task-id", required=True)
     settle.add_argument("--basis", required=True, choices=sorted(orca.PROOF_BASES))
@@ -484,9 +490,18 @@ def _command(args: argparse.Namespace, root: Path) -> int:
             return 0
         if args.command == "worker-watch":
             try:
-                return watcher.watch(root, args.run, task_ids=args.task_id or None, interval_s=max(args.interval, 1.0))
+                return watcher.watch(root, args.run, task_ids=args.task_id or None, interval_s=max(args.interval, 1.0),
+                                     housekeep_s=watcher.HOUSEKEEP_INTERVAL_S)
             except KeyboardInterrupt:
                 return 0
+        if args.command == "worker-sweep":
+            outcome = release.sweep(root, args.run, session="cli", dry_run=args.dry_run)
+            for label, items in (("release", outcome.released), ("wait", outcome.waiting), ("keep", outcome.kept)):
+                for item in items:
+                    print(f"{label}: {Path(item.worktree).name} ({item.task_id}): {item.reason}")
+            if not (outcome.released or outcome.waiting or outcome.kept):
+                print("worker-sweep: no finished worker with an open session")
+            return 0
         if args.command == "worker-settle":
             outcome = orca_cli.settle(root, task_id=args.task_id, basis=args.basis, artifacts=tuple(args.artifact), run=args.run)
             print(json.dumps(outcome, ensure_ascii=False))

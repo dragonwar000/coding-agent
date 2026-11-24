@@ -23,6 +23,8 @@ from coding_agent.manifest import Hook, Manifest, load
 CLAUDE_ROOT = '"$CLAUDE_PROJECT_DIR"'
 CODEX_ROOT = '"$(git rev-parse --show-toplevel)"'
 HARNESS_MARK = "coding_agent.hooks"
+# Hooks run inside worker worktrees: without this, a project that commits `harness/` gets untracked bytecode there.
+NO_BYTECODE = "PYTHONDONTWRITEBYTECODE=1"
 HOSTS = ("claude_code", "codex")
 
 CLAUDE_FILE = Path(".claude/settings.json")
@@ -36,7 +38,7 @@ class GenError(RuntimeError):
 def command_for(manifest: Manifest, hook: Hook, root_expr: str) -> str:
     """The shell command a host runs for one hook."""
     src = f"{root_expr}/{manifest.python_src}"
-    return f"{hook.env_name}={hook.mode} PYTHONPATH={src} {manifest.python} -m {HARNESS_MARK} {hook.id}"
+    return f"{hook.env_name}={hook.mode} {NO_BYTECODE} PYTHONPATH={src} {manifest.python} -m {HARNESS_MARK} {hook.id}"
 
 
 def _render_host(manifest: Manifest, host: str, root_expr: str) -> dict[str, Any]:
@@ -81,6 +83,12 @@ def harness_only(document: dict[str, Any] | None) -> dict[str, list[Any]]:
             if kept:
                 out[event] = kept
     return out
+
+
+def _comparable(entries: dict[str, list[Any]]) -> dict[str, list[Any]]:
+    """Harness entries with `NO_BYTECODE` taken out of each command, so a host file generated before it was added still
+    passes the gate. The next `gen --apply` or install writes the new command."""
+    return json.loads(json.dumps(entries).replace(f"{NO_BYTECODE} ", ""))
 
 
 def merged(live: dict[str, Any] | None, rendered: dict[str, Any]) -> dict[str, Any]:
@@ -143,7 +151,7 @@ def drift(manifest: Manifest, hosts: Iterable[str] | None = None) -> list[str]:
         except GenError as error:
             problems.append(f"{host}: {error}")
             continue
-        if harness_only(live) != harness_only(rendered):
+        if _comparable(harness_only(live)) != _comparable(harness_only(rendered)):
             problems.append(f"{host}: harness hooks in {target} differ from integration.yaml; run gen --apply")
     return problems
 

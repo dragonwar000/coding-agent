@@ -620,7 +620,18 @@ def coordinator_heartbeat(ctx: Context) -> HookResult:
 
 
 def subagent_ledger(ctx: Context) -> HookResult:
-    """Record a subagent's assignment, start, result and its session's end. Never blocks; does nothing in `orca` mode."""
+    """Record a subagent's assignment, start, result and its session's end. Never blocks.
+
+    The ledger is written only with `dispatch: subagent`. In both modes, a coordinator's SessionEnd starts the background
+    watcher when a finished Orca worker may still need cleanup or release (`watcher.after_session`).
+    """
+    if ctx.payload.get("hook_event_name") == "SessionEnd" and coordinator.role_for(_cwd(ctx)) == "coordinator":
+        from coding_agent import watcher
+
+        try:
+            watcher.after_session(ctx.root, session=ctx.session)
+        except Exception as error:  # noqa: BLE001 - a session that ends must not fail over its cleanup
+            ctx.note(guard="worker-watch", kind="start-failed", applied=False, detail={"error": f"{type(error).__name__}: {error}"[:300]})
     if _dispatch(ctx) != "subagent":
         return HookResult()
     subagents.record_event(ctx.root, ctx.payload)

@@ -43,6 +43,16 @@ The loop ends when no unsettled dispatch is left that has not been reported. `en
 background (after `delegate`, `plan-next`, and from the board while workers are unsettled) unless one already runs for
 the Run: the loop writes `ALIVE_FILE` every scan, and a fresh file means it is alive. `CODING_AGENT_WORKER_WATCH=off`
 turns the automatic start off; `worker-watch` still runs by hand.
+
+Cleanup without a coordinator (2026-11-23): worktree cleanup and the session release (`release.py`) ran only during a
+coordinator turn, so finished workers stayed open once it stopped. The command now also runs `housekeep` every
+`HOUSEKEEP_INTERVAL_S`, and the SessionEnd hook starts it (`after_session`). Once no worker is unsettled it stays only
+while a later pass can still do something, scanning every `HOUSEKEEP_INTERVAL_S`, for `LINGER_PASSES` passes at most
+(6 hours); a run of `GIVE_UP_SCANS` failed scans ends it too. A pass is skipped while the machine is overloaded
+(`_overloaded`). An unreachable Orca removes and closes nothing: every step needs a fresh read.
+
+One watcher per project: the loop holds `LOCK_FILE` (an OS lock, released when the process dies). A start for another Run
+leaves a request in `WAKE_FILE`, and the running loop follows that Run as well.
 """
 
 from __future__ import annotations
@@ -55,7 +65,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from coding_agent import events, notify, orca_cli, resume
+from coding_agent import cleanup, events, notify, orca_cli, release, resume
 
 WATCH_ENV = "CODING_AGENT_WORKER_WATCH"
 WATCH_INTERVAL_S = resume.WATCH_INTERVAL_S
@@ -71,6 +81,14 @@ STUCK = "stuck"
 FAILED_SCANS = 5         # failed scans in a row before the watcher tells the coordinator about itself
 WATCH_FAILING = "watch-failing"
 WATCH_RECOVERED = "watch-recovered"
+HOUSEKEEP_INTERVAL_S = 300.0  # cleanup and release pass; also the scan interval once only those are left
+LINGER_PASSES = 72       # passes (6 hours) a watcher with no unsettled worker waits for an acknowledgement or a grace period
+GIVE_UP_SCANS = 360      # failed scans in a row (6 hours at the default interval) after which the process ends
+WAKE_POLL_S = 15.0       # how often a lingering loop looks for a request; a file stat, no Orca call
+RESTART_GAP_S = 900      # the board does not restart a watcher that found nothing to do this recently
+LOCK_FILE = Path(".coding-agent") / "state" / "worker-watch.lock"
+WAKE_FILE = Path(".coding-agent") / "state" / "worker-watch-wake.json"
+EXIT_FILE = Path(".coding-agent") / "state" / "worker-watch-exit.json"
 
 
 def verdict(item: resume.Finding, after: float | None = None) -> str | None:
@@ -147,12 +165,118 @@ def report_death(root: Path, item: resume.Finding, reason: str, run: str | None 
     return "reported" if error is None else "report-failed"
 
 
-def _mark_alive(root: Path, run: str | None, pid: int | None = None) -> None:
+def _mark_alive(root: Path, run: str | None, pid: int | None = None, stale_s: float | None = None) -> None:
+    """Write the alive file. `stale_s` is how long it stays fresh, for a loop that scans less often than the default."""
     path = root / ALIVE_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"pid": pid or os.getpid(), "run": orca_cli.run_id(run) or "", "ts": time.time()}), encoding="utf-8")
+    record = {"pid": pid or os.getpid(), "run": orca_cli.run_id(run) or "", "ts": time.time(), **({"stale_s": stale_s} if stale_s else {})}
+    temporary.write_text(json.dumps(record), encoding="utf-8")
     temporary.replace(path)
+
+
+def _lock(root: Path) -> Any | None:
+    """Take the project's watcher lock without waiting. Returns the open file that holds it, or None when it is held."""
+    path = root / LOCK_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _unlock(handle: Any) -> None:
+    """Close the lock's file, which releases it."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    handle.close()
+
+
+def _request(root: Path, run: str | None) -> None:
+    """Ask the running loop to scan now, and to follow `run` too."""
+    path = root / WAKE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"run": orca_cli.run_id(run) or "", "ts": time.time()}), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _requested(root: Path) -> dict[str, Any]:
+    try:
+        record = json.loads((root / WAKE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _pause(root: Path, seconds: float, since: float, sleep: Callable[[float], None]) -> None:
+    """Sleep up to `seconds`, ending early when a start request newer than `since` arrives."""
+    left = seconds
+    while left > 0:
+        step = min(WAKE_POLL_S, left)
+        sleep(step)
+        left -= step
+        if float(_requested(root).get("ts") or 0) > since:
+            return
+
+
+def _overloaded() -> bool:
+    """True when the 1-minute load is above twice the CPU count. False where the load cannot be read."""
+    try:
+        return os.getloadavg()[0] > 2 * (os.cpu_count() or 1)
+    except (OSError, AttributeError):
+        return False
+
+
+def housekeep(root: Path, run: str | None = None, *, session: str = "worker-watch",
+              say: Callable[[str], None] | None = None, shown: set[str] | None = None) -> bool:
+    """One cleanup and release pass. True while a later pass may still have something to do.
+
+    Honors `CODING_AGENT_AUTO_CLEAN=off` and `CODING_AGENT_AUTO_RELEASE=off`. Orca failures become warnings; each
+    distinct warning is printed once (`shown`).
+    """
+    say = say or (lambda line: None)
+    if not (cleanup.auto_enabled() or release.enabled()):
+        return False
+    if _overloaded():
+        say("worker-watch: machine overloaded, cleanup pass skipped")
+        return True
+    warnings: list[str] = []
+    waiting = False
+    if cleanup.auto_enabled():
+        found = cleanup.candidates(root, run, warnings=warnings, session=session)
+        results = cleanup.auto_clean(root, run, session=session, found=found, warnings=warnings, strict=True)
+        gone = {item.worktree for item, outcome in results if outcome == "removed"}
+        for item in found:
+            if item.worktree in gone:
+                say(f"worker-watch: removed {Path(item.worktree).name} ({item.task_id})")
+        waiting = any(item.safe and item.exists and item.worktree not in gone for item in found) or any(item.status == cleanup.RUN_UNREAD for item in found)
+    outcome = release.sweep(root, run, session=session, warnings=warnings)
+    for item in outcome.released:
+        say(f"worker-watch: session of {Path(item.worktree).name} ({item.task_id}) ended: {item.reason}")
+    for warning in warnings:
+        if shown is None or warning not in shown:
+            say(f"worker-watch: warning: {warning}")
+            if shown is not None:
+                shown.add(warning)
+    return waiting or bool(outcome.waiting)
 
 
 def _clear_alive(root: Path) -> None:
@@ -299,22 +423,47 @@ class _Failures:
             self.note(failure)
 
 
+class _ScanFailed(Exception):
+    """A Run could not be scanned; its error was already noted."""
+
+
 def watch(root: Path, run: str | None = None, *, task_ids: list[str] | None = None, interval_s: float = WATCH_INTERVAL_S,
           scans: int | None = None, confirm: int = DEAD_CONFIRM, sleep: Callable[[float], None] = time.sleep,
-          out: Callable[[str], None] | None = None) -> int:
+          out: Callable[[str], None] | None = None, housekeep_s: float | None = None) -> int:
     """Scan every `interval_s` seconds, resume and remind as `resume.scan` does, and report each death once. Returns 0.
 
     Ends when no unsettled, unreported dispatch is left, or after `scans` scans (for tests). Prints one line when a
     worker's state changes and one per report. Any `Exception` in a scan or in one worker's report is printed once and
-    the loop goes on; `FAILED_SCANS` failed scans in a row send one escalation (`_Failures`).
+    the loop goes on; `FAILED_SCANS` failed scans in a row send one escalation (`_Failures`), and `GIVE_UP_SCANS` end
+    the process. With `housekeep_s` (the `worker-watch` command, unless it names tasks) it also runs `housekeep` that
+    often and stays while a pass still has something to wait for, `LINGER_PASSES` at most. A second loop for the same
+    project leaves a request for the first and returns.
     """
     say = out or (lambda line: print(line, flush=True))
+    lock = _lock(root)
+    if lock is None:
+        _request(root, run)
+        say("worker-watch: another watcher runs for this project; it was asked to follow this Run")
+        return 0
+    try:
+        return _watch(root, run, task_ids, interval_s, scans, confirm, sleep, say, None if task_ids else housekeep_s)
+    finally:
+        _unlock(lock)
+
+
+def _watch(root: Path, run: str | None, task_ids: list[str] | None, interval_s: float, scans: int | None, confirm: int,
+           sleep: Callable[[float], None], say: Callable[[str], None], housekeep_s: float | None) -> int:
+    started = time.time()
+    followed: list[str | None] = [run]
+    lingering = 0
+    last_pass: float | None = None
+    shown_warnings: set[str] = set()
     suspects: dict[str, int] = {}
     shown: dict[str, str] = {}
     delivered: set[str] = set()
     failures = _Failures(root, run, say)
 
-    def handle(item: resume.Finding, after: float | None, asking: set[str] | None) -> None:
+    def handle(item: resume.Finding, after: float | None, asking: set[str] | None, run: str | None) -> None:
         key = _key(item)
         mark = f"{item.state}|{item.action}|{item.attempt}|{item.episode if item.state == STUCK else ''}" if item.attention else ""
         if shown.get(key, "") != mark:
@@ -341,36 +490,91 @@ def watch(root: Path, run: str | None = None, *, task_ids: list[str] | None = No
     try:
         while scans is None or done < scans:
             if done:
-                sleep(interval_s)
+                if lingering and housekeep_s:
+                    _pause(root, housekeep_s, max(started, float(_requested(root).get("ts") or 0)), sleep)
+                else:
+                    sleep(interval_s)
             done += 1
             clean = True
+            wake = _requested(root)
+            if wake.get("run") and float(wake.get("ts") or 0) >= started and wake["run"] not in followed:
+                followed.append(str(wake["run"]))
+            failures.run = followed[-1]
             try:
-                _mark_alive(root, run)
-                found = resume.scan(root, run, task_ids=task_ids, session="worker-watch")
-                after = resume.silent_after_s()
-                due = [item for item in found if item.state == STUCK and _stuck_key(item) not in delivered and not stuck_reported(root, item)]
-                asking = _asking(run) if due else set()
-                for item in found:
+                _mark_alive(root, followed[-1], stale_s=3 * housekeep_s if lingering and housekeep_s else None)
+                found: list[resume.Finding] = []
+                left: list[resume.Finding] = []
+                unread_run = False
+                for current in list(followed):
+                    if current is None and orca_cli.run_id(None) is None and housekeep_s is not None:
+                        continue  # a project with no Run left: only the records' own Runs are read, by `housekeep`
                     try:
-                        handle(item, after, asking)
-                    except Exception as error:  # noqa: BLE001 - one worker's report must not cost the others theirs
-                        clean = False
-                        failures.note(error, f"{item.task_id}: ")
-                left = [item for item in found if _key(item) not in delivered and not reported(root, item)]
+                        scanned = resume.scan(root, current, task_ids=task_ids, session="worker-watch")
+                    except Exception as error:  # noqa: BLE001 - one Run that cannot be read says nothing about the others
+                        failures.note(error)
+                        unread_run = True
+                        continue
+                    after = resume.silent_after_s()
+                    due = [item for item in scanned if item.state == STUCK and _stuck_key(item) not in delivered and not stuck_reported(root, item)]
+                    asking = _asking(current) if due else set()
+                    for item in scanned:
+                        try:
+                            handle(item, after, asking, current)
+                        except Exception as error:  # noqa: BLE001 - one worker's report must not cost the others theirs
+                            clean = False
+                            failures.note(error, f"{item.task_id}: ")
+                    open_items = [item for item in scanned if _key(item) not in delivered and not reported(root, item)]
+                    found += scanned
+                    left += open_items
+                    if not open_items and current != followed[-1]:
+                        followed.remove(current)
+                waiting = False
+                if housekeep_s is not None and ((not left and not unread_run) or last_pass is None or time.monotonic() - last_pass >= housekeep_s):
+                    last_pass = time.monotonic()
+                    waiting = housekeep(root, followed[-1], say=say, shown=shown_warnings)
+                if unread_run:  # a Run that cannot be read may still hold workers: never read as "nothing left"
+                    raise _ScanFailed
             except Exception as error:  # noqa: BLE001 - the watcher outlives a bad scan; KeyboardInterrupt is not an Exception
-                failures.note(error)
+                if not isinstance(error, _ScanFailed):
+                    failures.note(error)
                 failures.scan_failed()
+                if failures.streak >= GIVE_UP_SCANS:
+                    say(f"worker-watch: stopping after {failures.streak} failed scans in a row; the next board or session end starts it again")
+                    _note_exit(root)
+                    return 0
                 continue
             if clean:
                 failures.scan_ok()
             else:
                 failures.scan_failed()
-            if not left:
+            if left:
+                lingering = 0
+            elif waiting and lingering < LINGER_PASSES:
+                lingering += 1
+            else:
                 say("worker-watch: no unsettled worker left to watch" + (" (the dead ones were reported)" if found else ""))
+                _note_exit(root)
                 return 0
     finally:
         _clear_alive(root)
     return 0
+
+
+def _note_exit(root: Path) -> None:
+    try:
+        path = root / EXIT_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"ts": time.time()}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _exited_recently(root: Path, now: float | None = None) -> bool:
+    try:
+        record = json.loads((root / EXIT_FILE).read_text(encoding="utf-8"))
+        return (time.time() if now is None else now) - float(record.get("ts") or 0) < RESTART_GAP_S
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
 
 
 def running(root: Path, run: str | None = None, now: float | None = None) -> bool:
@@ -382,7 +586,7 @@ def running(root: Path, run: str | None = None, now: float | None = None) -> boo
     if not isinstance(record, dict):
         return False
     now = time.time() if now is None else now
-    return record.get("run") == (orca_cli.run_id(run) or "") and now - float(record.get("ts") or 0) < STALE_AFTER_S
+    return record.get("run") == (orca_cli.run_id(run) or "") and now - float(record.get("ts") or 0) < float(record.get("stale_s") or STALE_AFTER_S)
 
 
 def enabled() -> bool:
@@ -401,11 +605,18 @@ def ensure_running(root: Path, run: str | None = None, *, session: str = "cli") 
         return None
     try:
         if running(root, run):
+            _request(root, run)  # a lingering loop scans at once, so a worker just started is watched without delay
             return "running"
+        held = _lock(root)
+        if held is None:
+            _request(root, run)
+            return "running"
+        _unlock(held)
         chosen = orca_cli.run_id(run)
         package_parent = str(Path(__file__).resolve().parents[1])
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(part for part in (package_parent, env.get("PYTHONPATH", "")) if part)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         log_path = root / LOG_FILE
         log_path.parent.mkdir(parents=True, exist_ok=True)
         detach: dict[str, Any] = ({"creationflags": getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
@@ -425,3 +636,43 @@ def ensure_running(root: Path, run: str | None = None, *, session: str = "cli") 
         except OSError:
             pass
         return None
+
+
+def _followed_run(root: Path, run: str | None) -> str | None:
+    """`run`, else the current Run, else the Run of the newest worker record."""
+    chosen = orca_cli.run_id(run)
+    if chosen:
+        return chosen
+    runs = [record["run"] for owner in orca_cli.all_roots(root) for record in orca_cli.worker_records(owner) if record.get("run")]
+    return runs[-1] if runs else None
+
+
+def ensure_for_cleanup(root: Path, run: str | None = None, *, session: str = "cli", throttle: bool = True) -> str | None:
+    """Start the watcher when a finished worker may still need cleanup or release. Reads local files only. Never raises.
+
+    `throttle` (the board, every prompt) leaves alone a watcher that ended within `RESTART_GAP_S`.
+    """
+    try:
+        if not (cleanup.auto_enabled() or release.enabled()):
+            return None
+        # The board cleans in its own turn, so only a session still to release is worth a process. A session end is the
+        # last chance to clean what the coordinator just merged.
+        if not (release.pending(root) or (not throttle and cleanup.auto_enabled()
+                                          and any(orca_cli.worker_records(owner) for owner in orca_cli.all_roots(root)))):
+            return None
+        if throttle and _exited_recently(root):
+            return None
+        return ensure_running(root, _followed_run(root, run), session=session)
+    except Exception as error:  # noqa: BLE001 - called from hooks that must not fail over the watcher
+        try:
+            events.record(root, guard="worker-watch", kind="start-failed", mode="enforce", applied=False, session=session,
+                          detail={"error": f"{type(error).__name__}: {error}"[:300]})
+        except OSError:
+            pass
+        return None
+
+
+def after_session(root: Path, session: str = "session-end") -> str | None:
+    """The SessionEnd step of a coordinator: keep cleanup and release going after it stops."""
+    orca_cli.use_stored_run(root)
+    return ensure_for_cleanup(root, session=session, throttle=False)

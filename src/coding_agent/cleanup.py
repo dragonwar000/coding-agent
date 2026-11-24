@@ -30,7 +30,11 @@ Safe worktrees, and records whose directory is already gone, are removed without
 the coordinator's board and after the CLI commands the coordinator runs each turn (`CODING_AGENT_AUTO_CLEAN=off`
 turns that off). A worker that reported but whose branch the coordinator has not merged yet keeps its worktree, so
 the coordinator can still check it; once the branch is merged into the coordinator's HEAD or the task's base branch,
-the next run removes it.
+the next run removes it. The background watcher runs the same step when no coordinator is running (`watcher.housekeep`),
+and `release.removable` keeps a merged worktree while its worker still needs its session.
+
+Untracked Python bytecode is not work (`_bytecode`). A tracked `.pyc` that changed is: a project that committed its
+`__pycache__` keeps such a worktree until those files are restored or untracked.
 
 A removal that stopped part-way (`Directory not empty`) can leave the directory without its git registration. A
 directory holding nothing but OS junk (`.DS_Store`, `Thumbs.db`, `desktop.ini`, and directories of those) counts as
@@ -54,7 +58,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from coding_agent import events, orca, orca_cli, roots, worktree_links
+from coding_agent import events, orca, orca_cli, release, roots, worktree_links
 
 SETTLED = ("completed", "failed")
 ACTIVE = ("dispatched", "running")  # a task Orca handed to a worker: its worktree is in use
@@ -63,6 +67,7 @@ ACTIVE = ("dispatched", "running")  # a task Orca handed to a worker: its worktr
 # worker that is starting right now.
 UNSTARTED_GRACE_S = 900
 AUTO_ENV = "CODING_AGENT_AUTO_CLEAN"
+RUN_UNREAD = "Run không đọc được"  # the status of a record whose Run could not be read
 WINDOWS = os.name == "nt"
 
 
@@ -79,6 +84,7 @@ class Candidate:
     root: str = ""  # the repository whose workers ledger lists the worktree; "" for the coordinator's own
     repo: str = ""  # that repository's name, when it is not the coordinator's
     orphan: bool = False  # a checkout whose git registration is gone; safe only when it matches a merged commit
+    run: str = ""  # the Run the task was read in
 
     @property
     def safe(self) -> bool:
@@ -128,6 +134,7 @@ HARNESS_RUNTIME = (
     ".coding-agent/roots.json",      # orca_cli.ROOTS_FILE: repositories the coordinator delegated into
     ".coding-agent/acked.jsonl",     # orca_cli.ACKED_FILE: reports acknowledged one task at a time
     ".coding-agent/worktree-links.json",  # worktree_links.RECORD: the install links made in a worker worktree
+    ".coding-agent/released.jsonl",  # release.FOLDER_LEDGER: sessions ended while the worktree stays
 )
 
 
@@ -135,6 +142,15 @@ def _harness_owned(path: str, links: tuple[str, ...] = ()) -> bool:
     """True for a harness runtime file, or for a path under one of `links` (the install `worktree_links` linked in)."""
     return (any(path.startswith(item) if item.endswith("/") else path == item for item in HARNESS_RUNTIME)
             or any(path == link or path.startswith(link + "/") for link in links))
+
+
+def _bytecode(path: str) -> bool:
+    """True for Python bytecode by its repo-relative path: a `*.pyc` file, or anything inside a `__pycache__` directory.
+
+    Callers apply it to untracked paths only: a tracked `.pyc` that changed is a real change.
+    """
+    parts = path.split("/")
+    return parts[-1].endswith(".pyc") or "__pycache__" in parts[:-1]
 
 
 def _status_args(windows: bool) -> list[str]:
@@ -153,8 +169,9 @@ def _dirty(worktree: Path) -> int:
     """Changed or untracked files in the worktree, or UNKNOWN when git cannot say.
 
     Not counted: mode-only changes on Windows (see `_status_args`), the harness's own runtime files
-    (`HARNESS_RUNTIME`), which hooks write into every worker's worktree whether or not the worker did anything, and
-    the coordinator's install linked in by `worktree_links` (normally hidden by `info/exclude` already).
+    (`HARNESS_RUNTIME`), which hooks write into every worker's worktree whether or not the worker did anything, the
+    coordinator's install linked in by `worktree_links` (normally hidden by `info/exclude` already), and untracked
+    Python bytecode (`_bytecode`), which a project that commits `harness/` gets from its hooks.
     """
     out = _git(worktree, *_status_args(WINDOWS))
     if out is None:
@@ -170,6 +187,8 @@ def _dirty(worktree: Path) -> int:
             continue
         if entry[0] in "RC":
             index += 1  # the next field is the rename/copy source
+        if entry[:2] == "??" and _bytecode(entry[3:]):
+            continue
         if not _harness_owned(entry[3:], links):
             count += 1
     return count
@@ -222,10 +241,15 @@ def _plain_dir(path: Path) -> bool:
     return path.is_dir() and not worktree_links.is_link(path)
 
 
-def _only_junk(path: Path) -> bool:
-    """True for a directory that holds nothing but OS junk files and directories of those (or nothing at all). It is
-    not a git worktree (that holds at least its `.git` file): it is what is left when a removal stopped after git
-    removed the worktree, and counts as already gone. A symlink or junction anywhere is content."""
+def _junk_file(name: str, in_cache: bool) -> bool:
+    """An OS junk file, or Python bytecode (`*.pyc`, or any file in a `__pycache__` directory)."""
+    return name in OS_JUNK or name.endswith(".pyc") or in_cache
+
+
+def _only_junk(path: Path, in_cache: bool = False) -> bool:
+    """True for a directory that holds nothing but OS junk files, Python bytecode and directories of those (or nothing
+    at all). It is not a git worktree (that holds at least its `.git` file): it is what is left when a removal stopped
+    after git removed the worktree, and counts as already gone. A symlink or junction anywhere is content."""
     if not _plain_dir(path):
         return False
     try:
@@ -235,9 +259,9 @@ def _only_junk(path: Path) -> bool:
                 if worktree_links.is_link(inner):
                     return False
                 if entry.is_dir(follow_symlinks=False):
-                    if not _only_junk(inner):
+                    if not _only_junk(inner, in_cache or entry.name == "__pycache__"):
                         return False
-                elif not (entry.name in OS_JUNK and entry.is_file(follow_symlinks=False)):
+                elif not (_junk_file(entry.name, in_cache) and entry.is_file(follow_symlinks=False)):
                     return False
     except OSError:
         return False
@@ -303,7 +327,7 @@ def _matches_commit(common: Path, path: Path, commit: str) -> bool:
     links = tuple(worktree_links.linked_paths(path))
     if any(name and not _harness_owned(name, links) for name in changed.split("\0")):
         return False
-    return not any(name and not _harness_owned(name, links) and name.rsplit("/", 1)[-1] not in OS_JUNK
+    return not any(name and not _harness_owned(name, links) and name.rsplit("/", 1)[-1] not in OS_JUNK and not _bytecode(name)
                    for name in untracked.split("\0"))
 
 
@@ -396,7 +420,7 @@ def candidates(root: Path, run: str | None = None, *, warnings: list[str] | None
             if exists:
                 skipped[key] = skipped.get(key, 0) + 1
                 continue
-            task, status, unstarted = None, "Run không đọc được", False
+            task, status, unstarted = None, RUN_UNREAD, False
         else:
             task = tasks[key].get(record["task_id"])
             unstarted = not (task is not None and task.get("status") in SETTLED) and _unstarted(record, task)
@@ -433,6 +457,7 @@ def candidates(root: Path, run: str | None = None, *, warnings: list[str] | None
             root="" if owner == own else str(owner),
             repo="" if name == home else name,
             orphan=gitdir is not None,
+            run=key or "",
         ))
     for key, count in skipped.items():
         _warn(root, warnings, session, kind="worktree-run-unread",
@@ -530,15 +555,15 @@ def _remove_leftover(path: Path) -> None:
         pass  # gone already, or something appeared in it
 
 
-def _remove_junk_tree(path: Path) -> None:
+def _remove_junk_tree(path: Path, in_cache: bool = False) -> None:
     with os.scandir(path) as entries:
         for entry in entries:
             inner = Path(entry.path)
             if worktree_links.is_link(inner):
                 continue
             if entry.is_dir(follow_symlinks=False):
-                _remove_junk_tree(inner)
-            elif entry.name in OS_JUNK and entry.is_file(follow_symlinks=False):
+                _remove_junk_tree(inner, in_cache or entry.name == "__pycache__")
+            elif _junk_file(entry.name, in_cache) and entry.is_file(follow_symlinks=False):
                 inner.unlink()
     os.rmdir(path)  # fails when anything else is in it
 
@@ -557,8 +582,14 @@ def auto_enabled() -> bool:
 
 
 def auto_clean(root: Path, run: str | None = None, *, session: str = "cli",
-               found: list[Candidate] | None = None, warnings: list[str] | None = None) -> list[tuple[Candidate, str]]:
+               found: list[Candidate] | None = None, warnings: list[str] | None = None,
+               strict: bool = False) -> list[tuple[Candidate, str]]:
     """Remove every settled worker worktree that loses no work, without asking. Returns `clean`'s (candidate, outcome).
+
+    A worktree whose worker still needs its session stays (`release.removable`): an unread report, an open question, a
+    working or waiting agent, or another agent's terminal in it. `strict` is the background watcher, with no coordinator
+    present: a record of an unreadable Run is left alone even when its directory is gone, and whatever Orca cannot
+    confirm keeps the worktree.
 
     Removed: safe candidates (with force, see `clean`); records whose directory no longer exists or holds only OS junk
     (only marked removed, the junk directory deleted); and orphaned checkouts whose files match a merged commit
@@ -584,7 +615,8 @@ def auto_clean(root: Path, run: str | None = None, *, session: str = "cli",
         if not any(orca_cli.worker_records(owner) for owner in orca_cli.all_roots(root)):
             return []
         found = candidates(root, run, warnings=warnings, session=session)
-    chosen = [item for item in found if item.safe or not item.exists]
+    chosen = [item for item in found if (item.safe or not item.exists) and not (strict and item.status == RUN_UNREAD)]
+    chosen = release.removable(root, chosen, run, strict=strict, session=session, warnings=warnings)
     return clean(root, chosen, session=session, kind="worktree-auto-removed", warnings=warnings) if chosen else []
 
 
@@ -606,5 +638,5 @@ def board_lines(found: list[Candidate]) -> list[str]:
                  "hoặc vào nhánh base của task (nhánh worker được tạo từ đó, `base:`/`--base-branch`; lượt sau nó tự được dọn); "
                  "worktree ghi 'đăng ký worktree đã mất, cần kiểm tay' thì git không còn biết nó: kiểm thư mục bằng tay; "
                  "nếu muốn bỏ việc đó thì hỏi người dùng trước, rồi chạy `worktree-clean --task-id <id> --discard --yes` (mất code chưa gộp). "
-                 "Worktree ghi 'sạch, đã gộp' chỉ còn khi tự dọn bị tắt (CODING_AGENT_AUTO_CLEAN=off): xoá bằng `worktree-clean --task-id <id>`, không cần --yes.")
+                 "Worktree ghi 'sạch, đã gộp' chỉ còn khi worker vẫn cần phiên (xem cảnh báo bên dưới; tự dọn sau) hoặc khi tự dọn bị tắt (CODING_AGENT_AUTO_CLEAN=off): xoá bằng `worktree-clean --task-id <id>`, không cần --yes.")
     return lines
