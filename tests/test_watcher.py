@@ -54,12 +54,24 @@ class Terminals:
         monkeypatch.setattr(orca_cli, "terminal_state", state)
 
 
+# What Orca 1.4.271 answered the watcher's death report on 2026-11-25 (project lada), after the coordinator moved terminal.
+REJECTED = ("orca send answered ok:false: worker_identity_changed: term_f49245d4-ec42-431d-997e-bae0f82e7c14 is not the "
+            "exact process that owns Dispatch ctx_d6c6fb2f2af7.")
+
+
 class Escalations:
+    """`orca_cli.escalate`: `fail` is a transient failure, `refuse` the final refusal (`REJECTED`); `tries` counts calls."""
+
     def __init__(self, monkeypatch: pytest.MonkeyPatch):
         self.sent: list[dict] = []
+        self.tries = 0
         self.fail = False
+        self.refuse = False
 
         def escalate(*, run, subject, body, task_id, dispatch):
+            self.tries += 1
+            if self.refuse:
+                raise orca_cli.OrcaRefused(REJECTED)
             if self.fail:
                 raise orca_cli.OrcaError("orca send exited 1")
             self.sent.append({"run": run, "subject": subject, "body": body, "task_id": task_id, "dispatch": dispatch})
@@ -219,18 +231,161 @@ def test_one_odd_scan_is_not_a_death(repo, monkeypatch):
     assert escalations.sent == []
 
 
-def test_a_report_orca_refused_is_sent_on_the_next_scan(repo, monkeypatch):
+def test_a_report_that_failed_transiently_is_sent_again_after_the_backoff_not_every_scan(repo, monkeypatch, clock):
     Workers(repo, monkeypatch, {"task_1": BLOCKED})
     Terminals(monkeypatch)
     escalations = Escalations(monkeypatch)
     escalations.fail = True
+    said: list[str] = []
+    tick = lambda seconds: clock.__setitem__(0, clock[0] + 60)  # noqa: E731 - one scan a minute, as live
+    watcher.watch(repo, RUN, scans=4, sleep=tick, out=said.append, confirm=1)
+    assert escalations.tries == 1  # 3 more scans inside the first REPORT_RETRY_S: nothing sent
+    assert sum("could not be reported" in line for line in said) == 1
+    clock[0] += watcher.REPORT_RETRY_S
+    watcher.watch(repo, RUN, scans=3, sleep=tick, out=said.append, confirm=1)
+    assert escalations.tries == 2  # the second wait is twice as long
+    clock[0] += 2 * watcher.REPORT_RETRY_S
+    escalations.fail = False
+    watcher.watch(repo, RUN, scans=3, sleep=tick, out=said.append, confirm=1)
+    assert escalations.tries == 3 and len(escalations.sent) == 1 and "retry does not fix" in escalations.sent[0]["body"]
+    assert [record["sent"] for record in resume.history(repo) if record.get("kind") == "death"] == [False, False, True]
+
+
+def test_the_backoff_doubles_and_stops_at_the_cap(repo):
+    for n in range(8):
+        orca_cli._append(repo / resume.LEDGER, {"ts": 1000, "kind": watcher.DEATH, "dispatch": "ctx_1", "sent": False})
+        wait = watcher.retry_left(repo, "ctx_1", watcher.DEATH, now=1000)
+        assert wait == min(watcher.REPORT_RETRY_S * 2 ** n, watcher.REPORT_RETRY_MAX_S)
+    assert watcher.REPORT_RETRY_S >= 300 and watcher.retry_left(repo, "ctx_2", watcher.DEATH, now=1000) == 0
+
+
+def test_a_report_orca_rejects_for_good_is_recorded_once_and_never_sent_again(repo, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": BLOCKED})
+    Terminals(monkeypatch)
+    escalations = Escalations(monkeypatch)
+    escalations.refuse = True
+    said: list[str] = []
+    tick = lambda seconds: clock.__setitem__(0, clock[0] + 600)  # noqa: E731
+    watcher.watch(repo, RUN, scans=5, sleep=tick, out=said.append, confirm=1)
+    watcher.watch(repo, RUN, scans=5, sleep=tick, out=said.append, confirm=1)  # a restarted loop too
+    assert escalations.tries == 1
+    deaths = [record for record in resume.history(repo) if record.get("kind") == watcher.DEATH]
+    assert len(deaths) == 1 and deaths[0]["sent"] is False and "not the exact process that owns Dispatch" in deaths[0]["rejected"]
+    assert sum("rejected by Orca for good" in line for line in said) == 1
+    assert not any("could not be reported" in line for line in said)
+    logged = [json.loads(line) for line in events.log_path(repo).read_text(encoding="utf-8").splitlines()]
+    assert [entry["kind"] for entry in logged if entry["guard"] == "worker-watch"].count("report-rejected") == 1
+
+
+@pytest.mark.parametrize("error, final", [
+    (orca_cli.OrcaRefused(REJECTED), True),
+    (orca_cli.OrcaRefused("orca send answered ok:false: consumer_fenced: not bound"), True),
+    (orca_cli.OrcaRefused("orca send answered ok:false: permission_denied: Sender is not allowed to send to run"), True),
+    (orca_cli.OrcaError("orca send exited 1: timed out"), False),
+    (orca_cli.OrcaError("cannot run orca: [Errno 2] No such file"), False),
+    (orca_cli.OrcaRefused("orca send answered ok:false: runtime_unavailable: daemon restarting"), False),
+])
+def test_only_a_refusal_a_retry_does_not_change_is_final(error, final):
+    assert orca_cli.final_refusal(error) is final
+
+
+def fake_watch(repo, tmp_path, monkeypatch, reject: str) -> tuple[str, Path]:
+    """A dispatched task with a closed terminal on the fake CLI, which refuses escalations as `FAKE_ORCA_SEND_REJECT` says."""
+    state = tmp_path / "orca-state.json"
+    monkeypatch.setenv("CODING_AGENT_ORCA", str(FAKE))
+    monkeypatch.setenv("FAKE_ORCA_STATE", str(state))
+    monkeypatch.setenv("CODING_AGENT_ORCA_RUN", RUN)
+    monkeypatch.setenv("FAKE_ORCA_SEND_REJECT", reject)
+    task_id = orca_cli.create_task(repo, project="demo-repo", t_id="T-d1", spec="x", title="Sua parser")
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["tasks"][task_id]["status"] = "dispatched"
+    data["dispatches"] = {"dsp_0001": {"task": task_id, "status": "ready"}}
+    state.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setenv("FAKE_ORCA_SCREEN", IDLE)
+    monkeypatch.setenv("FAKE_ORCA_GONE_TERMINALS", f"term_{task_id}")
+    return task_id, state
+
+
+def test_a_report_refused_for_its_dispatch_id_is_sent_once_without_the_ids(repo, tmp_path, monkeypatch):
+    task_id, state = fake_watch(repo, tmp_path, monkeypatch, "ids")
+    said: list[str] = []
+    watcher.watch(repo, RUN, scans=4, sleep=lambda s: None, out=said.append)
+    data = json.loads(state.read_text(encoding="utf-8"))
+    assert len(data["orchestration_refused"]) == 1 and data["orchestration_refused"][0]["dispatch-id"] == "dsp_0001"
+    sent = data["orchestration_sent"]
+    assert len(sent) == 1 and "dispatch-id" not in sent[0] and "task-id" not in sent[0]
+    assert sent[0]["to"] == f"run:{RUN}" and sent[0]["type"] == "escalation" and f"task: {task_id}\ndispatch: dsp_0001" in sent[0]["body"]
+    assert [record.get("form") for record in resume.history(repo) if record.get("kind") == watcher.DEATH] == ["plain"]
+    assert any(f"{task_id} reported dead" in line for line in said)
+
+
+def test_a_report_orca_refuses_in_every_form_is_tried_once_and_never_again(repo, tmp_path, monkeypatch):
+    _, state = fake_watch(repo, tmp_path, monkeypatch, "all")
+    watcher.watch(repo, RUN, scans=5, sleep=lambda s: None, out=lambda line: None)
+    watcher.watch(repo, RUN, scans=5, sleep=lambda s: None, out=lambda line: None)
+    data = json.loads(state.read_text(encoding="utf-8"))
+    assert len(data["orchestration_refused"]) == 2  # one report: with the ids, then plain
+    assert "dispatch-id" not in data["orchestration_refused"][1] and not data.get("orchestration_sent")
+    deaths = [record for record in resume.history(repo) if record.get("kind") == watcher.DEATH]
+    assert len(deaths) == 1 and "worker_identity_changed" in deaths[0]["rejected"]
+
+
+def test_a_silent_worker_with_an_open_question_is_neither_reminded_nor_reported(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+    Terminals(monkeypatch)
+    escalations = Escalations(monkeypatch)
+    workers.questions.append({"id": "msg_b1e957845308", "task_id": "task_1", "dispatch": "ctx_task_1"})
+    said: list[str] = []
+    watcher.watch(repo, RUN, interval_s=resume.SILENT_AFTER_S, scans=8,
+                  sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds), out=said.append)
+    assert workers.sent == [] and workers.messages == [] and escalations.sent == []
+    assert [item.action for item in resume.scan(repo)] == ["asking"]
+    assert any("waiting on its open question, not reminded" in line for line in said)
+
+
+def test_a_question_opened_after_the_last_reminder_is_never_a_death(repo, monkeypatch, clock):
+    """Live on 2026-11-25: task_2e98c38d04b0 got both reminders, then waited on msg_b1e957845308 and was reported dead."""
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+    Terminals(monkeypatch)
+    escalations = Escalations(monkeypatch)
 
     def nap(seconds):
-        escalations.fail = False
+        clock[0] += seconds
+        if len(workers.sent) >= resume.MAX_NUDGES and not workers.questions:
+            workers.questions.append({"id": "msg_q", "task_id": "task_1", "dispatch": ""})
 
-    watcher.watch(repo, RUN, scans=3, sleep=nap, out=lambda line: None, confirm=1)
-    assert len(escalations.sent) == 1 and "retry does not fix" in escalations.sent[0]["body"]
-    assert [record["sent"] for record in resume.history(repo) if record.get("kind") == "death"] == [False, True]
+    watcher.watch(repo, RUN, interval_s=resume.SILENT_AFTER_S, scans=8, sleep=nap, out=lambda line: None)
+    assert len(workers.sent) == resume.MAX_NUDGES and escalations.sent == []
+    assert watcher.DEATH not in [record.get("kind") for record in resume.history(repo)]
+
+
+def test_a_silent_death_waits_while_orca_cannot_say_who_is_asking(repo, monkeypatch, clock):
+    workers = Workers(repo, monkeypatch, {"task_1": IDLE})
+    Terminals(monkeypatch)
+    escalations = Escalations(monkeypatch)
+    tick = lambda seconds: clock.__setitem__(0, clock[0] + seconds)  # noqa: E731
+    watcher.watch(repo, RUN, interval_s=resume.SILENT_AFTER_S, scans=3, sleep=tick, out=lambda line: None)
+    assert len(workers.sent) == resume.MAX_NUDGES and escalations.sent == []
+
+    def unreadable(run=None):
+        raise orca_cli.OrcaError("orca check exited 1")
+
+    monkeypatch.setattr(orca_cli, "worker_activity", unreadable)
+    watcher.watch(repo, RUN, interval_s=resume.SILENT_AFTER_S, scans=4, sleep=tick, out=lambda line: None)
+    assert escalations.sent == [] and len(workers.sent) == resume.MAX_NUDGES
+    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: [])
+    watcher.watch(repo, RUN, interval_s=resume.SILENT_AFTER_S, scans=3, sleep=tick, out=lambda line: None)
+    assert len(escalations.sent) == 1 and "reminders, no worker_done" in escalations.sent[0]["body"]
+
+
+def test_the_asking_check_on_a_silent_death_is_the_watchers_own(repo, monkeypatch, clock):
+    """Even a finding that `resume.scan` left at `nudge-limit` is no death while its dispatch has an open question."""
+    item = finding(state="silent", action="nudge-limit", idle_s=int(resume.SILENT_AFTER_S), dispatch="ctx_9")
+    monkeypatch.setattr(resume, "scan", lambda root, run=None, **kwargs: [item])
+    escalations = Escalations(monkeypatch)
+    monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: [{"task_id": "", "dispatch": "ctx_9"}])
+    watcher.watch(repo, RUN, scans=4, sleep=lambda s: None, out=lambda line: None)
+    assert escalations.tries == 0
 
 
 def test_a_stuck_stall_is_reported_only_after_the_resumes_ran_out(repo, monkeypatch, clock):
@@ -742,7 +897,7 @@ def test_the_screen_signal_reports_once_per_episode(repo, monkeypatch, clock):
     assert len(escalations.sent) == 2
 
 
-def test_a_stuck_report_orca_refused_is_sent_on_the_next_scan(repo, tmp_path, monkeypatch, clock):
+def test_a_stuck_report_that_failed_is_sent_again_after_the_backoff(repo, tmp_path, monkeypatch, clock):
     Workers(repo, monkeypatch, {"task_1": HUNG})
     escalations = Escalations(monkeypatch)
     asking_nothing(monkeypatch)
@@ -751,7 +906,21 @@ def test_a_stuck_report_orca_refused_is_sent_on_the_next_scan(repo, tmp_path, mo
     watcher.watch(repo, RUN, scans=1, sleep=lambda s: None, out=lambda line: None)
     escalations.fail = False
     watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=lambda line: None)
-    assert len(escalations.sent) == 1
+    assert escalations.tries == 1 and escalations.sent == []
+    clock[0] += watcher.REPORT_RETRY_S
+    watcher.watch(repo, RUN, scans=2, sleep=lambda s: None, out=lambda line: None)
+    assert escalations.tries == 2 and len(escalations.sent) == 1
+
+
+def test_a_stuck_report_rejected_for_good_is_not_sent_again_for_that_episode(repo, tmp_path, monkeypatch, clock):
+    Workers(repo, monkeypatch, {"task_1": HUNG})
+    escalations = Escalations(monkeypatch)
+    asking_nothing(monkeypatch)
+    transcript_for(repo, tmp_path, written=clock[0] - 1300)
+    escalations.refuse = True
+    watcher.watch(repo, RUN, scans=3, sleep=lambda s: clock.__setitem__(0, clock[0] + 600), out=lambda line: None)
+    assert escalations.tries == 1
+    assert [bool(record.get("rejected")) for record in resume.history(repo) if record.get("kind") == watcher.STUCK] == [True]
 
 
 def test_a_worker_waiting_on_an_answer_is_not_reported_stuck(repo, tmp_path, monkeypatch, clock):
