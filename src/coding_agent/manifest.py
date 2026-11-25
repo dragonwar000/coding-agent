@@ -32,6 +32,11 @@ NOTIFY_TIMEOUT_S = (1, 120)
 # Who does the coordinator's work: `orca` workers in their own worktrees, or in-process `subagent`s (`subagents.py`).
 DISPATCH_MODES = ("orca", "subagent")
 DEFAULT_DISPATCH = "subagent"
+# update-check: hours between two reads of upstream, and seconds one `git ls-remote` may take at session start.
+UPDATE_INTERVAL_H = (1, 720)
+UPDATE_TIMEOUT_S = (1, 30)
+# A branch name is put after `refs/heads/` in a git argument: no spaces, no leading dash, no `..`.
+BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
 class ManifestError(ValueError):
@@ -124,6 +129,14 @@ class CoordinatorSettings:
 
 
 @dataclass(frozen=True)
+class UpdateCheck:
+    """`update_check:` of the manifest: how the `update-check` hook reads upstream (`update_check.py`). The hook's mode switches it off."""
+    interval_h: int = 24
+    timeout_s: int = 5
+    branch: str = "main"
+
+
+@dataclass(frozen=True)
 class Manifest:
     path: Path
     verified: bool
@@ -144,6 +157,7 @@ class Manifest:
     evaluator: Evaluator = field(default_factory=Evaluator)
     notify: Notify = field(default_factory=Notify)
     coordinator: CoordinatorSettings = field(default_factory=CoordinatorSettings)
+    update_check: UpdateCheck = field(default_factory=UpdateCheck)
 
     @property
     def root(self) -> Path:
@@ -298,6 +312,25 @@ def coordinator_from(raw: Any) -> CoordinatorSettings:
     return CoordinatorSettings(dispatch=dispatch)
 
 
+def update_check_from(raw: Any) -> UpdateCheck:
+    """The update-check settings; a missing block or key is the default, a wrong value or an unknown key raises ManifestError."""
+    if raw is None:
+        return UpdateCheck()
+    if not isinstance(raw, dict):
+        raise ManifestError("update_check must be a mapping")
+    unknown = sorted(str(key) for key in raw if key not in ("interval_h", "timeout_s", "branch"))
+    if unknown:
+        raise ManifestError(f"update_check has unknown keys: {', '.join(unknown)} (switch the check off with the update-check hook's mode)")
+    branch = raw.get("branch", "main")
+    if not isinstance(branch, str) or not BRANCH_NAME.fullmatch(branch) or ".." in branch:
+        raise ManifestError("update_check.branch must be a branch name such as main")
+    return UpdateCheck(
+        interval_h=_require_range(raw.get("interval_h", 24), "update_check.interval_h", *UPDATE_INTERVAL_H),
+        timeout_s=_require_range(raw.get("timeout_s", 5), "update_check.timeout_s", *UPDATE_TIMEOUT_S),
+        branch=branch,
+    )
+
+
 def _hook(item: Any, seen: set[str]) -> Hook:
     if not isinstance(item, dict):
         raise ManifestError("each hooks entry must be a mapping")
@@ -432,4 +465,5 @@ def load(path: Path) -> Manifest:
         evaluator=evaluator_from(raw.get("evaluator")),
         notify=notify_from(raw.get("notify")),
         coordinator=coordinator_from(raw.get("coordinator")),
+        update_check=update_check_from(raw.get("update_check")),
     )

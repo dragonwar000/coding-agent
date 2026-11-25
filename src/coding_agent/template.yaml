@@ -110,6 +110,15 @@ notify:
 coordinator:
   dispatch: subagent
 
+# Nhắc cập nhật (hook update-check, đầu phiên): so commit đã cài (ghi trong `.coding-agent/installed.json` lúc cài) với
+# `refs/heads/<branch>` của repo nguồn bằng `git ls-remote`, tối đa một lần mỗi `interval_h` giờ, mỗi lần chờ tối đa
+# `timeout_s` giây. Khác thì phiên nhận một dòng nhắc kèm lệnh cập nhật; không bao giờ tự cài. Lỗi mạng, thiếu git hay
+# không rõ nguồn thì im lặng. Tắt: đặt mode của hook update-check là "off", hoặc biến môi trường CODING_AGENT_UPDATE_CHECK=off.
+update_check:
+  interval_h: 24              # 1 đến 720
+  timeout_s: 5                # 1 đến 30
+  branch: main
+
 # Hook. `mode` có ba giá trị: off (không chạy), shadow (ghi quyết định, không chặn), enforce (được chặn).
 # Mặc định là shadow (FR-010). Mọi hook không off bắt buộc có `assumption`: câu nêu điều hook giả định về model.
 # Chỉ hook đã khai enforce mới được chặn. Hiện orca-guard (FR-009), stop-gate (SC-002), coordinator-guard (bắt buộc chia việc theo graph) và coordinator-heartbeat (chặn lượt chỉ có heartbeat) ở enforce.
@@ -211,3 +220,9 @@ hooks:
     event: UserPromptSubmit
     mode: enforce
     assumption: "Thông báo hộp thư của Orca mà mọi tin chưa đọc đều là heartbeat thì coordinator không có gì để làm: chặn prompt đó và ack các heartbeat không làm mất tin nào; còn tin khác hay Orca lỗi thì cho prompt qua."
+  - id: update-check
+    host: [claude_code, codex]
+    event: SessionStart
+    matcher: "startup|resume"
+    mode: shadow
+    assumption: "Một commit mới trên nhánh main của repo nguồn là bản người dùng muốn biết; nhắc một dòng mỗi ngày là đủ, và người dùng tự quyết khi nào cập nhật."

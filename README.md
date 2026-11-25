@@ -17,7 +17,7 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `integration.yaml` | Manifest duy nhất: hook, mode, assumption, verify, bộ nhớ, ngưỡng loop, cờ `verified` |
 | `src/coding_agent/manifest.py` | Đọc và kiểm manifest; cấu hình sai bị từ chối ngay lúc nạp |
 | `src/coding_agent/gen.py` | Sinh `.claude/settings.json` và `.codex/hooks.json` với đường dẫn tương đối; `--check` báo drift |
-| `src/coding_agent/hooks/` | Hook: `orca-guard`, `loop-guard`, `prompt-reset`, `stop-gate`, `pre-compact`, `session-restore`, các hook coordinator (`coordinator-guard`, `coordinator-context`, `coordinator-board`, `coordinator-heartbeat`), `auto-decide`, và sổ subagent (`subagent-assign`, `-started`, `-stopped`, `-result`, `-failed`, `-session-end`) |
+| `src/coding_agent/hooks/` | Hook: `orca-guard`, `loop-guard`, `prompt-reset`, `stop-gate`, `pre-compact`, `session-restore`, các hook coordinator (`coordinator-guard`, `coordinator-context`, `coordinator-board`, `coordinator-heartbeat`), `auto-decide`, sổ subagent (`subagent-assign`, `-started`, `-stopped`, `-result`, `-failed`, `-session-end`), và `update-check` |
 | `src/coding_agent/subagents.py` | `coordinator.dispatch: subagent`: đọc setting, sổ subagent, bảng việc, và số đo payload hook của Claude Code |
 | `src/coding_agent/transcript.py` | Đọc một lượt từ transcript, có số dòng làm bằng chứng và số lần lỗi/bị từ chối |
 | `src/coding_agent/orca.py` | Quy tắc Orca thuần: completion cần bằng chứng, task thuộc một repo, bằng chứng `CLAIMED-DONE BUT ABSENT` |
@@ -31,6 +31,7 @@ Repo này là package độc lập, không nằm trong `harness/setup`.
 | `src/coding_agent/cli.py` | Lệnh cho agent: `recall`, `stats`, `report`, `forget`, `brief`, `status`, `orca-create`, `orca-status`, `claim`, `orca-check`, `delegate`, `plan-*`, `inbox`, `worker-kick`, `worker-resume`, `worker-watch`, `worker-sweep`, `worker-settle`, `wiki-sync`, `wikieval` |
 | `src/coding_agent/watcher.py` | `worker-watch`: theo dõi worker bằng terminal (không model, không heartbeat), báo coordinator đúng một lần khi worker chết hoặc kẹt |
 | `src/coding_agent/release.py` | Đóng phiên agent của worker đã xong và đã được đọc báo cáo, giữ nguyên worktree, nhánh và file |
+| `src/coding_agent/update_check.py` | Nhắc cập nhật: ghi nguồn của bản cài, đầu phiên so commit đã cài với `main` của repo nguồn (`git ls-remote`, có cache), không bao giờ tự cài |
 | `src/coding_agent/notify.py` | Khối `notify` (mặc định tắt): chạy lệnh argv của người dùng để báo cho người khi watcher báo sự cố |
 | `src/coding_agent/wiki/` | Công cụ wiki của dự án: neo đồng bộ code→wiki (`sync.py`) và bộ eval goldens (`evaluate.py`) |
 | `src/coding_agent/project_install.py` | Cài, verify và gỡ coding-agent trong một dự án, như install.sh của setup (FR-001, FR-004) |
@@ -270,6 +271,48 @@ Kiểm tra trạng thái sau khi cài:
 ```sh
 PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.gate --manifest integration.yaml   # 0: khớp manifest
 ```
+
+### Nhắc cập nhật
+
+Repo không có tag hay release: bản mới là một commit mới trên `main`. Đầu phiên (Claude Code và Codex, `startup` và
+`resume`), hook `update-check` so commit đang cài với `main` của repo nguồn. Nếu khác, phiên nhận **một dòng** (người
+dùng thấy, agent cũng nhận làm context) kèm lệnh cập nhật. Hook **không bao giờ tự cài**; agent được dặn chỉ báo, không
+tự chạy lệnh. Ví dụ:
+
+```text
+[update-check] coding-agent có commit mới trên dragonwar000/coding-agent@main: đang cài 4c129b7, upstream 9f3e2a1. Cập nhật bằng tay khi tiện: curl -fsSL https://raw.githubusercontent.com/dragonwar000/coding-agent/main/bootstrap.sh | CODING_AGENT_REF=9f3e2a1c0d4b5e6f708192a3b4c5d6e7f8091a2b bash -s -- --add-new-hooks (Agent: chỉ báo cho người dùng, không tự chạy lệnh này.)
+```
+
+- **Nguồn của bản cài:** installer ghi khoá `source` vào `.coding-agent/installed.json` (ngoài package, nên digest
+  của dấu harness không đổi và installer cũ vẫn nhận bản copy là của nó). Cài từ checkout: URL `origin`, `HEAD`, cây có
+  sửa chưa commit hay không, và đường dẫn checkout. Cài bằng `bootstrap.sh`/`bootstrap.ps1`: repo và ref đã tải (truyền
+  qua `CODING_AGENT_SOURCE_REPO`, `CODING_AGENT_SOURCE_REF`); ref không phải SHA đầy đủ thì installer đổi ra commit bằng
+  `git ls-remote` một lần. Báo cáo cài có dòng `source: ...`. Live link (`--link`) không ghi nguồn và không nhắc: nó
+  chạy thẳng checkout.
+- **Kiểm đầu phiên:** `git ls-remote <repo> refs/heads/<branch>` với timeout ngắn, tối đa một lần mỗi `interval_h` giờ;
+  kết quả nằm ở `.coding-agent/state/update-check.json`, nên phần lớn phiên không gọi mạng. Lần đọc lỗi (mất mạng, thiếu
+  git, quá timeout, repo private không có quyền) thì im lặng và thử lại sau tối đa một giờ. Cùng một commit upstream chỉ
+  được nhắc một lần mỗi `interval_h`. Checkout đã cài chứa sẵn commit upstream (cài từ `main` local đi trước `origin`)
+  thì không nhắc. Phiên worker không nhắc.
+- **Lệnh cập nhật trong dòng nhắc:** cài từ checkout còn trên máy thì `git -C <checkout> pull --ff-only && bash
+  <checkout>/install.sh <dự án> --add-new-hooks`; còn lại là dòng bootstrap ở trên, ghim đúng commit upstream bằng
+  `CODING_AGENT_REF` (trên Windows là dòng `bootstrap.ps1`): không ghim thì bootstrap cài `PINNED_REF`, có thể cũ hơn
+  `main`. `--python-src` khác mặc định được giữ trong lệnh.
+- **Không có nguồn thì không nhắc:** dự án cài trước khi có tính năng này, hoặc cài từ thư mục không phải git checkout có
+  `origin`, im lặng cho tới lần cài lại kế tiếp.
+- Dự án cũ chưa có hook `update-check` trong manifest: chạy lệnh nâng cấp với `--add-new-hooks`.
+
+Cấu hình trong `integration.yaml`:
+
+```yaml
+update_check:
+  interval_h: 24              # 1 đến 720: số giờ giữa hai lần đọc upstream
+  timeout_s: 5                # 1 đến 30: thời gian tối đa của một lần git ls-remote
+  branch: main
+```
+
+Tắt: đặt `mode: "off"` cho hook `update-check` rồi chạy lại lệnh cài (hoặc `PYTHONPATH=harness/coding-agent/src python3 -m coding_agent.gen --apply`), hoặc
+đặt biến môi trường `CODING_AGENT_UPDATE_CHECK=off` (nhận `off`, `0`, `false`, `no`) cho phiên.
 
 ## Windows
 

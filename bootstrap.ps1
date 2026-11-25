@@ -52,6 +52,8 @@ $Target = (Get-Location).Path
 $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('coding-agent-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 $PreviousPythonPath = $env:PYTHONPATH
+$PreviousSourceRepo = $env:CODING_AGENT_SOURCE_REPO
+$PreviousSourceRef = $env:CODING_AGENT_SOURCE_REF
 try {
     $Zip = Join-Path $Tmp 'src.zip'
     $Headers = @{}
@@ -63,11 +65,16 @@ try {
     $Package = Join-Path (Join-Path $Source.FullName 'src') 'coding_agent'
     if (-not $Source -or -not (Test-Path $Package)) { throw 'coding-agent: the archive has no src/coding_agent' }
     $env:PYTHONPATH = Join-Path $Source.FullName 'src'
+    # Where this install came from, recorded in .coding-agent/installed.json for the session-start update reminder.
+    $env:CODING_AGENT_SOURCE_REPO = "https://github.com/$Owner/$Repo"
+    $env:CODING_AGENT_SOURCE_REF = $Ref
     Write-Host "[bootstrap] target: $Target"
     & $Python -m coding_agent.project_install --project $Target @InstallArgs
     if ($LASTEXITCODE -ne 0) { throw "coding-agent: the installer exited with code $LASTEXITCODE" }
 }
 finally {
     $env:PYTHONPATH = $PreviousPythonPath
+    $env:CODING_AGENT_SOURCE_REPO = $PreviousSourceRepo
+    $env:CODING_AGENT_SOURCE_REF = $PreviousSourceRef
     Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
 }

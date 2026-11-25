@@ -1,5 +1,5 @@
 """The handlers the manifest binds: orca-guard, loop-guard, prompt-reset, stop-gate, pre-compact, session-restore,
-the coordinator hooks (coordinator-guard, coordinator-context/-board, coordinator-heartbeat) and auto-decide.
+the coordinator hooks (coordinator-guard, coordinator-context/-board, coordinator-heartbeat), auto-decide and update-check.
 
 Each handler returns a HookResult. Blocking is exit 2 with the reason on stderr, and happens only
 when the hook's mode is `enforce`. Every decision is logged with `applied` (FR-003).
@@ -16,9 +16,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from coding_agent import autodecide, coordinator, evaluator, events, orca, orca_cli, ratchet, state, subagents, transcript
+from coding_agent import autodecide, coordinator, evaluator, events, orca, orca_cli, ratchet, state, subagents, transcript, update_check
 from coding_agent.hooks import Context, HookResult
-from coding_agent.manifest import Loop
+from coding_agent.manifest import Loop, UpdateCheck
 from coding_agent.memory import record, zeromem
 
 TASK_UPDATE = re.compile(r"orca\s+orchestration\s+task-update\b")
@@ -670,6 +670,26 @@ def auto_decide(ctx: Context) -> HookResult:
     return HookResult(stdout=autodecide.hook_output(tool_input, decision.answers, decision.note))
 
 
+def update_check_hook(ctx: Context) -> HookResult:
+    """At session start, remind the user once per interval that upstream coding-agent moved past the installed commit.
+
+    Never blocks and never installs: the output is one line for the user (`systemMessage`) and the same line as
+    context for the agent. Worker sessions get nothing; every failure leaves the session as it was. Only a read of
+    upstream and a reminder are logged, so a session served from the cache adds no event.
+    """
+    if ctx.payload.get("source") not in (None, "startup", "resume") or coordinator.role_for(_cwd(ctx)) == "worker":
+        return HookResult()
+    settings = ctx.manifest.update_check if ctx.manifest is not None else UpdateCheck()
+    result = update_check.check(ctx.root, settings)
+    if result.message or result.detail.get("fetched"):
+        ctx.note(guard="update-check", kind=result.kind, applied=False, detail=result.detail)
+    if result.message is None:
+        return HookResult()
+    event = str(ctx.payload.get("hook_event_name") or "SessionStart")
+    return HookResult(stdout=json.dumps({"systemMessage": result.message,
+                                         "hookSpecificOutput": {"hookEventName": event, "additionalContext": result.message}}, ensure_ascii=False))
+
+
 REGISTRY: dict[str, Callable[[Context], HookResult]] = {
     "orca-guard": orca_guard,
     "loop-guard": loop_guard,
@@ -688,4 +708,5 @@ REGISTRY: dict[str, Callable[[Context], HookResult]] = {
     "subagent-result": subagent_ledger,
     "subagent-failed": subagent_ledger,
     "subagent-session-end": subagent_ledger,
+    "update-check": update_check_hook,
 }

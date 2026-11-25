@@ -51,4 +51,6 @@ SRC="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 [ -n "$SRC" ] && [ -f "$SRC/install.sh" ] || die "archive không có install.sh"
 
 say "cài vào $TARGET"
-bash "$SRC/install.sh" "$TARGET" ${ARGS[@]+"${ARGS[@]}"}
+# Nguồn của bản cài, ghi vào .coding-agent/installed.json để đầu phiên nhắc khi main có commit mới (không tự cài).
+CODING_AGENT_SOURCE_REPO="https://github.com/$OWNER/$REPO" CODING_AGENT_SOURCE_REF="$REF" \
+  bash "$SRC/install.sh" "$TARGET" ${ARGS[@]+"${ARGS[@]}"}

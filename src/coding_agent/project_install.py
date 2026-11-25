@@ -15,6 +15,9 @@
 4. Writes `integration.yaml` only when the project has none. An existing manifest is never overwritten.
 5. Merges the harness hooks into the host files (`.claude/settings.json`, `.codex/hooks.json`), keeping the
    user's own hooks and settings, with a `.bak` of each file it changes.
+   The install record `.coding-agent/installed.json` also notes where a copied package came from (`source`: the git
+   checkout's origin and HEAD, or the repository and ref bootstrap downloaded), for the session-start update reminder
+   (`update_check`). A link has no such record.
 6. Writes a CI gate at `.github/workflows/coding-agent.yml` when none exists.
 7. Verifies the wiring: the gate, and the hook commands from the host file run against sample payloads.
 
@@ -34,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import coding_agent
-from coding_agent import gate, gen
+from coding_agent import gate, gen, update_check
 from coding_agent import install as safe_install
 from coding_agent.manifest import ManifestError, load
 from coding_agent.worktree_links import _make_link, is_link, remove_link
@@ -401,6 +404,11 @@ def install(project: Path, *, python_src: str = DEFAULT_PYTHON_SRC, verify: str 
     installed: dict[str, Any] = {"hosts": hosts, "python_src": python_src}
     if is_link(package_path):
         installed["link"] = os.path.realpath(package_path)
+    else:
+        source = update_check.record_source(link_package or PACKAGE)
+        if source is not None:
+            installed["source"] = source
+        report.append(update_check.source_line(source))
     record.write_text(json.dumps(installed, indent=2) + "\n", encoding="utf-8")
     _ignore_state(project, report)
 
