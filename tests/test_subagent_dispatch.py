@@ -489,6 +489,14 @@ def test_the_contract_of_subagent_mode(repo):
     assert "delegate --title" not in text
 
 
+def test_both_contracts_plan_for_quality_not_time():
+    for text in (coordinator.contract("src", dispatch="subagent"), coordinator.contract("src")):
+        assert "- " + coordinator.QUALITY_RULE in text
+        assert "thời gian hoàn thành không phải tiêu chí" in text and "chất lượng kết quả là tiêu chí duy nhất" in text
+        assert "Không ghi ước lượng thời gian vào plan" in text
+        assert text.count(coordinator.QUALITY_RULE) == 1
+
+
 def test_the_orca_contract_is_unchanged_by_default():
     assert coordinator.contract("src") == coordinator.contract("src", dispatch="orca")
     assert "worker Orca" in coordinator.contract("src") and "dispatch: subagent" not in coordinator.contract("src")

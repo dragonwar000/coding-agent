@@ -325,6 +325,11 @@ HOW = (
     "(3) `python3 -m coding_agent.cli plan-apply .coding-agent/plan.yaml`; "
     "(4) `python3 -m coding_agent.cli plan-next .coding-agent/plan.yaml`. Xem graph: `plan-status`."
 )
+QUALITY_RULE = (
+    "Khi lập kế hoạch, không cân nhắc việc làm xong nhanh hay chậm: thời gian hoàn thành không phải tiêu chí, chất lượng kết quả là tiêu chí duy nhất. "
+    "Không cắt phạm vi, bỏ kiểm chứng hay test, chọn cách yếu hơn, hay gộp các bước lại chỉ để xong sớm; chia bao nhiêu node thì kết quả đúng cần bấy nhiêu, chưa chắc thì chọn model mạnh hơn. "
+    "Không ghi ước lượng thời gian vào plan, và không đưa phương án \"nhanh\" cho người dùng như thể nó tốt hơn vì nhanh."
+)
 RECOVER = (
     "Worker không nhận đề bài (Orca báo turn_start_unobserved): `plan-next` tự gửi kick-off; nếu worker vẫn im, chạy "
     "`python3 -m coding_agent.cli worker-kick --task-id <id>`. Báo cáo 'Rejected worker_done' là worker thiếu token: kiểm kết quả rồi "
@@ -494,6 +499,7 @@ def subagent_contract(auto_decide: bool = False) -> str:
         "- Subagent dùng chung working tree với bạn, KHÔNG có cách ly: các subagent chạy song song không được đụng cùng file. Việc có thể đụng nhau thì chạy lần lượt, hoặc đặt `isolation: \"worktree\"` trên tool Agent khi có; subagent đó làm trên nhánh riêng và bạn phải gộp nhánh đó lại.",
         "- Mỗi lần gọi Agent: `description` ngắn nói rõ việc, `prompt` đủ ngữ cảnh vì subagent không thấy hội thoại, và `model`: `sonnet` cho việc máy móc hoặc spec rõ, `opus` cho việc khó hoặc rủi ro cao (bảo mật, concurrency, migrate dữ liệu, kiến trúc, debug mơ hồ). Chưa chắc thì `opus`.",
         "- Graph vẫn dùng được: ghi plan vào .coding-agent/plan.yaml, `python3 -m coding_agent.cli plan-next .coding-agent/plan.yaml` in các node sẵn sàng kèm spec. Giao mỗi node cho một subagent với `description` bắt đầu bằng `<node id>:`; sổ subagent dùng tiền tố đó để biết node đang chạy hay đã xong. Xem graph: `plan-status`.",
+        "- " + QUALITY_RULE,
         "- Bạn kiểm kết quả trước khi nói với người dùng là xong: đọc diff và chạy test hợp với việc đó. Lời báo của subagent chưa phải bằng chứng. Việc chưa đạt thì giao lại.",
         "- Bảng việc liệt kê subagent đang mở và tuổi của chúng, đánh dấu cái quá hạn (`CODING_AGENT_SUBAGENT_MINUTES`, mặc định 30, `off` để tắt). Gặp dấu đó thì kiểm hoặc dừng nó. Subagent 'mất dấu' là phiên của nó đã kết thúc: đọc diff rồi giao lại phần chưa xong.",
         "- Worker Orca đã giao trước khi project chuyển sang mode này vẫn là việc của bạn: bảng việc liệt kê chúng. Dùng `inbox`, `worker-resume`, `worker-settle`, gộp nhánh và `worktree-clean` như cũ, và không giao lại node đang có worker Orca.",
@@ -521,6 +527,7 @@ def contract(python_src: str, auto_decide: bool = False, dispatch: str = "orca")
         "- " + MODEL_RULE,
         "- Folder project (root không phải repo git, chứa nhiều repo con): mọi lệnh delegate phải có `--repo <đường dẫn repo>`, và mỗi node trong plan đặt `repo:`. Worker tách nhánh từ HEAD của repo đó; đổi bằng `--base-branch` / `base:`.",
         "- " + HOW + " Chỉ node đã xong hết phụ thuộc mới được giao.",
+        "- " + QUALITY_RULE,
         "- `title` của mỗi node là tóm tắt việc cần làm, ngắn và súc tích, khoảng 3 đến 6 từ, không tiền tố chung. Nó thành tên worktree, tên nhánh (cắt ở 40 ký tự, bỏ dấu) và nhãn của worker trong Orca. Chi tiết để trong `spec`.",
         "- Khi bảng việc ghi 'worker vừa báo': kiểm kết quả, gộp nhánh nếu đạt, rồi `inbox --ack --task-id <id>` cho đúng task vừa gộp (không ack cả hộp thư: báo cáo chưa xem sẽ mất khỏi bảng), rồi `plan-next`.",
         "- Task giao bằng `delegate`/`plan-next` với `--root <repo khác>` vẫn hiện trên bảng (kèm tên repo) và được tự dọn như task của repo này: repo trong cây thư mục của bạn được tự tìm (có .coding-agent/links.jsonl), repo ngoài cây được ghi vào .coding-agent/roots.json. Task giao trước khi có roots.json được tự tìm lại repo từ Orca; nếu bảng vẫn thiếu, chạy `roots-add <path>`, xem bằng `roots-list`.",

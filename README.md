@@ -439,7 +439,7 @@ không mở lại bản ghi của nó.
 
 ### Coordinator: test và model theo việc
 
-Hợp đồng in ở đầu phiên coordinator có hai luật:
+Hợp đồng in ở đầu phiên coordinator có các luật sau (cả hai mode dispatch):
 
 - **Test: bạn quyết định.** Việc có code chạy được → khai `--verify` / `verify:` bằng lệnh test hợp với việc đó
   (vd `go test ./pkg/...`, `npm test -- path`); việc chỉ đổi tài liệu/hạ tầng → không cần verify, tự kiểm kết quả.
@@ -447,6 +447,9 @@ Hợp đồng in ở đầu phiên coordinator có hai luật:
   (đổi tên, sao chép, tài liệu, config, scaffold, thay đổi có spec và test rõ); `opus` cho việc khó/rủi ro cao (bảo mật,
   auth, concurrency, migrate dữ liệu, prod/deploy, kiến trúc, debug mơ hồ, mọi thứ chạm guard/quyền). Chưa chắc → `opus`.
   Bắt buộc với worker claude: thiếu model thì lệnh giao việc bị từ chối.
+- **Lập kế hoạch vì chất lượng, không vì thời gian.** Không cân nhắc việc làm xong nhanh hay chậm; không cắt phạm vi,
+  bỏ test, chọn cách yếu hơn hay gộp bước chỉ để xong sớm; chưa chắc thì chọn model mạnh hơn. Không ghi ước lượng
+  thời gian vào plan và không đưa phương án "nhanh" cho người dùng như thể nó tốt hơn vì nhanh.
 
 ```sh
 python3 -m coding_agent.cli delegate --title "..." --spec "..." --model sonnet|opus [--agent claude|codex] [--verify CMD]
