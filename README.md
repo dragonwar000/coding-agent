@@ -663,11 +663,17 @@ coordinator khi worker chết hoặc kẹt hẳn.
 - **`worker-watch [--task-id <id> ...] [--interval GIÂY] [--run ID]`:** vòng lặp không model, mặc định 60 giây một lượt, chỉ đọc
   Orca CLI. Mỗi lượt chạy đúng bước quét của `worker-resume` (tự resume, tự nhắc như trên), rồi coi là **chết hoặc kẹt** khi:
   terminal hay agent đã mất; màn hình có lỗi API mà thử lại không sửa được (`PERMANENT_MARKS` hoặc `API Error` lạ); lỗi tạm thời
-  vẫn còn sau 5 lần resume (hoặc đã resume mà màn hình không đổi); hay worker vẫn im sau 2 lần nhắc. Phải thấy hai lượt liên tiếp
+  vẫn còn sau 5 lần resume (hoặc đã resume mà màn hình không đổi); hay worker vẫn im sau 2 lần nhắc mà Orca không có câu hỏi
+  (`ask`) nào đang mở của nó. Worker đang chờ trả lời câu hỏi không bị nhắc (`action: asking`) và không bao giờ bị báo chết; Orca
+  không đọc được danh sách câu hỏi thì lượt đó không báo (đo 2026-11-25, dự án lada). Phải thấy hai lượt liên tiếp
   mới báo. Báo bằng MỘT tin `orca orchestration send --to run:<run> --type escalation`, subject `worker dead: <tên task>`, body
   có task id, dispatch id, terminal, lý do và các dòng cuối màn hình (tối đa 15 dòng). Lần báo ghi vào `.coding-agent/resumes.jsonl`
-  với `kind: death`, nên mỗi dispatch chỉ được báo một lần; Orca từ chối thì lượt sau gửi lại. Vòng lặp tự thoát khi không còn
-  dispatch chưa xong nào chưa bị báo. Event `guard: worker-watch`: `started`, `start-failed`, `reported`, `report-failed`, `watch-failing`, `recovered`.
+  với `kind: death`, nên mỗi dispatch chỉ được báo một lần. Orca từ chối hẳn (ví dụ `worker_identity_changed: <terminal> is not
+  the exact process that owns Dispatch <ctx>` khi phiên coordinator đã sang terminal khác, đo 2026-11-25) thì gửi lại đúng một lần
+  không kèm `--task-id`/`--dispatch-id` (id đã có trong body); vẫn bị từ chối thì ghi sổ một lần với `rejected: <lý do>`, tính là
+  đã báo, không gửi lại nữa. Chỉ lỗi tạm thời (timeout, crash, không có JSON) mới gửi lại, sau 5 phút, gấp đôi mỗi lần, tối đa 30
+  phút. Vòng lặp tự thoát khi không còn dispatch chưa xong nào chưa bị báo. Event `guard: worker-watch`: `started`,
+  `start-failed`, `reported`, `report-rejected`, `report-failed`, `watch-failing`, `recovered`.
 - **Watcher không chết vì một lượt quét lỗi:** mọi `Exception` của một lượt quét hoặc của báo cáo một worker (file state hỏng, lỗi
   JSON, không ghi được sổ) được bắt, in một dòng cho mỗi lỗi khác nhau, rồi quét tiếp; `KeyboardInterrupt` và `SystemExit` vẫn dừng
   vòng lặp. Sau 5 lượt lỗi liên tiếp, watcher gửi MỘT escalation subject `worker-watch failing` kèm lỗi cuối, ghi vào sổ với

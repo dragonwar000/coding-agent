@@ -1533,13 +1533,50 @@ def run_mail(run: str | None = None) -> tuple[list[dict[str, Any]], list[dict[st
     return messages, unread, replies
 
 
-def escalate(*, run: str | None, subject: str, body: str, task_id: str = "", dispatch: str = "") -> None:
+# Refusals of a `send` that the same command meets again on every try: who sends it or what it names is not allowed.
+# Measured 2026-11-25 (Orca 1.4.271, project lada): the watcher's escalation with `--dispatch-id` answered
+# `worker_identity_changed: term_… is not the exact process that owns Dispatch ctx_…` once the coordinator session had
+# moved to another terminal; Orca also posted "Rejected escalation: …" to the coordinator for every try.
+FINAL_REFUSALS = ("worker_identity_changed", "consumer_fenced", "worker_cannot_coordinate_own_run", "invalid_argument",
+                  "run_not_found", "legacy_read_only", "permission_denied", "forbidden", "not_owner", "not_allowed", "unauthorized")
+FINAL_REFUSAL_TEXT = re.compile(r"not the exact process|does not own|not the owner|not allowed|not permitted|forbidden", re.IGNORECASE)
+_ids_refused: set[str] = set()  # binaries that refused an escalation carrying ids, so the rest of this process sends it plain
+
+
+def final_refusal(error: BaseException) -> bool:
+    """True when Orca read the command and refused it for a reason a retry does not change (`FINAL_REFUSALS`).
+
+    A timeout, a crash, no JSON or a binary that cannot run (an `OrcaError` that is not `OrcaRefused`) is transient.
+    """
+    if not isinstance(error, OrcaRefused):
+        return False
+    text = str(error)
+    return any(f"{code}:" in text for code in FINAL_REFUSALS) or bool(FINAL_REFUSAL_TEXT.search(text))
+
+
+def escalate(*, run: str | None, subject: str, body: str, task_id: str = "", dispatch: str = "") -> str:
     """Send the coordinator an `escalation` through the Run's mailbox (`--to run:<id>`, the address Orca names for raising
-    something with the Run's own coordinator), carrying the task and dispatch ids when it is about one worker."""
+    something with the Run's own coordinator), carrying the task and dispatch ids when it is about one worker.
+
+    Orca treats an escalation that names a dispatch as that worker's own signal and refuses it from any other process
+    (`worker_identity_changed`, see `FINAL_REFUSALS`). Such a final refusal is followed by the same escalation without
+    `--task-id` and `--dispatch-id` (the ids are in the body), and the rest of the process sends that form at once.
+    Assumption, not measured on a live Orca: the plain form is accepted, as the watcher's own `worker-watch failing`
+    escalation is. Returns `ids` or `plain`, the form Orca accepted; raises the last `OrcaError` otherwise.
+    """
     chosen = run_id(run)
-    target = ["--to", f"run:{chosen}"] if chosen else []
+    head = ["send", *(["--to", f"run:{chosen}"] if chosen else []), "--type", "escalation", "--subject", subject, "--body", body]
     ids = [*(["--task-id", task_id] if task_id else []), *(["--dispatch-id", dispatch] if dispatch else [])]
-    _call("send", *target, "--type", "escalation", "--subject", subject, "--body", body, *ids, *_run_args(run))
+    if ids and binary() not in _ids_refused:
+        try:
+            _call(*head, *ids, *_run_args(run))
+            return "ids"
+        except OrcaError as error:
+            if not final_refusal(error):
+                raise
+            _ids_refused.add(binary())
+    _call(*head, *_run_args(run))
+    return "plain"
 
 
 def send_line(handle: str, text: str) -> None:
@@ -1815,6 +1852,11 @@ def worker_activity(run: str | None = None) -> list[dict[str, Any]]:
     except OrcaError:
         replies = []
     return open_questions(run_messages, replies)
+
+
+def asking_keys(run: str | None = None) -> set[str]:
+    """Task ids and dispatch ids of the workers with an open question (`worker_activity`). Raises `OrcaError`."""
+    return {str(value) for question in worker_activity(run) for value in (question.get("task_id"), question.get("dispatch")) if value}
 
 
 def _take_delivery(run: str | None) -> tuple[list[dict[str, Any]], str | None]:

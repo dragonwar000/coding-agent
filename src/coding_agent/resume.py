@@ -619,9 +619,14 @@ def nudge_silent(root: Path, findings: list[Finding], run: str | None = None, *,
     `silent` whenever it is idle again without having reported. Actions: `nudged` (an `orca orchestration send` to the
     dispatch, then the same line typed into its terminal; the terminal send is what counts), `would-nudge` (dry run),
     `nudge-wait` (reminded before, not silent long enough again), `nudge-limit` (`MAX_NUDGES` sent),
-    `nudge-failed`, `nudge-deferred` (`deadline` passed) and `inbox-unreadable` (nothing sent without knowing). Each
-    send is appended to the resumes ledger with `kind: nudge` and recorded as an event. The inbox is read once, and
-    only when a worker may be silent. `CODING_AGENT_SILENT_MINUTES=off` leaves every idle worker `idle`.
+    `nudge-failed`, `nudge-deferred` (`deadline` passed), `asking` (its task or dispatch has an open question in Orca,
+    `orca_cli.asking_keys`: it waits for the coordinator, so it is neither reminded nor ever a death) and
+    `inbox-unreadable` (the inbox or the open questions cannot be read: nothing sent without knowing). Each send is
+    appended to the resumes ledger with `kind: nudge` and recorded as an event. The inbox and the questions are read
+    once, and only when a worker may be silent. `CODING_AGENT_SILENT_MINUTES=off` leaves every idle worker `idle`.
+
+    Why `asking` (2026-11-25, project lada): task_2e98c38d04b0 waited on its open question msg_b1e957845308, got both
+    reminders while it waited, and was then reported dead every scan.
     """
     now = time.time() if now is None else now
     findings = track_idle(root, findings, now)
@@ -630,6 +635,7 @@ def nudge_silent(root: Path, findings: list[Finding], run: str | None = None, *,
         return findings
     reports: set[tuple[str, str]] | None = None
     unreadable = False
+    asking: set[str] | None = None
     out: list[Finding] = []
     for item in findings:
         if item.state != "idle" or item.status != "dispatched":
@@ -651,6 +657,17 @@ def nudge_silent(root: Path, findings: list[Finding], run: str | None = None, *,
             continue
         if (item.task_id, item.dispatch) in (reports or set()) or (item.task_id, "") in (reports or set()):
             out.append(item)
+            continue
+        if asking is None and not unreadable:
+            try:
+                asking = orca_cli.asking_keys(run)
+            except orca_cli.OrcaError:
+                unreadable = True
+        if unreadable or asking is None:
+            out.append(replace(silent, action="inbox-unreadable"))
+            continue
+        if item.task_id in asking or (item.dispatch and item.dispatch in asking):
+            out.append(replace(silent, action="asking"))
             continue
         if len(sent) >= MAX_NUDGES:
             out.append(replace(silent, action="nudge-limit"))
@@ -709,7 +726,7 @@ def _load_scan(root: Path) -> dict[str, Any]:
 
 
 # Decisions to send nothing that `auto` records as an event when they change, not on every scan.
-NOTED_ACTIONS = ("waiting-network", "blocked", "limit", "already-resumed", "nudge-limit", "inbox-unreadable")
+NOTED_ACTIONS = ("waiting-network", "blocked", "limit", "already-resumed", "nudge-limit", "inbox-unreadable", "asking")
 
 
 def auto(root: Path, tasks: list[dict[str, Any]], run: str | None = None, session: str = "board") -> list[Finding]:
@@ -813,6 +830,7 @@ def silent_notes(findings: list[Finding]) -> dict[str, str]:
             "nudge-failed": ": không gõ được lời nhắc vào terminal, lượt quét sau thử lại",
             "nudge-deferred": ": chưa nhắc vì hết thời gian của lượt quét; lượt quét sau sẽ nhắc",
             "inbox-unreadable": ": hộp thư worker không đọc được nên chưa nhắc",
+            "asking": ": đang chờ coordinator trả lời câu hỏi, không nhắc",
         }.get(item.action, "")
     return notes
 
@@ -830,6 +848,7 @@ def describe(item: Finding) -> str:
         "nudge-failed": f"{idle}, the reminder could not be typed into its terminal",
         "nudge-deferred": f"{idle}, not reminded yet (this scan ran out of time), the next scan reminds it",
         "inbox-unreadable": f"idle for {_minutes(item.idle_s)} min, the worker inbox cannot be read, so not reminded",
+        "asking": f"idle for {_minutes(item.idle_s)} min, waiting on its open question, not reminded",
     } if item.state == "silent" else {
         "resumed": f"stalled, resumed (attempt {item.attempt}/{MAX_RESUMES})",
         "would-resume": "stalled, would be resumed (dry run, nothing sent)",

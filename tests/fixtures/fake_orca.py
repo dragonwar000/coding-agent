@@ -28,7 +28,9 @@ answers every message including acknowledged ones, and `data["release_answer"]` 
 `FAKE_ORCA_CONCISE=1` answers like Orca 1.4.271 without `--full` (`_concise`), and `FAKE_ORCA_NO_FULL=1` refuses `--full`
 on everything but `inbox`, like Orca 1.4.222. `task-create` and `run-create` replay a `--retry-request` seen before, and answer
 `request_mismatch` when its input differs. `FAKE_ORCA_UNREADABLE_CREATE=1` creates the record and answers without its id.
-`data["workers"]` holds the full `worker-list` rows.
+`data["workers"]` holds the full `worker-list` rows. `FAKE_ORCA_SEND_REJECT=ids` makes an escalation `send` that carries
+`--dispatch-id` answer the `worker_identity_changed` refusal Orca 1.4.271 gave the watcher on 2026-11-25 (recorded in
+`orchestration_refused`); `FAKE_ORCA_SEND_REJECT=all` refuses every escalation that way.
 `FAKE_ORCA_WORKER_START_FENCED=1` makes `worker-start` answer the `consumer_fenced` refusal Orca gives a coordinator
 terminal no longer bound to the Task Run; `FAKE_ORCA_WORKER_START_CRASH=1` makes it exit 3 with no JSON.
 """
@@ -269,6 +271,11 @@ def main(argv: list[str]) -> int:
             for m in messages:
                 m["delivery"] = "delivery_1"
             answer = {"ok": True, "result": {"runId": options.get("--run"), "messages": messages, "count": len(messages), "deliveryId": "delivery_1"}}
+    elif command == "send" and options.get("--type") == "escalation" and (
+            os.environ.get("FAKE_ORCA_SEND_REJECT") == "all" or (os.environ.get("FAKE_ORCA_SEND_REJECT") == "ids" and "--dispatch-id" in options)):
+        data.setdefault("orchestration_refused", []).append({key.removeprefix("--"): value for key, value in options.items()})
+        answer = {"ok": False, "error": {"code": "worker_identity_changed",
+                                         "message": f"term_coord is not the exact process that owns Dispatch {options.get('--dispatch-id', 'ctx_x')}."}}
     elif command == "send":
         data.setdefault("orchestration_sent", []).append({key.removeprefix("--"): value for key, value in options.items()})
         answer = {"ok": True, "result": {"message": {"id": f"msg_{len(data['orchestration_sent'])}"}}}

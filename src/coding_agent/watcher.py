@@ -13,12 +13,21 @@ those cannot fix is a death (`verdict`):
 - the terminal is closed, or the agent process left it (`resume.terminal_death`);
 - the screen shows an API error a retry does not fix (`PERMANENT_MARKS`, or an unknown `API Error`);
 - a transient API error is still on screen after `MAX_RESUMES` resumes, or a resume did not change the screen;
-- the worker stays silent for `silent_after_s()` after `MAX_NUDGES` reminders.
+- the worker stays silent for `silent_after_s()` after `MAX_NUDGES` reminders, and Orca says it has no open question.
 
 A death seen on `DEAD_CONFIRM` scans in a row is reported once (`report_death`): one `escalation` to the Run's mailbox,
 subject `worker dead: <task title>`, body with task id, dispatch id, terminal, the reason and the last screen lines
 (`BODY_LINES` lines at most). The report is appended to the resumes ledger with `kind: death`, so the same dispatch is
-never reported twice, by this loop or a later one. A report Orca refused is tried again on the next scan.
+never reported twice, by this loop or a later one.
+
+A report that does not reach the coordinator (2026-11-25, project lada): Orca refused the death report of a dispatch with
+`worker_identity_changed: <coordinator terminal> is not the exact process that owns Dispatch <ctx>` after the
+coordinator session had moved to another terminal, posted "Rejected escalation: worker dead: …" to the coordinator, and
+the watcher sent the same report again every minute. Now `orca_cli.escalate` sends such a report again once without the
+ids it refused (they are in the body). A refusal a retry does not change (`orca_cli.final_refusal`) is recorded once in
+the ledger with `rejected: <reason>`, which counts as reported: no later scan or loop sends it again for that dispatch
+(or, for a stuck report, that episode). Only a transient failure (timeout, crash, no JSON) is tried again, after
+`REPORT_RETRY_S` doubling per failure up to `REPORT_RETRY_MAX_S` (`retry_left`, read from the ledger's failed records).
 
 A scan that fails never ends the loop (2026-11-23: until then only `OrcaError` was caught, so a damaged state file, a
 JSON error or a ledger write error stopped the watcher and only its log said so). Every `Exception` of a scan or of one
@@ -33,8 +42,9 @@ A worker whose spinner runs with no progress is `stuck` (`resume.track_stuck`, w
 not a death: `report_stuck` sends one escalation per stretch without progress, subject `worker stuck: <task title>`, with
 task id, dispatch id, terminal, minutes, signal and last screen lines, recorded with `kind: stuck` and the episode. The
 watcher never interrupts it, never types into its terminal and keeps watching it; when it progresses and sticks again,
-that is a new episode and a new report. A worker waiting on an open question is not reported: its silence has a cause
-the coordinator already sees.
+that is a new episode and a new report. A worker waiting on an open question is not reported, stuck or silent: its
+silence has a cause the coordinator already sees. `resume.nudge_silent` does not remind it either (`action: asking`).
+When Orca cannot say which tasks are asking (`_asking` answers None), a stuck or silent report waits for a later scan.
 
 Each of those three reports can also tell a person through the optional `notify` command of the manifest (`notify.py`):
 once per event, also when Orca refused the escalation, since that is when a person most needs to hear it.
@@ -89,6 +99,8 @@ RESTART_GAP_S = 900      # the board does not restart a watcher that found nothi
 LOCK_FILE = Path(".coding-agent") / "state" / "worker-watch.lock"
 WAKE_FILE = Path(".coding-agent") / "state" / "worker-watch-wake.json"
 EXIT_FILE = Path(".coding-agent") / "state" / "worker-watch-exit.json"
+REPORT_RETRY_S = 300.0       # first wait before a report that failed transiently is sent again; doubles per failure
+REPORT_RETRY_MAX_S = 1800.0  # longest wait between two tries of the same report
 
 
 def verdict(item: resume.Finding, after: float | None = None) -> str | None:
@@ -114,9 +126,47 @@ def _key(item: resume.Finding) -> str:
     return item.dispatch or item.task_id
 
 
+def _settled(root: Path, key: str, kind: str) -> list[dict[str, Any]]:
+    """The ledger's `kind` reports of dispatch `key` that are done with: delivered, or rejected by Orca for good."""
+    return [record for record in resume.history(root) if record.get("dispatch") == key and record.get("kind") == kind
+            and (record.get("sent") is True or bool(record.get("rejected")))]
+
+
 def reported(root: Path, item: resume.Finding) -> bool:
-    """True once a death of this dispatch reached the coordinator."""
-    return bool(resume._sent(root, _key(item), DEATH))
+    """True once a death of this dispatch reached the coordinator, or Orca refused it for good."""
+    return bool(_settled(root, _key(item), DEATH))
+
+
+def retry_left(root: Path, key: str, kind: str, episode: str = "", now: float | None = None) -> float:
+    """Seconds before a `kind` report of `key` that failed transiently may be sent again; 0 when it may be sent now.
+
+    The wait is `REPORT_RETRY_S` after the first failure and doubles with each one, `REPORT_RETRY_MAX_S` at most. For a
+    stuck report only the failures of the same `episode` count.
+    """
+    failed = [record for record in resume.history(root)
+              if record.get("dispatch") == key and record.get("kind") == kind and record.get("sent") is False
+              and not record.get("rejected") and (kind != STUCK or record.get("episode") == episode)]
+    if not failed:
+        return 0.0
+    wait = min(REPORT_RETRY_S * 2 ** (len(failed) - 1), REPORT_RETRY_MAX_S)
+    return max(0.0, float(failed[-1].get("ts") or 0) + wait - (time.time() if now is None else now))
+
+
+def _send_report(run: str | None, subject: str, body: str, item: resume.Finding) -> tuple[str, str | None, bool]:
+    """Escalate one report. Returns (the form Orca accepted or "", the error or None, whether the refusal is final)."""
+    try:
+        return orca_cli.escalate(run=run, subject=subject, body=body, task_id=item.task_id, dispatch=item.dispatch) or "", None, False
+    except orca_cli.OrcaError as failure:
+        return "", str(failure)[:300], orca_cli.final_refusal(failure)
+
+
+def _outcome(error: str | None, final: bool) -> str:
+    return "reported" if error is None else "rejected" if final else "report-failed"
+
+
+def _ledger_fields(form: str, error: str | None, final: bool) -> dict[str, Any]:
+    return {"sent": error is None, **({"form": form} if form else {}), **({"rejected": error} if final else {}),
+            **({"error": error} if error and not final else {})}
 
 
 def screen_tail(screen: str, limit: int = SCREEN_LINES) -> list[str]:
@@ -137,32 +187,32 @@ def death_body(item: resume.Finding, reason: str, screen: str) -> str:
 
 def report_death(root: Path, item: resume.Finding, reason: str, run: str | None = None, *, session: str = "worker-watch",
                  delivered: set[str] | None = None) -> str:
-    """Tell the coordinator once that a worker is dead. Returns `reported`, `already-reported` or `report-failed`.
+    """Tell the coordinator once that a worker is dead.
 
-    `delivered` is the loop's memory of the reports Orca accepted: the key is added before the ledger is written, so a
-    ledger write that raises does not send the same report again on the next scan.
+    Returns `reported`, `already-reported`, `rejected` (Orca refused it for good: recorded once, never sent again),
+    `report-failed` (a transient failure, sent again after `retry_left`) or `retry-wait` (that wait is not over).
+    `delivered` is the loop's memory of the reports that are done with: the key is added before the ledger is written,
+    so a ledger write that raises does not send the same report again on the next scan.
     """
     key = _key(item)
     if (delivered is not None and key in delivered) or reported(root, item):
         return "already-reported"
+    if retry_left(root, key, DEATH) > 0:
+        return "retry-wait"
     body = death_body(item, reason, orca_cli.screen_of(item.terminal) if item.terminal else "")
     subject = f"{orca_cli.DEATH_SUBJECT}{item.title or item.task_id}"[:120]
-    error: str | None = None
-    try:
-        orca_cli.escalate(run=run, subject=subject, body=body, task_id=item.task_id, dispatch=item.dispatch)
-    except orca_cli.OrcaError as failure:
-        error = str(failure)[:300]
-    if error is None and delivered is not None:
+    form, error, final = _send_report(run, subject, body, item)
+    if (error is None or final) and delivered is not None:
         delivered.add(key)
     notify.fire(root, DEATH, key, task_id=item.task_id, dispatch=item.dispatch, terminal=item.terminal, title=item.title, reason=reason,
                 session=session, seen=delivered)
     orca_cli._append(root / resume.LEDGER, {"ts": int(time.time()), "kind": DEATH, "task_id": item.task_id, "dispatch": key,
-                                            "terminal": item.terminal, "reason": reason, "sent": error is None})
-    events.record(root, guard="worker-watch", kind="reported" if error is None else "report-failed", mode="enforce",
+                                            "terminal": item.terminal, "reason": reason, **_ledger_fields(form, error, final)})
+    events.record(root, guard="worker-watch", kind={"rejected": "report-rejected"}.get(_outcome(error, final), _outcome(error, final)), mode="enforce",
                   applied=error is None, session=session,
                   detail={"task_id": item.task_id, "dispatch": item.dispatch, "terminal": item.terminal, "state": item.state,
-                          "reason": reason, "error": error})
-    return "reported" if error is None else "report-failed"
+                          "reason": reason, "error": error, "form": form})
+    return _outcome(error, final)
 
 
 def _mark_alive(root: Path, run: str | None, pid: int | None = None, stale_s: float | None = None) -> None:
@@ -293,8 +343,8 @@ def _stuck_key(item: resume.Finding) -> str:
 
 
 def stuck_reported(root: Path, item: resume.Finding) -> bool:
-    """True once this stretch without progress (`item.episode`) reached the coordinator."""
-    return any(record.get("episode") == item.episode for record in resume._sent(root, _key(item), STUCK))
+    """True once this stretch without progress (`item.episode`) reached the coordinator, or Orca refused it for good."""
+    return any(record.get("episode") == item.episode for record in _settled(root, _key(item), STUCK))
 
 
 def stuck_reason(item: resume.Finding) -> str:
@@ -308,38 +358,50 @@ def report_stuck(root: Path, item: resume.Finding, run: str | None = None, *, se
                  delivered: set[str] | None = None) -> str:
     """Tell the coordinator once per episode that a worker looks hung. Only reads its screen; never types into it.
 
-    Returns `reported`, `already-reported` or `report-failed` (tried again on the next scan).
+    Returns what `report_death` returns, per episode.
     """
     if (delivered is not None and _stuck_key(item) in delivered) or stuck_reported(root, item):
         return "already-reported"
+    if retry_left(root, _key(item), STUCK, item.episode) > 0:
+        return "retry-wait"
     reason = stuck_reason(item)
     body = death_body(item, reason, orca_cli.screen_of(item.terminal) if item.terminal else "")
     subject = f"{orca_cli.STUCK_SUBJECT}{item.title or item.task_id}"[:120]
-    error: str | None = None
-    try:
-        orca_cli.escalate(run=run, subject=subject, body=body, task_id=item.task_id, dispatch=item.dispatch)
-    except orca_cli.OrcaError as failure:
-        error = str(failure)[:300]
-    if error is None and delivered is not None:
+    form, error, final = _send_report(run, subject, body, item)
+    if (error is None or final) and delivered is not None:
         delivered.add(_stuck_key(item))
     notify.fire(root, STUCK, f"{_key(item)}:{item.episode}", task_id=item.task_id, dispatch=item.dispatch, terminal=item.terminal,
                 title=item.title, reason=reason, session=session, seen=delivered)
     orca_cli._append(root / resume.LEDGER, {"ts": int(time.time()), "kind": STUCK, "task_id": item.task_id, "dispatch": _key(item),
                                             "terminal": item.terminal, "episode": item.episode, "signal": item.signal,
-                                            "stuck_s": item.stuck_s, "sent": error is None})
-    events.record(root, guard="worker-watch", kind="stuck-reported" if error is None else "report-failed", mode="enforce",
-                  applied=error is None, session=session,
+                                            "stuck_s": item.stuck_s, **_ledger_fields(form, error, final)})
+    events.record(root, guard="worker-watch", kind={"reported": "stuck-reported", "rejected": "report-rejected"}.get(_outcome(error, final), "report-failed"),
+                  mode="enforce", applied=error is None, session=session,
                   detail={"task_id": item.task_id, "dispatch": item.dispatch, "terminal": item.terminal, "state": item.state,
-                          "signal": item.signal, "stuck_s": item.stuck_s, "episode": item.episode, "error": error})
-    return "reported" if error is None else "report-failed"
+                          "signal": item.signal, "stuck_s": item.stuck_s, "episode": item.episode, "error": error, "form": form})
+    return _outcome(error, final)
 
 
 def _asking(run: str | None) -> set[str] | None:
-    """The tasks with an open question, or None when Orca cannot say (a stuck report then waits for the next scan)."""
+    """Task and dispatch ids with an open question, or None when Orca cannot say (a stuck or silent report then waits)."""
     try:
-        return {str(question.get("task_id") or "") for question in orca_cli.worker_activity(run)}
+        return orca_cli.asking_keys(run)
     except orca_cli.OrcaError:
         return None
+
+
+def _waits(item: resume.Finding, asking: set[str]) -> bool:
+    """True when the worker of `item` waits on an open question."""
+    return item.task_id in asking or bool(item.dispatch and item.dispatch in asking)
+
+
+def _said(outcome: str, what: str, reason: str = "") -> str | None:
+    """The log line for a report's outcome; None for a report that waits for its retry (said once, when it failed)."""
+    tail = f": {reason}" if reason else ""
+    return {"reported": f"reported {what} to the coordinator{tail}",
+            "rejected": f"report ({what}) rejected by Orca for good, recorded once and not sent again{tail}",
+            "report-failed": (f"could not be reported ({what}), tried again after a backoff ({resume._minutes(REPORT_RETRY_S)} min "
+                              f"first, {resume._minutes(REPORT_RETRY_MAX_S)} at most){tail}")}.get(outcome)
 
 
 def _alert_open(root: Path) -> bool:
@@ -470,21 +532,26 @@ def _watch(root: Path, run: str | None, task_ids: list[str] | None, interval_s: 
             say(resume.describe(item).replace("worker-resume:", "worker-watch:", 1))
         shown[key] = mark
         if item.state == STUCK:
-            if asking is not None and item.task_id not in asking and _stuck_key(item) not in delivered and not stuck_reported(root, item):
-                outcome = report_stuck(root, item, run, delivered=delivered)
-                say(f"worker-watch: {item.task_id} " + ("reported stuck to the coordinator" if outcome == "reported"
-                                                         else "could not be reported as stuck, tried again next scan"))
+            if asking is not None and not _waits(item, asking) and _stuck_key(item) not in delivered and not stuck_reported(root, item):
+                line = _said(report_stuck(root, item, run, delivered=delivered), "stuck")
+                if line:
+                    say(f"worker-watch: {item.task_id} {line}")
             return
         reason = verdict(item, after)
+        if reason is not None and item.state == "silent":
+            if asking is None:
+                return  # Orca cannot say whether it waits on a question: no report this scan
+            if _waits(item, asking):
+                reason = None
         if reason is None or key in delivered or reported(root, item):
             suspects.pop(key, None)
             return
         suspects[key] = suspects.get(key, 0) + 1
         if suspects[key] < confirm:
             return
-        outcome = report_death(root, item, reason, run, delivered=delivered)
-        say(f"worker-watch: {item.task_id} " + ("reported dead to the coordinator" if outcome == "reported"
-                                                 else "could not be reported, tried again next scan") + f": {reason}")
+        line = _said(report_death(root, item, reason, run, delivered=delivered), "dead", reason)
+        if line:
+            say(f"worker-watch: {item.task_id} {line}")
 
     done = 0
     try:
@@ -515,7 +582,8 @@ def _watch(root: Path, run: str | None, task_ids: list[str] | None, interval_s: 
                         unread_run = True
                         continue
                     after = resume.silent_after_s()
-                    due = [item for item in scanned if item.state == STUCK and _stuck_key(item) not in delivered and not stuck_reported(root, item)]
+                    due = [item for item in scanned if (item.state == STUCK and _stuck_key(item) not in delivered and not stuck_reported(root, item))
+                           or (item.state == "silent" and verdict(item, after) is not None and _key(item) not in delivered and not reported(root, item))]
                     asking = _asking(current) if due else set()
                     for item in scanned:
                         try:

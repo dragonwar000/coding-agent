@@ -221,6 +221,7 @@ class Workers:
         self.sent: list[tuple[str, str]] = []
         self.messages: list[dict[str, str]] = []
         self.reports: list[dict[str, str]] = []
+        self.questions: list[dict[str, str]] = []  # open worker questions, as `orca_cli.worker_activity` answers them
         self.online = True
         self.tasks = [{"id": task_id, "status": (statuses or {}).get(task_id, "dispatched"), "task_title": f"Viec {task_id}"} for task_id in screens]
         for task_id in screens:
@@ -231,6 +232,7 @@ class Workers:
         monkeypatch.setattr(orca_cli, "send_line", lambda handle, text: self.sent.append((handle, text)))
         monkeypatch.setattr(resume, "network_up", lambda timeout_s=0.0: self.online)
         monkeypatch.setattr(orca_cli, "unread_reports", lambda run=None: self.reports)
+        monkeypatch.setattr(orca_cli, "worker_activity", lambda run=None: self.questions)
 
         def message(dispatch, *, subject, body, task_id, run=None):
             self.messages.append({"dispatch": dispatch, "subject": subject, "body": body, "task_id": task_id})

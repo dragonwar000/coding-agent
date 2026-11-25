@@ -80,6 +80,7 @@ def no_real_orca(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(orca_cli, "_adopted", None)
     monkeypatch.setattr(orca_cli, "_no_full", set())
+    monkeypatch.setattr(orca_cli, "_ids_refused", set())
     # No test starts the background death watcher (`watcher.ensure_running`); test_watcher.py turns it on where it checks it.
     monkeypatch.setenv("CODING_AGENT_WORKER_WATCH", "off")
     # Board and inbox also read worker questions (`check --all`, `inbox --full`); tests that do not

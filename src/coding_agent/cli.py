@@ -44,7 +44,10 @@
   worker that is dead or stuck for good to the coordinator with ONE `escalation` (`worker dead: <task title>`, task and
   dispatch ids, the reason, the last screen lines), once per dispatch (`kind: death` in `.coding-agent/resumes.jsonl`).
   Dead or stuck: its terminal or agent process is gone, its screen shows an API error a retry does not fix, a transient
-  error stays after the last resume, or it stays silent after the last reminder; seen on two scans in a row. A scan that
+  error stays after the last resume, or it stays silent after the last reminder with no open question in Orca (a worker
+  waiting on its `ask` is neither reminded nor reported); seen on two scans in a row. A report Orca refuses for good
+  (such as `worker_identity_changed`) is sent once more without its ids, then recorded once and never sent again; a
+  transient failure is tried again after 5 minutes, doubling up to 30. A scan that
   fails is printed and the loop goes on; 5 failed scans in a row send one `worker-watch failing` escalation. A worker whose spinner runs with no transcript
   write or screen change for `CODING_AGENT_STUCK_MINUTES` (default 20, `off` disables) gets one `worker stuck: <task
   title>` escalation per episode; it is never interrupted or marked dead. Each report can also run the manifest's
